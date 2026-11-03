@@ -3,6 +3,7 @@
 //! - `source`: the zstd C sources from `third_party/zstd` (text, ~2-3 MB)
 //! - `log`: synthetic server log lines (very compressible text)
 //! - `numeric`: little-endian integer series (structured binary)
+//! - `skewed`: skewed random bytes, nearly all Huffman literals
 //! - `random`: incompressible bytes
 //! - every file in `$ZSTD_BENCH_CORPUS` (for example the Silesia corpus)
 
@@ -117,6 +118,19 @@ pub fn numeric_corpus(len: usize) -> Vec<u8> {
     out
 }
 
+/// Bytes from a skewed (roughly geometric) distribution with almost no
+/// repeats: compresses to mostly Huffman-coded literals.
+pub fn skewed_corpus(len: usize) -> Vec<u8> {
+    let mut r = Rng::new(5);
+    (0..len)
+        .map(|_| {
+            let x = r.next_u64();
+            let z = (x | (1 << 40)).trailing_zeros() as u64;
+            (z * 16 + ((x >> 50) & 15)) as u8
+        })
+        .collect()
+}
+
 pub fn random_corpus(len: usize) -> Vec<u8> {
     let mut r = Rng::new(3);
     (0..len).map(|_| r.next_u64() as u8).collect()
@@ -128,6 +142,7 @@ pub fn datasets() -> Vec<(String, Vec<u8>)> {
         ("source".to_string(), source_corpus()),
         ("log".to_string(), log_corpus(4 << 20)),
         ("numeric".to_string(), numeric_corpus(4 << 20)),
+        ("skewed".to_string(), skewed_corpus(4 << 20)),
         ("random".to_string(), random_corpus(1 << 20)),
     ];
     if let Ok(dir) = std::env::var("ZSTD_BENCH_CORPUS") {

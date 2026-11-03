@@ -36,15 +36,16 @@ On this Windows machine, cargo is in `~/.cargo/bin` (not on PATH in Bash).
 
 - `unsafe` is denied by default and allowed only in hot paths, each block
   with a SAFETY comment and debug assertions: `bits.rs` (raw-pointer bit
-  reader), `huf.rs` fast loops, `block.rs` sequence execution and copies,
+  reader), `huf.rs` fast loops, `huf_asm.rs` (asm! port of libzstd's
+  Huffman loops), `block.rs` sequence execution and copies,
   and the output writes in `decoder.rs`. New `unsafe` needs a benchmark
   showing the gain.
 - CPU-specific code goes behind run-time detection (`cpu.rs`), compiled
   with `#[target_feature]` (BMI2 today), with the generic version selected
   by the `portable` feature for testing.
-- Porting libzstd's x86-64 assembly (`huf_decompress_amd64.S`) to `asm!`
-  is allowed, like xz-native's `lzma/x86_asm.rs`, with the Rust loop kept
-  as the fallback.
+- Assembly (`asm!`, like xz-native's `lzma/x86_asm.rs`) is allowed when
+  it measures faster, with the Rust loop kept as the fallback. Measure on
+  both Intel and AMD: results differ (see `cpu.rs`, `huf_asm.rs`).
 - Versioning: SemVer with the matched zstd version as build metadata
   (`0.1.0+zstd.1.5.7`).
 

@@ -9,12 +9,18 @@
 use zstd_bench::{Rng, c_compress, log_corpus, numeric_corpus, source_corpus};
 
 fn c_decompress(src: &[u8], cap: usize) -> Option<Vec<u8>> {
-    zstd::bulk::Decompressor::new().unwrap().decompress(src, cap).ok()
+    zstd::bulk::Decompressor::new()
+        .unwrap()
+        .decompress(src, cap)
+        .ok()
 }
 
 #[test]
 fn mutated_frames() {
-    let iters: usize = std::env::var("ZSTD_NATIVE_CORRUPTION_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
+    let iters: usize = std::env::var("ZSTD_NATIVE_CORRUPTION_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3000);
     let src = source_corpus();
     let inputs: Vec<Vec<u8>> = vec![
         src[..20_000].to_vec(),
@@ -62,15 +68,25 @@ fn mutated_frames() {
                 m.splice(p..p, piece);
             }
         }
+        // Alternate the asm and Rust Huffman loops (where the CPU has both).
+        zstd_native::__private::set_asm(Some(i % 2 == 0));
         let native = dec.decompress(&m);
         let mut buf = vec![0u8; orig_len + 100];
         let native_slice = dec.decompress_to_slice(&m, &mut buf);
         if let Ok(v) = &native {
             accepted += 1;
             let c = c_decompress(&m, v.len().max(1) + 1000);
-            assert_eq!(c.as_ref(), Some(v), "iteration {i}: zstd-native accepted what libzstd rejects or decodes differently");
+            assert_eq!(
+                c.as_ref(),
+                Some(v),
+                "iteration {i}: zstd-native accepted what libzstd rejects or decodes differently"
+            );
             if let Ok(n) = native_slice {
-                assert_eq!(&buf[..n], &v[..], "iteration {i}: slice and vec decoders differ");
+                assert_eq!(
+                    &buf[..n],
+                    &v[..],
+                    "iteration {i}: slice and vec decoders differ"
+                );
             }
         }
     }
