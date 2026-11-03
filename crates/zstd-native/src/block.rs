@@ -409,12 +409,15 @@ fn decode_sequence(
     let llc = cell(tp, *ll);
     let mlc = cell(tp, *ml);
     let ofc = cell(tp, *of);
-    let mut lit_len = llc.base as usize;
-    let mut match_len = mlc.base as usize;
     let ll_bits = u32::from(llc.nb_add_bits);
     let ml_bits = u32::from(mlc.nb_add_bits);
     let of_bits = u32::from(ofc.nb_add_bits);
 
+    // Extra bits in libzstd's order: offset, match length, (reload),
+    // literal length. Reading them together measured slower on text (an
+    // extra data-dependent branch, or worse register allocation).
+    let mut lit_len = llc.base as usize;
+    let mut match_len = mlc.base as usize;
     let offset;
     if of_bits > 1 {
         offset = ofc.base as usize + br.read_fast(of_bits) as usize;
@@ -460,9 +463,18 @@ fn decode_sequence(
         lit_len += br.read_fast(ll_bits) as usize;
     }
     if !last {
-        *ll = llc.next_state as usize + br.read(u32::from(llc.nb_bits)) as usize;
-        *ml = mlc.next_state as usize + br.read(u32::from(mlc.nb_bits)) as usize;
-        *of = ofc.next_state as usize + br.read(u32::from(ofc.nb_bits)) as usize;
+        // One read for the three state updates (LL bits first, then ML, then
+        // OF; at most 9 + 9 + 8 bits): one dependency on the consumed count
+        // instead of three.
+        let (lb, mb, ob) = (
+            u32::from(llc.nb_bits),
+            u32::from(mlc.nb_bits),
+            u32::from(ofc.nb_bits),
+        );
+        let v = br.read(lb + mb + ob);
+        *ll = llc.next_state as usize + (v >> (mb + ob)) as usize;
+        *ml = mlc.next_state as usize + ((v >> ob) & ((1 << mb) - 1)) as usize;
+        *of = ofc.next_state as usize + (v & ((1 << ob) - 1)) as usize;
         br.reload();
     }
     Seq {
@@ -603,7 +615,10 @@ fn sequences_body(
         {
             let seq = decode_sequence(&mut br, tp, &mut ll, &mut ml, &mut of, &mut reps, n == 0);
             let seq_len = seq.lit_len + seq.match_len;
-            if seq.lit_len > lit_end - lp as usize || seq_len > oend_w.saturating_sub(op as usize) {
+            // In u64 so the sums can't wrap on 32-bit targets (free on 64-bit).
+            if lp as u64 + seq.lit_len as u64 > lit_end as u64
+                || op as u64 + seq_len as u64 > oend_w as u64
+            {
                 let o = op as usize - base as usize;
                 let mut lit = lp as usize - lit_start as usize;
                 let o = exec_sequence_end(
