@@ -25,24 +25,30 @@ the x86-64 asm Huffman decoder).
 
 | Data | Level | zstd-native | libzstd | structured-zstd | ruzstd | zstd-native / libzstd |
 |---|---:|---:|---:|---:|---:|---:|
-| source | 1 | 1352 | 1414 | 1301 | 354 | 0.96x |
-| source | 3 | 1248 | 1327 | 1225 | 388 | 0.94x |
-| source | 9 | 1409 | 1503 | 1429 | 426 | 0.94x |
-| source | 19 | 1385 | 1477 | 1385 | 467 | 0.94x |
-| log | 1 | 1232 | 1313 | 1194 | 354 | 0.94x |
-| log | 3 | 1242 | 1335 | 1202 | 398 | 0.93x |
-| log | 9 | 1431 | 1538 | 1382 | 444 | 0.93x |
-| log | 19 | 1575 | 1716 | 1524 | 477 | 0.92x |
-| numeric | 1 | 768 | 802 | 689 | 214 | 0.96x |
-| numeric | 3 | 676 | 710 | 626 | 185 | 0.95x |
-| numeric | 9 | 756 | 788 | 686 | 205 | 0.96x |
-| numeric | 19 | 780 | 809 | 706 | 254 | 0.96x |
-| random | 1 | 16964 | 16929 | 16923 | 6404 | 1.00x |
-| random | 3 | 10469 | 10460 | 10460 | 6329 | 1.00x |
-| random | 9 | 10473 | 10458 | 10453 | 6322 | 1.00x |
-| random | 19 | 10457 | 10457 | 10458 | 6443 | 1.00x |
+| source | 1 | 1367 | 1416 | 1303 | 354 | 0.96x |
+| source | 3 | 1262 | 1327 | 1225 | 388 | 0.95x |
+| source | 9 | 1425 | 1509 | 1427 | 426 | 0.94x |
+| source | 19 | 1398 | 1479 | 1381 | 468 | 0.95x |
+| log | 1 | 1249 | 1309 | 1196 | 354 | 0.95x |
+| log | 3 | 1243 | 1337 | 1203 | 398 | 0.93x |
+| log | 9 | 1432 | 1548 | 1386 | 446 | 0.93x |
+| log | 19 | 1572 | 1713 | 1528 | 479 | 0.92x |
+| numeric | 1 | 784 | 803 | 695 | 214 | 0.98x |
+| numeric | 3 | 689 | 713 | 629 | 185 | 0.97x |
+| numeric | 9 | 772 | 791 | 687 | 205 | 0.98x |
+| numeric | 19 | 800 | 811 | 706 | 248 | 0.99x |
+| skewed | 1 | 1462 | 1405 | 1108 | 217 | 1.04x |
+| skewed | 3 | 1462 | 1405 | 1108 | 215 | 1.04x |
+| skewed | 9 | 1460 | 1389 | 1104 | 216 | 1.05x |
+| skewed | 19 | 1429 | 1363 | 1077 | 220 | 1.05x |
+| random | 1 | 16930 | 16884 | 16906 | 6368 | 1.00x |
+| random | 3 | 10444 | 10403 | 10433 | 6374 | 1.00x |
+| random | 9 | 10442 | 10422 | 10434 | 6298 | 1.00x |
+| random | 19 | 10442 | 10418 | 10432 | 6217 | 1.00x |
 
-Datasets: `source` = the zstd C sources, `log` = synthetic server logs, `numeric` = integer series, `random` = incompressible (raw blocks: memcpy speed). zstd-native is at 92-96% of libzstd on compressible data, ahead of structured-zstd on 10 of the 12 compressible cases (1.5% behind on source L9, tied on source L19), and about 3x ruzstd. Closing the gap to libzstd is the current work.
+Datasets: `source` = the zstd C sources, `log` = synthetic server logs, `numeric` = integer series, `skewed` = skewed random bytes (nearly all Huffman-coded literals), `random` = incompressible (raw blocks: memcpy speed).
+
+zstd-native is 4-5% faster than libzstd on literal-heavy data (`skewed`), 97-99% on `numeric` and 92-96% on `source` and `log`, where the sequence loop is the remaining gap. It is ahead of or level with structured-zstd everywhere (within noise on `source` L9) and 3-7x faster than ruzstd.
 
 How: the hot loops (sequence decoding and execution, 4-stream Huffman
 decoding with single- and double-symbol tables) are compiled generic and
