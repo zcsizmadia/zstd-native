@@ -1,0 +1,29 @@
+[package]
+name = "zstd-native"
+description = "Pure Rust Zstandard (zstd) compression and decompression, built to match or beat C libzstd in speed. No C code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+keywords = ["zstd", "zstandard", "compression", "decompression"]
+categories = ["compression", "no-std"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["std"]
+## std::io types and run-time CPU feature detection; without it the crate
+## is no_std + alloc (CPU features then come from compile-time target
+## features).
+std = []
+## Disables the SIMD/BMI2 specializations so only the generic code runs.
+## For testing the fallbacks: it changes speed, never results.
+portable = []
+
+[lints]
+workspace = true

@@ -1,0 +1,30 @@
+[package]
+name = "zstd-bench"
+description = "Benchmarks and differential tests: zstd-native vs C libzstd 1.5.7 and the pure-Rust zstd crates"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+bench = false
+
+[dependencies]
+zstd-native = { path = "../zstd-native" }
+# C libzstd 1.5.7, built from the bundled source: the speed reference and
+# the oracle for differential tests. Never a dependency of zstd-native.
+zstd = { version = "0.14", default-features = false, features = ["zstdmt", "experimental", "zdict_builder"] }
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+# Pure-Rust competitors.
+ruzstd = "0.9"
+structured-zstd = "0.2"
+
+[[bench]]
+name = "decode"
+harness = false
+
+[lints]
+workspace = true

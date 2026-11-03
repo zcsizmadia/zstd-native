@@ -1,0 +1,34 @@
+# cargo-deny: RustSec advisories, licenses, duplicate crates and sources.
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+# Permissive licenses only. zstd-native itself is BSD-3-Clause; the rest come from the
+# benchmark and fuzz tooling (criterion, zstd, ruzstd, structured-zstd).
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+# The list is a policy for future dependencies, not an inventory.
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = ["crates/zstd-native", "crates/zstd-bench"]
+default-members = ["crates/zstd-native"]
+exclude = ["fuzz", "third_party"]
+
+[workspace.package]
+version = "0.1.0+zstd.1.5.7"
+edition = "2024"
+rust-version = "1.89"
+license = "BSD-3-Clause"
+repository = "https://github.com/zcsizmadia/zstd-native"
+authors = ["Zoltan Csizmadia <zcsizmadia@gmail.com>"]
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# Optimized tests with debug assertions and overflow checks (CI).
+[profile.ci]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+lto = false
+codegen-units = 16
+panic = "unwind"
+incremental = true
+
+[profile.bench]
+lto = "fat"
+codegen-units = 1
+debug = 1
