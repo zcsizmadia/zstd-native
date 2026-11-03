@@ -361,6 +361,11 @@ fn fast_loop_dispatch(
     cpu: Features,
 ) {
     #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+    if cpu.huf_asm {
+        fast_loop_asm(st, out, src, starts, None, dt.as_ptr().cast());
+        return;
+    }
+    #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
     if cpu.bmi2 {
         #[allow(unsafe_code)]
         // SAFETY: the caller detected BMI2 (and BMI1/LZCNT) on this CPU.
@@ -494,6 +499,11 @@ fn fast_loop_x2_dispatch(
     cpu: Features,
 ) {
     #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+    if cpu.huf_asm {
+        fast_loop_asm(st, out, src, starts, Some(seg_ends), dt2.as_ptr().cast());
+        return;
+    }
+    #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
     if cpu.bmi2 {
         #[allow(unsafe_code)]
         // SAFETY: the caller detected BMI2 (and BMI1/LZCNT) on this CPU.
@@ -618,4 +628,57 @@ fn fast_loop_x2_body(
     st.ip = [ip0, ip1, ip2, ip3];
     st.op = [op0, op1, op2, op3];
     st.bits = [b0, b1, b2, b3];
+}
+
+/// Drives the `asm!` loops (libzstd's `huf_decompress_amd64.S`): computes
+/// how many iterations are safe, exactly as the Rust loops do, and lets
+/// the asm run them. `seg_ends` is `Some` for the double-symbol loop.
+#[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+#[allow(unsafe_code)]
+fn fast_loop_asm(
+    st: &mut FastState,
+    out: &mut [u8],
+    src: &[u8],
+    starts: &[usize; 4],
+    seg_ends: Option<&[usize; 4]>,
+    dt: *const u8,
+) {
+    use crate::huf_asm::{self, AsmArgs};
+    let srcp = src.as_ptr();
+    let outp = out.as_mut_ptr();
+    loop {
+        let iiters = (0..4).map(|s| (st.ip[s] - starts[s]) / 7).min().unwrap();
+        let oiters = match seg_ends {
+            // Double-symbol: up to 10 bytes per stream per iteration.
+            Some(ends) => (0..4).map(|s| (ends[s] - st.op[s]) / 10).min().unwrap(),
+            // Single-symbol: 5 per stream, stream 3's segment is the shortest.
+            None => (out.len() - st.op[3]) / 5,
+        };
+        let iters = iiters.min(oiters);
+        if iters == 0 {
+            break;
+        }
+        // SAFETY: indexes are in bounds (`ip + 8 <= src.len()`,
+        // `op <= out.len()`, `op[3] + 5 * iters <= out.len()`), and the
+        // iteration bound above is what the asm's safety contract needs:
+        // it stops once `op[3]` reaches `olimit`, which takes at most
+        // `iters` iterations as `op[3]` advances by at least 5 each.
+        unsafe {
+            let mut a = AsmArgs {
+                ip: st.ip.map(|i| srcp.add(i)),
+                op: st.op.map(|o| outp.add(o)),
+                bits: st.bits,
+                dt,
+                olimit: outp.add(st.op[3] + 5 * iters),
+            };
+            if seg_ends.is_some() {
+                huf_asm::x2(&mut a);
+            } else {
+                huf_asm::x1(&mut a);
+            }
+            st.ip = a.ip.map(|p| p as usize - srcp as usize);
+            st.op = a.op.map(|p| p as usize - outp as usize);
+            st.bits = a.bits;
+        }
+    }
 }

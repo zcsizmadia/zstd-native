@@ -185,3 +185,31 @@ fn output_too_small() {
         Err(zstd_native::Error::OutputTooSmall)
     );
 }
+
+#[test]
+fn asm_and_rust_huffman_loops_agree() {
+    // Same results with the asm Huffman loops on and off (where they exist).
+    eprintln!(
+        "selected paths: {:?}",
+        zstd_native::__private::selected_paths()
+    );
+    let datasets = [
+        source_corpus(),
+        log_corpus(1 << 20),
+        numeric_corpus(1 << 20),
+    ];
+    for asm in [false, true] {
+        zstd_native::__private::set_asm(Some(asm));
+        eprintln!("asm={asm}: {:?}", zstd_native::__private::selected_paths());
+        for (i, data) in datasets.iter().enumerate() {
+            for level in [1, 3, 19] {
+                check(
+                    &format!("asm={asm} dataset {i} L{level}"),
+                    data,
+                    &c_compress(data, level),
+                );
+            }
+        }
+    }
+    zstd_native::__private::set_asm(None);
+}
