@@ -74,11 +74,18 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
   exactly the same inputs. (libzstd's fast path skips that end check.)
 - **CPU features**: hot loops are compiled generic and with BMI2
   (`#[target_feature]`), picked at run time; `portable` forces generic.
+- **Huffman asm** (`huf_asm.rs`): libzstd's `huf_decompress_amd64.S` X1
+  and X2 loops ported to `asm!` (same registers and instructions), run in
+  bounded chunks computed by the same Rust code as the Rust loops. Which
+  is faster depends on the microarchitecture: the asm is 12% faster on
+  Intel Alder Lake and 6% slower on AMD Zen 3 (its `movb %ah` stores), so
+  it runs on non-AMD CPUs with BMI2 and the Rust loops run on AMD. On
+  literal-heavy data (`skewed`) zstd-native is 1.04x libzstd on Zen 3.
 
 ## Roadmap
 
-1. Decoder speed to >= 1.0x libzstd everywhere: port
-   `huf_decompress_amd64.S` to `asm!`; a long-offset decoder with
+1. Decoder speed to >= 1.0x libzstd everywhere (Huffman is there; the
+   sequence loop is ~5% behind): a long-offset decoder with
    prefetching (libzstd's `ZSTD_decompressSequencesLong`) for large
    windows; literals placed in the output buffer like libzstd's split
    literal buffer; more measurement on Silesia (`ZSTD_BENCH_CORPUS`).
