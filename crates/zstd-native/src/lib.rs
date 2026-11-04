@@ -48,6 +48,7 @@ mod block;
 mod cpu;
 mod decoder;
 mod dict;
+mod enc;
 mod error;
 mod frame;
 mod fse;
