@@ -420,6 +420,47 @@ pub(crate) fn ml_code(ml_base: u32) -> u32 {
     }
 }
 
+/// The loop of `ZSTD_seqToCodes()`: the codes of `seqs` into the three
+/// tables (all of `seqs.len()` entries). Returns libzstd's `longOffsets`.
+///
+/// On x86-64 with LZCNT the `highbit32` of every offset is one `lzcnt`
+/// instead of `bsr` (several micro-ops on AMD); libzstd's `ZSTD_seqToCodes`
+/// is not compiled with it.
+#[inline]
+pub(crate) fn fill_codes(seqs: &[SeqDef], ll: &mut [u8], of: &mut [u8], ml: &mut [u8]) -> bool {
+    #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+    if crate::cpu::Features::detect().bmi2 {
+        // SAFETY: BMI2 (with BMI1 and LZCNT) was detected on this CPU.
+        #[allow(unsafe_code)]
+        return unsafe { fill_codes_lzcnt(seqs, ll, of, ml) };
+    }
+    fill_codes_body(seqs, ll, of, ml)
+}
+
+#[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+fn fill_codes_lzcnt(seqs: &[SeqDef], ll: &mut [u8], of: &mut [u8], ml: &mut [u8]) -> bool {
+    fill_codes_body(seqs, ll, of, ml)
+}
+
+#[inline(always)]
+fn fill_codes_body(seqs: &[SeqDef], ll: &mut [u8], of: &mut [u8], ml: &mut [u8]) -> bool {
+    debug_assert!(ll.len() == seqs.len() && of.len() == seqs.len() && ml.len() == seqs.len());
+    let mut long_offsets = false;
+    // Zipped so the four slices need no per-sequence bounds checks.
+    for (((s, ll), of), ml) in seqs.iter().zip(ll).zip(of).zip(ml) {
+        let of_code = highbit32(s.off_base);
+        *ll = ll_code(u32::from(s.lit_length)) as u8;
+        *of = of_code as u8;
+        *ml = ml_code(u32::from(s.ml_base)) as u8;
+        debug_assert!(!(usize::BITS == 64 && of_code >= STREAM_ACCUMULATOR_MIN));
+        if usize::BITS == 32 && of_code >= STREAM_ACCUMULATOR_MIN {
+            long_offsets = true;
+        }
+    }
+    long_offsets
+}
+
 /// `ZSTD_seqToCodes()`: fills `ll_code`, `of_code` and `ml_code` for the
 /// stored sequences (the long length, if any, gets `MaxLL` / `MaxML`).
 /// Returns libzstd's `longOffsets`: an offset code needs more bits than the
@@ -427,21 +468,12 @@ pub(crate) fn ml_code(ml_base: u32) -> u32 {
 pub(crate) fn seq_to_codes(ss: &mut SeqStore) -> bool {
     let nb_seq = ss.nb_seq;
     debug_assert!(nb_seq <= ss.max_nb_seq);
-    let mut long_offsets = false;
-    let seqs = &ss.sequences[..nb_seq];
-    let ll = &mut ss.ll_code[..nb_seq];
-    let of = &mut ss.of_code[..nb_seq];
-    let ml = &mut ss.ml_code[..nb_seq];
-    for (u, s) in seqs.iter().enumerate() {
-        let of_code = highbit32(s.off_base);
-        ll[u] = ll_code(u32::from(s.lit_length)) as u8;
-        of[u] = of_code as u8;
-        ml[u] = ml_code(u32::from(s.ml_base)) as u8;
-        debug_assert!(!(usize::BITS == 64 && of_code >= STREAM_ACCUMULATOR_MIN));
-        if usize::BITS == 32 && of_code >= STREAM_ACCUMULATOR_MIN {
-            long_offsets = true;
-        }
-    }
+    let long_offsets = fill_codes(
+        &ss.sequences[..nb_seq],
+        &mut ss.ll_code[..nb_seq],
+        &mut ss.of_code[..nb_seq],
+        &mut ss.ml_code[..nb_seq],
+    );
     match ss.long_length_type {
         LongLengthType::LiteralLength => ss.ll_code[ss.long_length_pos as usize] = MAX_LL,
         LongLengthType::MatchLength => ss.ml_code[ss.long_length_pos as usize] = MAX_ML,
