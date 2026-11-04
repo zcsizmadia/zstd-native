@@ -1,0 +1,84 @@
+name: Miri
+
+# Miri on zstd-native's unit tests and doc examples, little endian and big
+# endian. With the `portable` feature: Miri cannot run the asm! loops or
+# the BMI2/SSE2 #[target_feature] paths, so only the generic code (and its
+# unsafe: the bit reader and writer, Huffman and FSE tables, sequence
+# execution, match finders) runs.
+#
+# Pushes and pull requests skip the encoder round-trip tests: they
+# compress hundreds of KiB per case, each over 15 minutes under Miri. The
+# weekly and manual runs take every test.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  # Runs of the same PR share a group, and so do pushes to main: a newer
+  # push cancels the older run. Scheduled and manual runs get their own
+  # group, so a push never cancels them.
+  group: miri-${{ (github.event_name == 'pull_request' || github.event_name == 'push') && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Every test on the weekly and manual runs, the fast ones otherwise.
+  FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+
+permissions:
+  contents: read
+
+jobs:
+  miri:
+    name: miri ${{ matrix.target }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 360 || 60 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Little endian and big endian.
+        target: [x86_64-unknown-linux-gnu, s390x-unknown-linux-gnu]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+          components: miri
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: miri-${{ matrix.target }}
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-nextest
+      - run: cargo miri setup --target ${{ matrix.target }}
+      - name: Unit tests
+        # nextest runs each test in its own Miri process, one per CPU.
+        shell: bash
+        run: |
+          if [ "$FULL" = true ]; then
+            filter='all()'
+          else
+            filter='not (test(/::roundtrip_/) | test(/::small_blocks$/)
+              | test(~cdict::tests::round_trip_every_mode)
+              | test(~huf_enc::tests::)
+              | test(~fse_enc::tests::normalize_write_read_round_trip)
+              | test(~fse_enc::tests::compress_using_ctable_decodes)
+              | test(~opt::tests::weights)
+              | test(~presplit::tests::optimal_size)
+              | test(~mt::tests::jobs_run_in_the_calling_thread_without_workers))'
+          fi
+          filter=$(echo "$filter" | tr -s '\n ' '  ')
+          cargo miri nextest run -p zstd-native --lib --features portable \
+            --target ${{ matrix.target }} --no-fail-fast -E "$filter"
+      - name: Doc examples
+        shell: bash
+        # The set_workers example compresses 2.4 MB with four threads.
+        run: |
+          skip=()
+          [ "$FULL" = true ] || skip=(--skip set_workers)
+          cargo miri test -p zstd-native --doc --features portable \
+            --target ${{ matrix.target }} -- "${skip[@]}"
