@@ -108,6 +108,10 @@ dictionary path). Details in [docs/PROPOSAL.md](docs/PROPOSAL.md).
   thousands of mutated frames with debug assertions on).
 - `unsafe` is confined to the hot paths, each with a SAFETY argument and
   debug assertions; the `portable` feature runs the generic code paths.
+- Fuzzed with cargo-fuzz against libzstd (`fuzz/`: arbitrary bytes into
+  every decoder, libzstd's output with arbitrary parameters, arbitrary
+  data and parameters through the encoder), see
+  [docs/PROPOSAL.md](docs/PROPOSAL.md#fuzzing).
 
 ## License
 
