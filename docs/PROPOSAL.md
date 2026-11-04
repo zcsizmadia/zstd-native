@@ -114,8 +114,10 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
 3. Encoder, byte-identical with libzstd per level (the oracle for tests;
    it makes speed the only variable). Done: fast (levels 1-2 and
    negative; `enc/`, issue #6) and dfast (levels 3-4, #7), 0.90-0.96x
-   libzstd's speed. Next: speed (#17), the lazy family (#8), optimal parsing (#9),
-   streaming/dictionaries/multithreading (#10).
+   libzstd's speed; the lazy family (greedy, lazy, lazy2 with the hash
+   chain and row-based match finders, btlazy2: levels 4/5 to 15, #8), on
+   par with libzstd in first measurements. Next: speed (#17), optimal
+   parsing (#9), streaming/dictionaries/multithreading (#10).
 4. Multithreaded compression, dictionaries for the encoder, long distance
    matching.
 5. Fuzzing (cargo-fuzz, differential vs libzstd), Miri, CI matrix
