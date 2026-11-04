@@ -114,3 +114,13 @@ pub(crate) fn read_le32(src: &[u8], pos: usize) -> u32 {
 pub(crate) fn is_skippable(magic: u32) -> bool {
     magic & SKIPPABLE_MAGIC_MASK == SKIPPABLE_MAGIC
 }
+
+/// Total frame header size (magic included) from the frame header
+/// descriptor byte.
+#[inline]
+pub(crate) fn header_size(fhd: u8) -> usize {
+    let single = (fhd >> 5) & 1 != 0;
+    5 + usize::from(!single)
+        + [0, 1, 2, 4][(fhd & 3) as usize]
+        + [usize::from(single), 2, 4, 8][(fhd >> 6) as usize]
+}

@@ -92,3 +92,71 @@ fn mutated_frames() {
     }
     eprintln!("{accepted} of {iters} mutated inputs decoded");
 }
+
+/// The streaming decoder on mutated input, fed in random pieces: never a
+/// panic, and anything it accepts, libzstd's streaming decoder accepts
+/// with the same output.
+#[test]
+fn mutated_streams() {
+    use std::io::Write;
+    let iters: usize = std::env::var("ZSTD_NATIVE_CORRUPTION_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3000);
+    let data = log_corpus(200_000);
+    let mut frames = Vec::new();
+    for (level, wlog) in [(1, 10), (3, 12), (9, 17), (19, 15)] {
+        let mut enc = zstd::stream::write::Encoder::new(Vec::new(), level).unwrap();
+        enc.window_log(wlog).unwrap();
+        enc.include_checksum(wlog % 2 == 0).unwrap();
+        enc.write_all(&data[..(50_000 * level as usize).min(data.len())])
+            .unwrap();
+        frames.push(enc.finish().unwrap());
+    }
+    let mut r = Rng::new(31337);
+    let mut accepted = 0;
+    for i in 0..iters {
+        let mut m = frames[i % frames.len()].clone();
+        for _ in 0..1 + r.below(3) {
+            let p = r.below(m.len() as u64) as usize;
+            m[p] ^= 1 << r.below(8);
+        }
+        if r.below(4) == 0 {
+            let n = r.below(m.len() as u64) as usize;
+            m.truncate(n);
+        }
+        zstd_native::__private::set_asm(Some(i % 2 == 0));
+        let mut dec = zstd_native::StreamDecoder::new();
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 1 + r.below(70_000) as usize];
+        let mut ip = 0;
+        let ok = loop {
+            let n = (1 + r.below(50_000) as usize).min(m.len() - ip);
+            match dec.decode(&m[ip..ip + n], &mut buf) {
+                Err(_) => break false,
+                Ok(p) => {
+                    ip += p.read;
+                    out.extend_from_slice(&buf[..p.written]);
+                    if ip == m.len() && p.read == 0 && p.written == 0 {
+                        break p.at_frame_boundary;
+                    }
+                }
+            }
+        };
+        // Empty input is zero frames: empty output, as libzstd itself (the
+        // `zstd` crate's reader adds an error for streams with no frame).
+        if ok && !m.is_empty() {
+            accepted += 1;
+            let c = zstd::stream::decode_all(&m[..]).ok();
+            assert_eq!(
+                c.as_ref(),
+                Some(&out),
+                "iteration {i}: accepted what libzstd's stream decoder rejects or decodes differently (input {} bytes: {:02x?})",
+                m.len(),
+                &m[..m.len().min(24)]
+            );
+        }
+    }
+    zstd_native::__private::set_asm(None);
+    eprintln!("{accepted} of {iters} mutated streams decoded");
+}
