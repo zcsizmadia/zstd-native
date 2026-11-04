@@ -137,14 +137,16 @@ enum Stage {
 /// # Ok::<(), zstd_native::Error>(())
 /// ```
 ///
-/// Long distance matching is not implemented: libzstd enables it by itself
-/// at level 22 with a window of 128 MiB, i.e. for unknown sizes and sizes
-/// over 64 MiB; starting such a frame returns
-/// [`Error::UnsupportedFrameParameter`].
+/// At level 22 with a window of 128 MiB, i.e. for unknown sizes and sizes
+/// over 64 MiB, libzstd enables long distance matching by itself, and so
+/// does this encoder, with the same output (and libzstd's memory use: over
+/// 800 MiB for the tables and the input buffer).
 pub struct StreamEncoder {
     level: i32,
     /// `ZSTD_c_windowLog` (0: the level's).
     window_log: u32,
+    /// `ZSTD_c_enableLongDistanceMatching` set to enable (else auto).
+    force_ldm: bool,
     /// `pledgedSrcSizePlusOne - 1` for the next or current frame.
     pledged: Option<u64>,
     stage: Stage,
@@ -180,6 +182,7 @@ impl StreamEncoder {
         StreamEncoder {
             level,
             window_log: 0,
+            force_ldm: false,
             pledged: None,
             stage: Stage::Init,
             fc: None,
@@ -271,6 +274,17 @@ impl StreamEncoder {
         self.window_log = log;
     }
 
+    /// Forces long distance matching on (libzstd's
+    /// `ZSTD_c_enableLongDistanceMatching` set to `ZSTD_ps_enable`; `false`
+    /// restores the default, where it is enabled for `btopt` and above with
+    /// a window of at least 128 MiB), from the next frame on. The window log
+    /// then defaults to 27 (128 MiB) unless set with
+    /// [`set_window_log`](Self::set_window_log). For tests.
+    #[doc(hidden)]
+    pub fn set_long_distance_matching(&mut self, on: bool) {
+        self.force_ldm = on;
+    }
+
     /// Declares the size of the next frame's content (libzstd's
     /// `ZSTD_CCtx_setPledgedSrcSize`; `None`: unknown, the default). The
     /// frame header then holds it, and the parameters are chosen for it
@@ -325,9 +339,8 @@ impl StreamEncoder {
     /// # Errors
     ///
     /// [`Error::SrcSizeWrong`] if a frame gets more or less input than its
-    /// pledged size, [`Error::UnsupportedFrameParameter`] if the frame
-    /// would need long distance matching. After an error the frame is
-    /// abandoned (as with [`reset`](Self::reset)).
+    /// pledged size. After an error the frame is abandoned (as with
+    /// [`reset`](Self::reset)).
     pub fn compress(
         &mut self,
         input: &[u8],
@@ -349,11 +362,16 @@ impl StreamEncoder {
         }
         let (cd, level) = self.dict.for_frame(self.level)?;
         // ZSTD_getCParamsFromCCtxParams
-        let cp = frame_cparams(level, cd.as_deref(), self.pledged, self.window_log);
-        if ldm_enabled(&cp) {
-            return Err(Error::UnsupportedFrameParameter);
-        }
-        let fc = FrameCompressor::start_frame(&mut self.fc, cp, cd.as_ref(), self.pledged);
+        let cp = frame_cparams(
+            level,
+            cd.as_deref(),
+            self.pledged,
+            self.window_log,
+            self.force_ldm,
+        );
+        // ZSTD_resolveEnableLdm
+        let ldm = self.force_ldm || ldm_enabled(&cp);
+        let fc = FrameCompressor::start_frame(&mut self.fc, cp, cd.as_ref(), self.pledged, ldm);
         let bsm = fc.block_size_max;
         let pledged = self.pledged.unwrap_or(CONTENTSIZE_UNKNOWN);
         let window_size = (1u64 << cp.window_log).min(pledged).max(1) as usize;

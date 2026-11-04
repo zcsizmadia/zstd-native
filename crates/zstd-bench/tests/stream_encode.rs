@@ -455,16 +455,18 @@ fn several_frames() {
     }
 }
 
+/// Level 22 with an unknown size: a 128 MiB window, with long distance
+/// matching (see `ldm_encode.rs` for more); with a known size up to
+/// 64 MiB, a smaller window without.
 #[test]
-fn ldm_level_unsupported() {
-    let mut enc = StreamEncoder::new(22);
-    let mut out = vec![0u8; 4096];
-    assert_eq!(
-        enc.compress(b"abc", &mut out, EndOp::Continue),
-        Err(zstd_native::Error::UnsupportedFrameParameter)
-    );
-    // with a known size up to 64 MiB, level 22 works
+fn level22_unknown_and_known_size() {
     let data = input(200_000);
+    check(
+        "L22 unknown",
+        &chunked(22, 0, data.len(), 50_000, OUT),
+        &data,
+    );
+    check("L22 tiny", &chunked(22, 0, 3, 50_000, OUT), &data);
     let mut s = chunked(22, 0, data.len(), 50_000, OUT);
     s.pledged = Some(data.len() as u64);
     check("L22", &s, &data);

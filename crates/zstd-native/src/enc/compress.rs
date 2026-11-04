@@ -10,6 +10,7 @@ use super::cdict::{CDict, DictSlot, frame_cparams, should_attach, use_cdict_tabl
 use super::fast::{MatchState, SHORT_CACHE_TAG_BITS, build_seq_store};
 use super::hist::hist_count_fast;
 use super::huf_enc::HufRepeat;
+use super::ldm::{LdmState, build_seq_store_ldm};
 use super::literals::{HufCTables, compress_literals, min_gain};
 use super::opt::DictCosts;
 use super::params::{
@@ -448,19 +449,27 @@ pub(crate) struct FrameCompressor {
     produced: u64,
     /// `dictID`: the frame's dictionary ID (0: none written).
     dict_id: u32,
+    /// `ldmState` (kept between frames for its tables), used when
+    /// [`ldm_on`](Self::ldm_on).
+    pub(super) ldm: Option<Box<LdmState>>,
+    /// Long distance matching is enabled for the frame
+    /// (`appliedParams.ldmParams.enableLdm`).
+    pub(super) ldm_on: bool,
 }
 
 impl FrameCompressor {
     pub(crate) fn new(level: i32, src_size: usize) -> Self {
         let cp = one_shot_cparams(level, src_size as u64);
-        Self::with_params(cp, Some(src_size as u64))
+        Self::with_params(cp, Some(src_size as u64), ldm_enabled(&cp))
     }
 
     /// A compressor for a frame of `pledged` bytes (`None`: unknown) with
-    /// the resolved parameters `cp`.
-    pub(crate) fn with_params(cp: CParams, pledged: Option<u64>) -> Self {
+    /// the resolved parameters `cp`, with long distance matching if `ldm`.
+    pub(crate) fn with_params(cp: CParams, pledged: Option<u64>, ldm: bool) -> Self {
         let bsm = block_size_max(&cp, pledged.unwrap_or(CONTENTSIZE_UNKNOWN));
         FrameCompressor {
+            ldm: ldm.then(|| Box::new(LdmState::new(&cp, bsm))),
+            ldm_on: ldm,
             cp,
             ms: MatchState::new(cp),
             ss: SeqStore::new(bsm, cp.min_match),
@@ -484,25 +493,41 @@ impl FrameCompressor {
     /// and `ZSTD_reset_compressedBlockState`).
     pub(crate) fn reset(&mut self, level: i32, src_size: usize) {
         let cp = one_shot_cparams(level, src_size as u64);
-        self.reset_with_params(cp, Some(src_size as u64));
+        self.reset_with_params(cp, Some(src_size as u64), ldm_enabled(&cp));
     }
 
-    /// As [`reset`](Self::reset), with resolved parameters and a frame of
-    /// `pledged` bytes (`None`: unknown).
-    pub(crate) fn reset_with_params(&mut self, cp: CParams, pledged: Option<u64>) {
+    /// As [`reset`](Self::reset), with resolved parameters, a frame of
+    /// `pledged` bytes (`None`: unknown) and long distance matching if
+    /// `ldm`.
+    pub(crate) fn reset_with_params(&mut self, cp: CParams, pledged: Option<u64>, ldm: bool) {
         let use_row = row_match_finder_used(
             cp.strategy,
             resolve_row_match_finder_mode(ParamSwitch::Auto, &cp),
         );
-        self.reset_full(cp, pledged, use_row, &cp);
+        self.reset_full(cp, pledged, use_row, &cp, ldm);
     }
 
     /// `ZSTD_resetCCtx_internal`: [`reset_with_params`](Self::reset_with_params)
     /// with the row match finder use given and the post-block splitter
     /// resolved from the frame's parameters `frame_cp` (with a CDict, `cp`
-    /// holds the CDict's table parameters instead).
-    fn reset_full(&mut self, cp: CParams, pledged: Option<u64>, use_row: bool, frame_cp: &CParams) {
+    /// holds the CDict's table parameters instead, from which the LDM
+    /// parameters are derived too).
+    fn reset_full(
+        &mut self,
+        cp: CParams,
+        pledged: Option<u64>,
+        use_row: bool,
+        frame_cp: &CParams,
+        ldm: bool,
+    ) {
         let bsm = block_size_max(&cp, pledged.unwrap_or(CONTENTSIZE_UNKNOWN));
+        self.ldm_on = ldm;
+        if ldm {
+            match self.ldm.as_deref_mut() {
+                Some(l) => l.reset(&cp, bsm),
+                None => self.ldm = Some(Box::new(LdmState::new(&cp, bsm))),
+            }
+        }
         self.cp = cp;
         self.ms.reset_with(cp, use_row, false);
         if let Some(o) = self.ms.opt.as_deref_mut() {
@@ -536,17 +561,23 @@ impl FrameCompressor {
     /// and the dictionary `cdict`: libzstd's `ZSTD_compressBegin_internal`,
     /// which starts from the CDict's tables (attached or copied, see the
     /// `cdict` module) or loads its content into tables with the frame's
-    /// parameters. Reuses `slot`'s compressor, or makes one.
+    /// parameters. Reuses `slot`'s compressor, or makes one. With `ldm`,
+    /// long distance matching is enabled; a raw-content dictionary loaded
+    /// into the tables is loaded into the LDM table too.
     pub(crate) fn start_frame<'a>(
         slot: &'a mut Option<Box<FrameCompressor>>,
         frame_cp: CParams,
         cdict: Option<&Arc<CDict>>,
         pledged: Option<u64>,
+        ldm: bool,
     ) -> &'a mut FrameCompressor {
         let fc = match slot {
             Some(f) => f,
             None => {
-                let f = slot.insert(Box::new(FrameCompressor::with_params(frame_cp, pledged)));
+                // (no LDM tables yet: the reset below makes them)
+                let f = slot.insert(Box::new(FrameCompressor::with_params(
+                    frame_cp, pledged, false,
+                )));
                 // a new context: its one reset below must advance the hash
                 // salt from 0
                 f.ms.clear_hash_salt();
@@ -557,16 +588,22 @@ impl FrameCompressor {
         match cdict {
             Some(cd) if use_cdict_tables(cd, size) => {
                 if should_attach(cd, size) {
-                    fc.attach_cdict(frame_cp, cd, pledged);
+                    fc.attach_cdict(frame_cp, cd, pledged, ldm);
                 } else {
-                    fc.copy_cdict(frame_cp, cd, pledged);
+                    fc.copy_cdict(frame_cp, cd, pledged, ldm);
                 }
             }
             _ => {
-                fc.reset_with_params(frame_cp, pledged);
+                fc.reset_with_params(frame_cp, pledged, ldm);
                 if let Some(cd) = cdict {
                     // ZSTD_compress_insertDictionary
                     cd.load_into(&mut fc.ms);
+                    // ZSTD_loadDictionaryContent's LDM part (a zstd-format
+                    // dictionary's content is loaded without the LDM state)
+                    if ldm && cd.is_raw_content() {
+                        let l = fc.ldm.as_deref_mut().expect("LDM state");
+                        l.load_dictionary(cd);
+                    }
                     fc.take_block_state(cd);
                 }
             }
@@ -577,7 +614,13 @@ impl FrameCompressor {
     /// `ZSTD_resetCCtx_byAttachingCDict()`: the context's tables are sized
     /// for the source only, the match finders search the CDict's too
     /// (dictMatchState).
-    fn attach_cdict(&mut self, frame_cp: CParams, cd: &Arc<CDict>, pledged: Option<u64>) {
+    fn attach_cdict(
+        &mut self,
+        frame_cp: CParams,
+        cd: &Arc<CDict>,
+        pledged: Option<u64>,
+        ldm: bool,
+    ) {
         let size = pledged.unwrap_or(CONTENTSIZE_UNKNOWN);
         // Resize working context table params for input only, since the
         // dict has its own tables.
@@ -589,7 +632,7 @@ impl FrameCompressor {
             resolve_row_match_finder_mode(ParamSwitch::Auto, &frame_cp),
         );
         cp.window_log = frame_cp.window_log;
-        self.reset_full(cp, pledged, cd.use_row, &frame_cp);
+        self.reset_full(cp, pledged, cd.use_row, &frame_cp, ldm);
         debug_assert!(self.cp.strategy == cd.cparams.strategy);
         // don't even attach dictionaries with no contents
         if cd.has_window_content() {
@@ -615,10 +658,10 @@ impl FrameCompressor {
     /// `ZSTD_resetCCtx_byCopyingCDict()`: the context gets the CDict's
     /// table parameters (with the frame's window), tables and window; the
     /// dictionary is then its extDict.
-    fn copy_cdict(&mut self, frame_cp: CParams, cd: &Arc<CDict>, pledged: Option<u64>) {
+    fn copy_cdict(&mut self, frame_cp: CParams, cd: &Arc<CDict>, pledged: Option<u64>, ldm: bool) {
         let mut cp = cd.cparams;
         cp.window_log = frame_cp.window_log;
-        self.reset_full(cp, pledged, cd.use_row, &frame_cp);
+        self.reset_full(cp, pledged, cd.use_row, &frame_cp, ldm);
         let ms = &mut self.ms;
         let src = &cd.ms;
         // copy tables, removing the tags of a fast or dfast CDict's
@@ -659,6 +702,34 @@ impl FrameCompressor {
         }
     }
 
+    /// `ZSTD_buildSeqStore()` for the block `src[start..end]`, with the
+    /// long distance matcher when enabled (see
+    /// [`build_seq_store`] for `rep` and the result).
+    ///
+    /// # Errors
+    ///
+    /// Only with LDM, see [`LdmState::generate_sequences`].
+    #[inline]
+    pub(super) fn build_block_seq_store(
+        &mut self,
+        rep: &mut [u32; 3],
+        src: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Result<bool> {
+        match self.ldm.as_deref_mut().filter(|_| self.ldm_on) {
+            None => Ok(build_seq_store(
+                &mut self.ms,
+                &mut self.ss,
+                rep,
+                src,
+                start,
+                end,
+            )),
+            Some(l) => build_seq_store_ldm(&mut self.ms, &mut self.ss, rep, l, src, start, end),
+        }
+    }
+
     /// libzstd's `ZSTD_compressBlock_internal`: 0 = store raw, 1 = RLE
     /// (`dst[0]` holds the byte), else a compressed block's size.
     fn compress_block(
@@ -669,8 +740,7 @@ impl FrameCompressor {
         end: usize,
     ) -> Result<usize> {
         let mut next_rep = self.rep;
-        let c_size = if !build_seq_store(&mut self.ms, &mut self.ss, &mut next_rep, src, start, end)
-        {
+        let c_size = if !self.build_block_seq_store(&mut next_rep, src, start, end)? {
             0
         } else {
             let ch = SeqChunk::full(&self.ss);
@@ -789,6 +859,10 @@ impl FrameCompressor {
             return Ok(fh_size);
         }
         self.ms.update_window(start, end - start);
+        if self.ldm_on {
+            let l = self.ldm.as_deref_mut().expect("LDM state");
+            l.update_window(start, end - start);
+        }
         let c_size = self.frame_chunk(&mut dst[fh_size..], buf, start, end, last_chunk)?;
         self.consumed += (end - start) as u64;
         self.produced += (c_size + fh_size) as u64;
@@ -958,14 +1032,12 @@ pub(crate) fn compress_dict_to_slice_with(
 ) -> Result<usize> {
     let (cd, level) = dict.for_frame(level)?;
     let pledged = Some(src.len() as u64);
-    let frame_cp = frame_cparams(level, cd.as_deref(), pledged, 0);
-    if ldm_enabled(&frame_cp) {
-        return Err(Error::UnsupportedFrameParameter);
-    }
+    let frame_cp = frame_cparams(level, cd.as_deref(), pledged, 0, false);
     if let Some(f) = fc.as_deref_mut().filter(|_| fresh) {
         f.ms.clear_hash_salt();
     }
-    FrameCompressor::start_frame(fc, frame_cp, cd.as_ref(), pledged).compress(dst, src)
+    let ldm = ldm_enabled(&frame_cp);
+    FrameCompressor::start_frame(fc, frame_cp, cd.as_ref(), pledged, ldm).compress(dst, src)
 }
 
 /// As [`compress_dict_to_slice_with`], into a new vector.
