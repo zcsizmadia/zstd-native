@@ -10,7 +10,7 @@ use super::cdict::{CDict, DictSlot, frame_cparams, should_attach, use_cdict_tabl
 use super::fast::{MatchState, SHORT_CACHE_TAG_BITS, build_seq_store};
 use super::hist::hist_count_fast;
 use super::huf_enc::HufRepeat;
-use super::ldm::{LdmState, build_seq_store_ldm};
+use super::ldm::{LdmState, RawSeq, RawSeqStore, build_seq_store_ext, build_seq_store_ldm};
 use super::literals::{HufCTables, compress_literals, min_gain};
 use super::opt::DictCosts;
 use super::params::{
@@ -455,6 +455,11 @@ pub(crate) struct FrameCompressor {
     /// Long distance matching is enabled for the frame
     /// (`appliedParams.ldmParams.enableLdm`).
     pub(super) ldm_on: bool,
+    /// `externSeqStore`: long matches given from outside (a multithreaded
+    /// job's, see the `mt` module), used while not empty.
+    pub(super) ext: RawSeqStore,
+    /// Scratch space for [`build_seq_store_ext`].
+    ext_view: Vec<RawSeq>,
 }
 
 impl FrameCompressor {
@@ -485,6 +490,8 @@ impl FrameCompressor {
             consumed: 0,
             produced: 0,
             dict_id: 0,
+            ext: RawSeqStore::default(),
+            ext_view: Vec::new(),
         }
     }
 
@@ -554,6 +561,9 @@ impl FrameCompressor {
         self.consumed = 0;
         self.produced = 0;
         self.dict_id = 0;
+        self.ext.seq.clear();
+        self.ext.pos = 0;
+        self.ext.pos_in_sequence = 0;
     }
 
     /// Starts a frame of `pledged` bytes (`None`: unknown) with the frame
@@ -717,6 +727,18 @@ impl FrameCompressor {
         start: usize,
         end: usize,
     ) -> Result<bool> {
+        if !self.ext.seq.is_empty() {
+            return Ok(build_seq_store_ext(
+                &mut self.ms,
+                &mut self.ss,
+                rep,
+                &mut self.ext,
+                &mut self.ext_view,
+                src,
+                start,
+                end,
+            ));
+        }
         match self.ldm.as_deref_mut().filter(|_| self.ldm_on) {
             None => Ok(build_seq_store(
                 &mut self.ms,

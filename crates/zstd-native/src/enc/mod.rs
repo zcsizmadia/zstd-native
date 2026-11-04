@@ -41,6 +41,10 @@
 //!   enables by itself for `btopt` and above with a 128 MiB window; the
 //!   optimal parser takes its matches as candidates (`ZSTD_optLdm_*` in
 //!   `opt`)
+//! - `mt` (with `std`): multithreaded compression,
+//!   compress/zstdmt_compress.c (jobs compressed by worker threads, the
+//!   overlap between jobs, the serial LDM step) and how
+//!   `ZSTD_compressStream2` drives it with `nbWorkers >= 1`
 #![allow(dead_code)] // filled in step by step (issue #6)
 
 pub(crate) mod bitwriter;
@@ -54,6 +58,8 @@ pub(crate) mod huf_enc;
 pub(crate) mod lazy;
 pub(crate) mod ldm;
 pub(crate) mod literals;
+#[cfg(feature = "std")]
+pub(crate) mod mt;
 pub(crate) mod opt;
 pub(crate) mod params;
 pub(crate) mod presplit;
@@ -178,18 +184,27 @@ fn with_cached<T>(f: impl FnOnce(&mut Cached) -> T) -> T {
 /// assert_eq!(d.decompress(&a)?, b"{\"id\": 1, \"name\": \"one\", \"tags\": [\"a\"]}");
 /// # Ok::<(), zstd_native::Error>(())
 /// ```
+///
+/// With `std`, it can compress with worker threads
+/// ([`set_workers`](Self::set_workers)), as libzstd's `ZSTD_compress2` with
+/// `ZSTD_c_nbWorkers`.
 pub struct Compressor {
     level: i32,
     inner: Cached,
     dict: cdict::DictSlot,
+    #[cfg(feature = "std")]
+    mt_params: mt::MtParams,
+    #[cfg(feature = "std")]
+    mt: Option<alloc::boxed::Box<mt::MtCtx>>,
 }
 
 impl core::fmt::Debug for Compressor {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Compressor")
-            .field("level", &self.level)
-            .field("dict", &self.dict)
-            .finish_non_exhaustive()
+        let mut d = f.debug_struct("Compressor");
+        d.field("level", &self.level).field("dict", &self.dict);
+        #[cfg(feature = "std")]
+        d.field("workers", &self.mt_params.workers);
+        d.finish_non_exhaustive()
     }
 }
 
@@ -200,7 +215,103 @@ impl Compressor {
             level,
             inner: None,
             dict: cdict::DictSlot::None,
+            #[cfg(feature = "std")]
+            mt_params: mt::MtParams::default(),
+            #[cfg(feature = "std")]
+            mt: None,
         }
+    }
+
+    /// Compresses with `n` worker threads (libzstd's `ZSTD_c_nbWorkers`; at
+    /// most 256, 64 on 32-bit targets); 0, the default, compresses in the
+    /// calling thread. The output is byte-identical to libzstd's
+    /// `ZSTD_compress2` with the same worker count (a different count
+    /// changes it, see below).
+    ///
+    /// As in libzstd, inputs of at most 512 KiB are still compressed in the
+    /// calling thread; larger ones are cut into jobs (by default `4 <<
+    /// windowLog` bytes, at least 1 MiB: 8 MiB at level 3, 32 MiB at level
+    /// 19), each compressed by a worker starting from the end of the
+    /// previous one, so a frame needs several jobs to use several workers.
+    /// Multithreaded output differs from single-threaded output, and
+    /// compresses slightly less well.
+    ///
+    /// The threads are started at the first frame that uses them and kept
+    /// until the compressor is dropped (or the count changes). Memory: per
+    /// worker, a compressor's tables for the level; per job in flight (at
+    /// most the smallest power of 2 above the worker count plus 2), its
+    /// input and output.
+    #[cfg(feature = "std")]
+    pub fn set_workers(&mut self, n: u32) {
+        self.mt_params.set_workers(n);
+    }
+
+    /// The worker thread count (see [`set_workers`](Self::set_workers)).
+    #[cfg(feature = "std")]
+    pub fn workers(&self) -> u32 {
+        self.mt_params.workers
+    }
+
+    /// Sets the job size of multithreaded compression (libzstd's
+    /// `ZSTD_c_jobSize`: 0 is automatic, other sizes are raised to 512 KiB
+    /// and lowered to 1 GiB, 512 MiB on 32-bit targets). For tests.
+    #[cfg(feature = "std")]
+    #[doc(hidden)]
+    pub fn set_job_size(&mut self, size: usize) {
+        self.mt_params.set_job_size(size);
+    }
+
+    /// Sets the overlap between jobs of multithreaded compression
+    /// (libzstd's `ZSTD_c_overlapLog`: 0 is automatic, else 1 (none) to 9
+    /// (the whole window)). For tests.
+    ///
+    /// # Panics
+    ///
+    /// If `log` is over 9.
+    #[cfg(feature = "std")]
+    #[doc(hidden)]
+    pub fn set_overlap_log(&mut self, log: u32) {
+        self.mt_params.set_overlap_log(log);
+    }
+
+    /// `ZSTD_compress2` with workers: the multithreaded path for `src`, if
+    /// it is taken; the output written into `dst` (or a new vector if
+    /// `None`).
+    #[cfg(feature = "std")]
+    fn compress_mt(
+        &mut self,
+        src: &[u8],
+        dst: Option<&mut [u8]>,
+    ) -> Option<crate::error::Result<(alloc::vec::Vec<u8>, usize)>> {
+        let pledged = Some(src.len() as u64);
+        if !self.mt_params.applies(pledged) {
+            return None;
+        }
+        Some((|| {
+            let (cd, level) = self.dict.for_frame(self.level)?;
+            let cp = cdict::frame_cparams(level, cd.as_deref(), pledged, 0, false);
+            let ldm = params::ldm_enabled(&cp);
+            let m = self
+                .mt
+                .get_or_insert_with(|| alloc::boxed::Box::new(mt::MtCtx::new()));
+            m.init_frame(&self.mt_params, cp, ldm, cd, pledged);
+            match dst {
+                Some(d) => {
+                    let p = m.compress(src, d, EndOp::End)?;
+                    if p.remaining != 0 {
+                        m.abandon();
+                        return Err(crate::Error::OutputTooSmall);
+                    }
+                    Ok((alloc::vec::Vec::new(), p.written))
+                }
+                None => {
+                    let mut v = alloc::vec::Vec::with_capacity(compress_bound(src.len()));
+                    m.compress_end_to_vec(src, &mut v)?;
+                    let n = v.len();
+                    Ok((v, n))
+                }
+            }
+        })())
     }
 
     /// A compressor for `level` with the dictionary `dict` (see
@@ -267,6 +378,10 @@ impl Compressor {
     ///
     /// As [`compress`].
     pub fn compress(&mut self, src: &[u8]) -> crate::error::Result<alloc::vec::Vec<u8>> {
+        #[cfg(feature = "std")]
+        if let Some(r) = self.compress_mt(src, None) {
+            return r.map(|(v, _)| v);
+        }
         if !matches!(self.dict, cdict::DictSlot::None) {
             return compress::compress_dict_with(
                 &mut self.inner,
@@ -285,6 +400,10 @@ impl Compressor {
     ///
     /// As [`compress_to_slice`].
     pub fn compress_to_slice(&mut self, src: &[u8], dst: &mut [u8]) -> crate::error::Result<usize> {
+        #[cfg(feature = "std")]
+        if let Some(r) = self.compress_mt(src, Some(&mut *dst)) {
+            return r.map(|(_, n)| n);
+        }
         if !matches!(self.dict, cdict::DictSlot::None) {
             return compress::compress_dict_to_slice_with(
                 &mut self.inner,
