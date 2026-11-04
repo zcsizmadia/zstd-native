@@ -53,7 +53,7 @@ pub use compress::compress_bound;
 /// for levels not implemented yet.
 pub fn compress(src: &[u8], level: i32) -> crate::error::Result<alloc::vec::Vec<u8>> {
     check_level(level, src.len())?;
-    compress::compress_impl(src, level)
+    with_cached(|fc| compress::compress_with(fc, src, level))
 }
 
 /// Compresses into `dst`, returning the compressed size; `dst` of
@@ -65,7 +65,84 @@ pub fn compress(src: &[u8], level: i32) -> crate::error::Result<alloc::vec::Vec<
 /// small, or as [`compress`].
 pub fn compress_to_slice(src: &[u8], dst: &mut [u8], level: i32) -> crate::error::Result<usize> {
     check_level(level, src.len())?;
-    compress::compress_to_slice_impl(src, dst, level)
+    with_cached(|fc| compress::compress_to_slice_with(fc, src, dst, level))
+}
+
+type Cached = Option<alloc::boxed::Box<compress::FrameCompressor>>;
+
+/// Runs `f` with a per-thread cached compressor (with `std`): reusing its
+/// tables and buffers matters for small inputs, as in libzstd's CCtx.
+#[cfg(feature = "std")]
+fn with_cached<T>(f: impl FnOnce(&mut Cached) -> T) -> T {
+    use core::cell::Cell;
+    std::thread_local! {
+        static CACHED: Cell<Cached> = const { Cell::new(None) };
+    }
+    let mut c = CACHED.with(Cell::take);
+    let r = f(&mut c);
+    CACHED.with(|cell| cell.set(c));
+    r
+}
+
+#[cfg(not(feature = "std"))]
+fn with_cached<T>(f: impl FnOnce(&mut Cached) -> T) -> T {
+    f(&mut None)
+}
+
+/// A reusable compressor (libzstd's `ZSTD_CCtx`): keeps its tables and
+/// buffers between frames, which matters for many small inputs.
+///
+/// ```
+/// let mut c = zstd_native::Compressor::new(1);
+/// let a = c.compress(b"first message, first message")?;
+/// let b = c.compress(b"second message")?;
+/// assert_eq!(zstd_native::decompress(&a)?, b"first message, first message");
+/// assert_eq!(zstd_native::decompress(&b)?, b"second message");
+/// # Ok::<(), zstd_native::Error>(())
+/// ```
+pub struct Compressor {
+    level: i32,
+    inner: Cached,
+}
+
+impl core::fmt::Debug for Compressor {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Compressor")
+            .field("level", &self.level)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Compressor {
+    /// A compressor for `level` (see [`compress`]).
+    pub fn new(level: i32) -> Self {
+        Compressor { level, inner: None }
+    }
+
+    /// Changes the level for the next frames.
+    pub fn set_level(&mut self, level: i32) {
+        self.level = level;
+    }
+
+    /// Compresses `src` as one frame (see [`compress`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`compress`].
+    pub fn compress(&mut self, src: &[u8]) -> crate::error::Result<alloc::vec::Vec<u8>> {
+        check_level(self.level, src.len())?;
+        compress::compress_with(&mut self.inner, src, self.level)
+    }
+
+    /// Compresses `src` as one frame into `dst` (see [`compress_to_slice`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`compress_to_slice`].
+    pub fn compress_to_slice(&mut self, src: &[u8], dst: &mut [u8]) -> crate::error::Result<usize> {
+        check_level(self.level, src.len())?;
+        compress::compress_to_slice_with(&mut self.inner, src, dst, self.level)
+    }
 }
 
 fn check_level(level: i32, src_size: usize) -> crate::error::Result<()> {

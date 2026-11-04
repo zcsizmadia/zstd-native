@@ -634,11 +634,13 @@ fn no_dict_generic<const MLS: u32, const USE_CMOV: bool>(
             if USE_CMOV {
                 // ZSTD_match4Found_cmov
                 let valid = match_idx >= prefix_start_index;
-                let mval_addr = if valid {
-                    base.wrapping_add(match_idx as usize)
-                } else {
-                    DUMMY.as_ptr()
-                };
+                // A branchless select, as libzstd forces with inline asm
+                // (`ZSTD_selectAddr`): the condition is unpredictable.
+                let mval_addr = core::hint::select_unpredictable(
+                    valid,
+                    base.wrapping_add(match_idx as usize),
+                    DUMMY.as_ptr(),
+                );
                 if valid {
                     chk(mval_addr, 4);
                 }
