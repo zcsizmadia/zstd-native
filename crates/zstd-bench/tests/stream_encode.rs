@@ -18,6 +18,9 @@ struct Script {
     level: i32,
     window_log: u32,
     pledged: Option<u64>,
+    /// `ZSTD_c_checksumFlag` and `ZSTD_c_contentSizeFlag`.
+    checksum: bool,
+    content_size: bool,
     /// (input length, operation, output buffer size)
     ops: Vec<(usize, EndOp, usize)>,
 }
@@ -28,6 +31,8 @@ impl Script {
             level,
             window_log: 0,
             pledged: None,
+            checksum: false,
+            content_size: true,
             ops: Vec::new(),
         }
     }
@@ -61,6 +66,10 @@ fn run_c(script: &Script, data: &[u8], cctx: Option<&mut CCtx<'static>>) -> Vec<
             &mut own
         }
     };
+    cctx.set_parameter(CParameter::ChecksumFlag(script.checksum))
+        .unwrap();
+    cctx.set_parameter(CParameter::ContentSizeFlag(script.content_size))
+        .unwrap();
     if script.pledged.is_some() {
         cctx.set_pledged_src_size(script.pledged).unwrap();
     }
@@ -99,6 +108,8 @@ fn run_native(script: &Script, data: &[u8], enc: Option<&mut StreamEncoder>) -> 
             &mut own
         }
     };
+    enc.set_checksum(script.checksum).unwrap();
+    enc.set_content_size_flag(script.content_size).unwrap();
     if script.pledged.is_some() {
         enc.set_pledged_src_size(script.pledged).unwrap();
     }
@@ -287,6 +298,10 @@ fn random_scripts() {
         let n = if level >= 16 { 500_000 } else { 1_500_000 };
         let mut s = Script::new(level);
         s.window_log = wlog;
+        // every other round with the checksum, every third without the
+        // content size
+        s.checksum = round % 2 == 1;
+        s.content_size = round % 3 != 2;
         let mut left = n;
         while left > 0 {
             let c = match r.below(5) {
@@ -534,5 +549,120 @@ fn small_windows() {
             let s = chunked(level, wlog, n, 50_000, OUT);
             check("small window", &s, &data);
         }
+    }
+}
+
+/// With the content checksum (`ZSTD_c_checksumFlag`) and without the
+/// content size (`ZSTD_c_contentSizeFlag`): a few levels per strategy,
+/// flushes, tiny output buffers (the checksum written out in pieces), the
+/// end-with-input shortcut, pledged sizes, empty frames, reused encoders
+/// and the `io::Write` encoder.
+#[test]
+fn frame_flags() {
+    let data = input(1_500_000);
+    for &level in &[-5, 1, 2, 3, 4, 5, 7, 12, 14, 16, 19, 22] {
+        let n = if level >= 16 { 300_000 } else { 1_200_000 };
+        for (checksum, content_size) in [(true, true), (true, false), (false, false)] {
+            let what = format!("flags {checksum} {content_size}");
+            let mut variants = Vec::new();
+            // chunks with flushes
+            let mut s = Script::new(level);
+            for (i, c) in data[..n].chunks(70_000).enumerate() {
+                let op = if i % 3 == 1 {
+                    EndOp::Flush
+                } else {
+                    EndOp::Continue
+                };
+                s.ops.push((c.len(), op, OUT));
+            }
+            s.ops.push((0, EndOp::End, 5));
+            variants.push(s);
+            // the last piece with End and a large output (the shortcut)
+            let mut s = chunked(level, 0, n, 100_000, OUT);
+            s.ops.pop();
+            s.ops.last_mut().unwrap().1 = EndOp::End;
+            s.ops.last_mut().unwrap().2 = 4 << 20;
+            variants.push(s);
+            // one End call with everything, pledged
+            let mut s = Script::new(level);
+            s.pledged = Some(50_000);
+            s.ops.push((50_000, EndOp::End, 1 << 20));
+            variants.push(s);
+            // pledged, tiny output buffers
+            let mut s = chunked(level, 0, 20_000, 3000, 3);
+            s.pledged = Some(20_000);
+            variants.push(s);
+            // empty frames
+            variants.push(chunked(level, 0, 0, 1, OUT));
+            variants.push(chunked(level, 0, 0, 1, 1));
+            for mut s in variants {
+                s.checksum = checksum;
+                s.content_size = content_size;
+                check(&what, &s, &data);
+            }
+        }
+    }
+    // a reused encoder, the flag switched between frames
+    let mut cctx = CCtx::create();
+    cctx.set_parameter(CParameter::CompressionLevel(3)).unwrap();
+    let mut enc = StreamEncoder::new(3);
+    for k in 0..6 {
+        let n = [100_000, 0, 7, 300_000, 1000, 50_000][k];
+        let mut s = chunked(3, 0, n, 33_333, OUT);
+        s.checksum = k % 2 == 0;
+        s.content_size = k % 3 != 1;
+        if k == 3 {
+            s.pledged = Some(n as u64);
+        }
+        let piece = &data[k * 1000..k * 1000 + n];
+        let want = run_c(&s, piece, Some(&mut cctx));
+        let got = run_native(&s, piece, Some(&mut enc));
+        compare("reused, flags", &s, &got, &want);
+    }
+    // not in the middle of a frame
+    let mut out = vec![0u8; 4096];
+    enc.compress(b"abc", &mut out, EndOp::Continue).unwrap();
+    assert_eq!(enc.set_checksum(true), Err(zstd_native::Error::StageWrong));
+    assert_eq!(
+        enc.set_content_size_flag(false),
+        Err(zstd_native::Error::StageWrong)
+    );
+    // the io::Write encoder, with flushes
+    for level in [1, 3, 9, 19] {
+        let src = &data[..600_000];
+        let mut enc = zstd_native::Encoder::new(Vec::new(), level);
+        enc.set_checksum(true).unwrap();
+        let mut c = zstd::stream::write::Encoder::new(Vec::new(), level).unwrap();
+        c.include_checksum(true).unwrap();
+        for (i, piece) in src.chunks(50_000).enumerate() {
+            enc.write_all(piece).unwrap();
+            c.write_all(piece).unwrap();
+            if i % 4 == 1 {
+                enc.flush().unwrap();
+                c.flush().unwrap();
+            }
+        }
+        let got = enc.finish().unwrap();
+        let want = c.finish().unwrap();
+        assert!(got == want, "io checksum L{level}: differs from libzstd");
+        assert!(zstd_native::decompress(&got).unwrap() == src);
+        // pledged, without the content size in the header
+        let mut enc = zstd_native::Encoder::new(Vec::new(), level);
+        enc.set_checksum(true).unwrap();
+        enc.set_content_size_flag(false).unwrap();
+        enc.set_pledged_src_size(Some(src.len() as u64)).unwrap();
+        let mut c = zstd::stream::write::Encoder::new(Vec::new(), level).unwrap();
+        c.include_checksum(true).unwrap();
+        c.include_contentsize(false).unwrap();
+        c.set_pledged_src_size(Some(src.len() as u64)).unwrap();
+        enc.write_all(src).unwrap();
+        c.write_all(src).unwrap();
+        let got = enc.finish().unwrap();
+        let want = c.finish().unwrap();
+        assert!(got == want, "io pledged L{level}: differs from libzstd");
+        assert_eq!(zstd_native::content_size(&got).unwrap(), None);
+        let mut enc = zstd_native::Encoder::new(Vec::new(), level);
+        enc.write_all(b"x").unwrap();
+        assert!(enc.set_checksum(true).is_err());
     }
 }

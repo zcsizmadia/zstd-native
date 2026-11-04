@@ -442,3 +442,129 @@ fn dictionary_ids_and_errors() {
     assert!(Compressor::with_dictionary(3, &bad).is_err());
     assert!(zstd_native::compress_with_dictionary(b"x", &bad, 3).is_err());
 }
+
+/// The frame parameters tested: (checksum, content size, dictionary ID).
+const FLAGS: &[(bool, bool, bool)] = &[
+    (true, true, true),
+    (true, true, false),
+    (false, false, false),
+    (true, false, true),
+];
+
+fn set_c_flags(c: &mut CCtx<'_>, (checksum, content_size, dict_id): (bool, bool, bool)) {
+    c.set_parameter(CParameter::ChecksumFlag(checksum)).unwrap();
+    c.set_parameter(CParameter::ContentSizeFlag(content_size))
+        .unwrap();
+    c.set_parameter(CParameter::DictIdFlag(dict_id)).unwrap();
+}
+
+fn set_native_flags(c: &mut Compressor, (checksum, content_size, dict_id): (bool, bool, bool)) {
+    c.set_checksum(checksum);
+    c.set_content_size_flag(content_size);
+    c.set_dict_id_flag(dict_id);
+}
+
+fn set_stream_flags(e: &mut StreamEncoder, (checksum, content_size, dict_id): (bool, bool, bool)) {
+    e.set_checksum(checksum).unwrap();
+    e.set_content_size_flag(content_size).unwrap();
+    e.set_dict_id_flag(dict_id).unwrap();
+}
+
+/// With the content checksum, and without the dictionary ID or the content
+/// size in the header: loaded and prepared dictionaries, one-shot (reused
+/// contexts) and streaming with flushes.
+#[test]
+fn frame_flags() {
+    let data = input(700_000, 31);
+    let dicts = dictionaries();
+    for (name, dict) in dicts
+        .iter()
+        .filter(|(n, _)| matches!(n.as_str(), "trained4k" | "trained32k" | "raw8" | "raw3000"))
+    {
+        let id = Dictionary::new(dict).unwrap().id();
+        for &flags in FLAGS {
+            for level in [-3, 1, 3, 5, 7, 12, 16, 19] {
+                let what = format!("{name} {flags:?} L{level}");
+                // loaded, one-shot
+                let mut c = CCtx::create();
+                c.set_parameter(CParameter::CompressionLevel(level))
+                    .unwrap();
+                set_c_flags(&mut c, flags);
+                c.load_dictionary(dict).unwrap();
+                let mut n_c = Compressor::with_dictionary(level, dict).unwrap();
+                set_native_flags(&mut n_c, flags);
+                // prepared, one-shot
+                let cdict = zstd::dict::EncoderDictionary::copy(dict, level);
+                let mut pc = CCtx::create();
+                set_c_flags(&mut pc, flags);
+                pc.ref_cdict(cdict.as_cdict()).unwrap();
+                let edict = EncoderDictionary::new(dict, level).unwrap();
+                let mut n_pc = Compressor::with_prepared_dictionary(&edict);
+                set_native_flags(&mut n_pc, flags);
+                for n in [0, 9, 1000, 16_385, 131_073, 300_000] {
+                    let src = &data[n / 2..n / 2 + n];
+                    let what = format!("{what} n={n}");
+                    let mut buf = vec![0u8; zstd::zstd_safe::compress_bound(n)];
+                    let k = c.compress2(&mut buf[..], src).unwrap();
+                    let got = n_c.compress(src).unwrap_or_else(|e| panic!("{what}: {e}"));
+                    compare(&format!("{what} loaded"), &got, &buf[..k]);
+                    round_trip(&what, &got, dict, src);
+                    let h = zstd_native::FrameHeader::parse(&got).unwrap();
+                    assert_eq!(h.has_checksum, flags.0, "{what}");
+                    assert_eq!(h.dict_id, if flags.2 { id } else { 0 }, "{what}");
+                    let k = pc.compress2(&mut buf[..], src).unwrap();
+                    let got = n_pc.compress(src).unwrap_or_else(|e| panic!("{what}: {e}"));
+                    compare(&format!("{what} prepared"), &got, &buf[..k]);
+                    round_trip(&what, &got, dict, src);
+                }
+                // streaming with flushes, the size pledged on the second frame
+                let mut c = CCtx::create();
+                c.set_parameter(CParameter::CompressionLevel(level))
+                    .unwrap();
+                set_c_flags(&mut c, flags);
+                c.load_dictionary(dict).unwrap();
+                let mut n = StreamEncoder::with_dictionary(level, dict).unwrap();
+                let size = if level >= SLOW_LEVEL {
+                    200_000
+                } else {
+                    700_000
+                };
+                let src = &data[..size];
+                let ops = script(size, 30_000, 4, 5000);
+                for frame in 0..2 {
+                    let pledged = (frame == 1).then_some(size as u64);
+                    c.set_pledged_src_size(pledged).unwrap();
+                    n.set_pledged_src_size(pledged).unwrap();
+                    set_stream_flags(&mut n, flags);
+                    let (got, want) = stream_both(&mut c, &mut n, src, &ops);
+                    compare(&format!("{what} stream frame {frame}"), &got, &want);
+                    round_trip(&what, &got, dict, src);
+                }
+                let mut c = CCtx::create();
+                set_c_flags(&mut c, flags);
+                c.ref_cdict(cdict.as_cdict()).unwrap();
+                let mut n = StreamEncoder::with_prepared_dictionary(&edict);
+                set_stream_flags(&mut n, flags);
+                let (got, want) = stream_both(&mut c, &mut n, src, &ops);
+                compare(&format!("{what} prepared stream"), &got, &want);
+            }
+        }
+        // the io::Write encoder
+        let mut c = zstd::stream::write::Encoder::with_dictionary(Vec::new(), 5, dict).unwrap();
+        c.include_checksum(true).unwrap();
+        c.include_dictid(false).unwrap();
+        let mut e = zstd_native::Encoder::with_dictionary(Vec::new(), 5, dict).unwrap();
+        e.set_checksum(true).unwrap();
+        e.set_dict_id_flag(false).unwrap();
+        for piece in data.chunks(60_000) {
+            c.write_all(piece).unwrap();
+            e.write_all(piece).unwrap();
+            c.flush().unwrap();
+            e.flush().unwrap();
+        }
+        let want = c.finish().unwrap();
+        let got = e.finish().unwrap();
+        compare(&format!("{name} io flags"), &got, &want);
+        round_trip(name, &got, dict, &data);
+    }
+}

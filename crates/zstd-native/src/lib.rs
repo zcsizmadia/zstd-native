@@ -41,7 +41,8 @@
 //! once), with libzstd's output. With `std`, [`Compressor`],
 //! [`StreamEncoder`] and [`Encoder`] also compress with worker threads
 //! (`set_workers`, libzstd's `ZSTD_c_nbWorkers`), with libzstd's
-//! multithreaded output.
+//! multithreaded output. Their `set_checksum` ends frames with a content
+//! checksum (`ZSTD_c_checksumFlag`, off by default).
 //!
 //! ```
 //! use std::io::Write;
