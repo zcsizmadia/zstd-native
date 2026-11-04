@@ -2,7 +2,8 @@
 //!
 //! `cargo run --release -p zstd-bench --example profile_decode -- <dataset> <level> <lib> <seconds>`
 //! with lib `native` (per-CPU default), `native-asm` / `native-noasm`
-//! (force the asm or Rust Huffman loops) or `c`.
+//! (force the asm or Rust Huffman loops), `c`, or `structured`
+//! (structured-zstd).
 
 use std::time::Instant;
 
@@ -43,6 +44,7 @@ fn main() {
     });
     let mut native = zstd_native::Decompressor::new();
     let mut c = zstd::bulk::Decompressor::new().unwrap();
+    let mut sd = structured_zstd::decoding::FrameDecoder::new();
     while t.elapsed().as_secs_f64() < secs {
         let len = match lib {
             "native-stream" => {
@@ -72,6 +74,7 @@ fn main() {
             "native" | "native-noasm" | "native-asm" => {
                 native.decompress_to_slice(&comp, &mut out).unwrap()
             }
+            "structured" => sd.decode_all(&comp, &mut out).unwrap(),
             _ => c.decompress_to_buffer(&comp, &mut out[..]).unwrap(),
         };
         assert_eq!(len, data.len());
