@@ -513,6 +513,7 @@ unsafe fn search_max<const MLS: u32, const METHOD: u8, const ROW_LOG: u32>(
 /// variant like libzstd: depth from the strategy, the row finder when
 /// [`MatchState::use_row_match_finder`], `mls = clamp(minMatch, 4, 6)` and
 /// `rowLog = clamp(searchLog, 4, 6)`.
+#[inline(never)]
 pub(crate) fn compress_block_lazy(
     ms: &mut MatchState,
     ss: &mut SeqStore,

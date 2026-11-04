@@ -52,6 +52,7 @@ pub(crate) fn fill_double_hash_table(
 /// [`compress_block_fast`](super::fast::compress_block_fast). Picks the
 /// `ZSTD_compressBlock_doubleFast_noDict_<mls>` variant like libzstd
 /// (3 and other values use 4).
+#[inline(never)]
 pub(crate) fn compress_block_double_fast(
     ms: &mut MatchState,
     ss: &mut SeqStore,

@@ -604,6 +604,7 @@ pub(crate) fn build_seq_store(
 /// `mls = minMatch` (3 and other values use 4), `useCmov = windowLog < 19`
 /// (the two variants find the same matches; only the code differs).
 /// Updates `rep` and returns the number of trailing literals.
+#[inline(never)]
 pub(crate) fn compress_block_fast(
     ms: &mut MatchState,
     ss: &mut SeqStore,
