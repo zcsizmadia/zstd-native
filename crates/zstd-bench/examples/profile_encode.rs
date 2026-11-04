@@ -1,6 +1,6 @@
 //! Compress one dataset in a loop (MiB/s of input), zstd-native vs libzstd.
 //!
-//! `cargo run --profile bench -p zstd-bench --example profile_encode -- <dataset> <level> <native|c|native-stream|c-stream> <seconds> [chunk]`
+//! `cargo run --profile bench -p zstd-bench --example profile_encode -- <dataset> <level> <native|c|structured|native-stream|c-stream> <seconds> [chunk]`
 //!
 //! `ZSTD_BENCH_WORKERS=n` compresses with n worker threads (one-shot modes),
 //! and `ZSTD_BENCH_REPEAT=k` repeats the dataset k times (multithreading
@@ -65,6 +65,11 @@ fn main() {
                     }
                     e.finish().unwrap().len()
                 }
+                "structured" => structured_zstd::encoding::compress_slice_to_vec(
+                    p,
+                    structured_zstd::encoding::CompressionLevel::Level(level),
+                )
+                .len(),
                 _ => c.compress_to_buffer(p, &mut out[..]).unwrap(),
             };
         }
