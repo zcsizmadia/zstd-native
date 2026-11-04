@@ -370,7 +370,13 @@ impl StreamDecoder {
         let last = bh & 1 != 0;
         let btype = ((bh >> 1) & 3) as u8;
         let size = (bh >> 3) as usize;
-        if btype == 3 || size > self.block_max {
+        // libzstd's streaming stages check both the compressed size (1 for
+        // an RLE block) and the regenerated size against `blockSizeMax`
+        // (`ZSTD_decompressContinue`). They differ only for an RLE block in
+        // a window of 0 (a single-segment frame of content size 0), which
+        // libzstd rejects even when it regenerates 0 bytes.
+        let csize = if btype == 1 { 1 } else { size };
+        if btype == 3 || size.max(csize) > self.block_max {
             return Err(Error::Corrupted);
         }
         self.stage = Stage::Block { btype, size, last };
