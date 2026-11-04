@@ -276,3 +276,54 @@ fn never_more_lenient_than_libzstd() {
         }
     }
 }
+
+/// `decode`: a compressed block that regenerates more than the frame's
+/// largest block (`Block_Maximum_Size`, here the 1 KiB window). The format
+/// forbids it, and libzstd rejects it: its streaming stages decode into a
+/// `blockSizeMax` buffer, and its one-shot decoder, given room, puts the
+/// literals `blockSizeMax + WILDCOPY_OVERLENGTH` after the block and stops
+/// the sequences there (`ZSTD_allocateLiteralsBuffer`,
+/// `ZSTD_decompressSequences_body`). zstd-native's one-shot decoder bounded
+/// the block only by the output space: the slice API accepted the 70,000
+/// bytes into a large buffer, and the growing-vector API, which reserves
+/// `Block_Maximum_Size` per compressed block, failed with `OutputTooSmall`.
+#[test]
+fn compressed_block_larger_than_block_size_max() {
+    // No content size, 1 KiB window; 6 empty raw blocks, then a last
+    // compressed block: 2 raw literals "aa", then 1 sequence (predefined
+    // tables) whose match repeats them to 70,000 bytes of "a".
+    let src = frame(
+        &[0x00, 0x00],
+        &[
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // empty raw blocks
+            0x55, 0x00, 0x00, // last, compressed, 10 bytes
+            0x10, 0x61, 0x61, // raw literals "aa"
+            0x01, 0x00, // 1 sequence, predefined tables
+            0x6b, 0x11, 0x39, 0xc0, 0x02, // the sequence bitstream
+        ],
+    );
+    assert_eq!(src.len(), 37);
+    check(&src, false, false);
+
+    let mut buf = vec![0u8; 8 << 20];
+    let mut c = DCtx::create();
+    assert!(c.decompress(&mut buf[..], &src).is_err());
+    // Every one-shot API rejects it the same way, whatever the room.
+    let mut d = Decompressor::new();
+    let corrupted = Err(zstd_native::Error::Corrupted);
+    let err = |r: Result<Vec<u8>, zstd_native::Error>| r.map(|v| v.len());
+    assert_eq!(d.decompress_to_slice(&src, &mut buf), corrupted);
+    assert_eq!(d.decompress_to_slice(&src, &mut buf[..70_000]), corrupted);
+    assert_eq!(err(d.decompress(&src)), corrupted);
+    assert_eq!(err(zstd_native::decompress(&src)), corrupted);
+    let mut v = Vec::with_capacity(1 << 20);
+    assert_eq!(
+        d.decompress_append(&src, &mut v).map(|_| v.len()),
+        corrupted
+    );
+    // A smaller output buffer than the block's limit is still too small.
+    assert_eq!(
+        d.decompress_to_slice(&src, &mut buf[..100]),
+        Err(zstd_native::Error::OutputTooSmall)
+    );
+}
