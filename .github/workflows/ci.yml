@@ -35,6 +35,10 @@ jobs:
       - run: cargo doc -p zstd-native --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      # The fuzz crate (its own workspace; running it needs nightly and
+      # cargo-fuzz) must keep compiling.
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml --check
+      - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 
   test:
     name: test ${{ matrix.name }}

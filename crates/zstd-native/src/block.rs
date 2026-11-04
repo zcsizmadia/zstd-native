@@ -12,7 +12,7 @@
 use alloc::vec::Vec;
 use core::ptr;
 
-use crate::bits::BitReader;
+use crate::bits::{BitReader, SeqBits};
 use crate::cpu::Features;
 use crate::error::{Error, Result};
 use crate::fse::{self, LL_KIND, ML_KIND, OF_KIND, SeqSymbol, SeqTables};
@@ -398,8 +398,8 @@ struct Seq {
 
 /// One sequence (libzstd's `ZSTD_decodeSequence`, 64-bit flavor).
 #[inline(always)]
-fn decode_sequence(
-    br: &mut BitReader<'_>,
+fn decode_sequence<B: SeqBits>(
+    br: &mut B,
     tp: *const SeqSymbol,
     ll: &mut usize,
     ml: &mut usize,
@@ -573,6 +573,78 @@ mod copy {
     }
 }
 
+/// Executes one sequence inside a decode loop: the fast path when the
+/// sequence (plus the wildcopy slack) fits in the output and the literals,
+/// else `exec_sequence_end`; then `continue`s the loop. The loop's
+/// cursors (`op`, `lp`) and bounds are passed by name so the fast and the
+/// checked loop share it with everything in registers.
+macro_rules! exec_seq {
+    ($seq:expr; $op:ident, $lp:ident; $base:ident, $cap:ident, $prefix_start:ident,
+     $oend_w:ident, $lit_start:ident, $lit_end:ident, $lit_total:expr, $prefix:ident,
+     $dict:ident) => {{
+        let seq = $seq;
+        let seq_len = seq.lit_len + seq.match_len;
+        // In u64 so the sums can't wrap on 32-bit targets (free on 64-bit).
+        if $lp as u64 + seq.lit_len as u64 > $lit_end as u64
+            || $op as u64 + seq_len as u64 > $oend_w as u64
+        {
+            let o = $op as usize - $base as usize;
+            let mut lit = $lp as usize - $lit_start as usize;
+            let o = exec_sequence_end(
+                $base,
+                $cap,
+                o,
+                seq.lit_len,
+                seq.match_len,
+                seq.offset,
+                $lit_start,
+                $lit_total,
+                &mut lit,
+                $prefix,
+                $dict,
+            )?;
+            // SAFETY: the new positions are within the output and literals.
+            unsafe {
+                $op = $base.add(o);
+                $lp = $lit_start.add(lit);
+            }
+            continue;
+        }
+        // SAFETY: the sequence plus WILDCOPY_OVERLENGTH fits in the
+        // output, so every wildcopy write is in bounds; the literals have
+        // WILDCOPY_OVERLENGTH readable bytes past their end (see
+        // `decode_literals`); match sources are checked to lie in the
+        // dictionary (`dict_match`) or in already written output.
+        unsafe {
+            copy::copy16($op, $lp);
+            if seq.lit_len > 16 {
+                copy::wildcopy($op.add(16), $lp.add(16), seq.lit_len - 16);
+            }
+            $lp = $lp.add(seq.lit_len);
+            let mut mop = $op.add(seq.lit_len);
+            let op_end = $op.add(seq_len);
+            let match_len = seq.match_len;
+            let offset = seq.offset;
+            let in_prefix = mop as usize - $prefix_start as usize;
+            if offset > in_prefix {
+                dict_match(mop, offset, in_prefix, match_len, $prefix_start, $dict)?;
+                $op = op_end;
+                continue;
+            }
+            let mut mp: *const u8 = mop.sub(offset);
+            if offset >= 16 {
+                copy::wildcopy(mop, mp, match_len);
+            } else {
+                copy::overlap_copy8(&mut mop, &mut mp, offset);
+                if match_len > 8 {
+                    copy::wildcopy8(mop, mp, match_len - 8);
+                }
+            }
+            $op = op_end;
+        }
+    }};
+}
+
 /// The fused decode + execute loop (libzstd's `ZSTD_decompressSequences_body`).
 /// (Decoding batches of sequences first and executing them after was
 /// measured 15% slower.)
@@ -611,60 +683,29 @@ fn sequences_body(
     let mut lp = lits.ptr;
 
     let mut n = nb_seq;
+    // Fast loop: the sentinel bit reader (`FastBits`), whose reloads have
+    // no bounds checks. A sequence reloads at most twice, 8 bytes each, so
+    // it runs while 16 bytes remain before the window.
+    if n > 0 && br.pos() >= 16 {
+        let mut fb = br.fast();
+        // SAFETY: `pos() >= 16`.
+        let limit = unsafe { br.start().add(16) };
+        // 32 bytes of padding put the loop's first instruction on a
+        // 64-byte boundary (measured: 2-4% faster than the other three
+        // residues); re-check with objdump after changes to the loop entry.
+        align_hot_loop!(32);
+        while n > 0 && fb.ip >= limit {
+            n -= 1;
+            let seq = decode_sequence(&mut fb, tp, &mut ll, &mut ml, &mut of, &mut reps, n == 0);
+            exec_seq!(seq; op, lp; base, cap, prefix_start, oend_w, lit_start, lit_end, lits.len, prefix, dict);
+        }
+        br = br.resume(fb);
+    }
+    // The last sequences, with the checked reader.
     while n > 0 {
         n -= 1;
-        {
-            let seq = decode_sequence(&mut br, tp, &mut ll, &mut ml, &mut of, &mut reps, n == 0);
-            let seq_len = seq.lit_len + seq.match_len;
-            // In u64 so the sums can't wrap on 32-bit targets (free on 64-bit).
-            if lp as u64 + seq.lit_len as u64 > lit_end as u64
-                || op as u64 + seq_len as u64 > oend_w as u64
-            {
-                let o = op as usize - base as usize;
-                let mut lit = lp as usize - lit_start as usize;
-                let o = exec_sequence_end(
-                    base, cap, o, seq, lit_start, lits.len, &mut lit, prefix, dict,
-                )?;
-                // SAFETY: the new positions are within the output and literals.
-                unsafe {
-                    op = base.add(o);
-                    lp = lit_start.add(lit);
-                }
-                continue;
-            }
-            // SAFETY: the sequence plus WILDCOPY_OVERLENGTH fits in the
-            // output, so every wildcopy write is in bounds; the literals have
-            // WILDCOPY_OVERLENGTH readable bytes past their end (see
-            // `decode_literals`); match sources are checked to lie in the
-            // dictionary (`dict_match`) or in already written output.
-            unsafe {
-                copy::copy16(op, lp);
-                if seq.lit_len > 16 {
-                    copy::wildcopy(op.add(16), lp.add(16), seq.lit_len - 16);
-                }
-                lp = lp.add(seq.lit_len);
-                let mut mop = op.add(seq.lit_len);
-                let op_end = op.add(seq_len);
-                let match_len = seq.match_len;
-                let offset = seq.offset;
-                let in_prefix = mop as usize - prefix_start as usize;
-                if offset > in_prefix {
-                    dict_match(mop, offset, in_prefix, match_len, prefix_start, dict)?;
-                    op = op_end;
-                    continue;
-                }
-                let mut mp: *const u8 = mop.sub(offset);
-                if offset >= 16 {
-                    copy::wildcopy(mop, mp, match_len);
-                } else {
-                    copy::overlap_copy8(&mut mop, &mut mp, offset);
-                    if match_len > 8 {
-                        copy::wildcopy8(mop, mp, match_len - 8);
-                    }
-                }
-                op = op_end;
-            }
-        }
+        let seq = decode_sequence(&mut br, tp, &mut ll, &mut ml, &mut of, &mut reps, n == 0);
+        exec_seq!(seq; op, lp; base, cap, prefix_start, oend_w, lit_start, lit_end, lits.len, prefix, dict);
     }
     *rep = reps;
     if !br.is_end() {
@@ -691,37 +732,36 @@ fn exec_sequence_end(
     base: *mut u8,
     cap: usize,
     o: usize,
-    seq: Seq,
+    lit_len: usize,
+    match_len: usize,
+    offset: usize,
     lit_base: *const u8,
     lit_total: usize,
     lit: &mut usize,
     prefix: usize,
     dict: &[u8],
 ) -> Result<usize> {
-    let total = seq
-        .lit_len
-        .checked_add(seq.match_len)
-        .ok_or(Error::Corrupted)?;
+    let total = lit_len.checked_add(match_len).ok_or(Error::Corrupted)?;
     if total > cap - o {
         return Err(Error::OutputTooSmall);
     }
-    if seq.lit_len > lit_total - *lit {
+    if lit_len > lit_total - *lit {
         return Err(Error::Corrupted);
     }
-    let o_lit_end = o + seq.lit_len;
+    let o_lit_end = o + lit_len;
     let in_prefix = o_lit_end - prefix;
-    if seq.offset > in_prefix + dict.len() {
+    if offset > in_prefix + dict.len() {
         return Err(Error::Corrupted);
     }
     // SAFETY: the literal and output ranges were checked above; the match
     // source is in the dictionary or before `op` in the output.
     unsafe {
-        ptr::copy_nonoverlapping(lit_base.add(*lit), base.add(o), seq.lit_len);
-        *lit += seq.lit_len;
+        ptr::copy_nonoverlapping(lit_base.add(*lit), base.add(o), lit_len);
+        *lit += lit_len;
         let mut op = base.add(o_lit_end);
-        let mut match_len = seq.match_len;
-        if seq.offset > in_prefix {
-            let back = seq.offset - in_prefix;
+        let mut match_len = match_len;
+        if offset > in_prefix {
+            let back = offset - in_prefix;
             let dp = dict.as_ptr().add(dict.len() - back);
             let n = back.min(match_len);
             ptr::copy_nonoverlapping(dp, op, n);
@@ -734,7 +774,7 @@ fn exec_sequence_end(
             let mp = base.add(prefix);
             overlapping_copy(op, mp, match_len);
         } else {
-            let mp = op.sub(seq.offset);
+            let mp = op.sub(offset);
             overlapping_copy(op, mp, match_len);
         }
     }

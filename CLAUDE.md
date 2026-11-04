@@ -36,13 +36,15 @@ On this Windows machine, cargo is in `~/.cargo/bin` (not on PATH in Bash).
 
 - `unsafe` is denied by default and allowed only in hot paths, each block
   with a SAFETY comment and debug assertions: `bits.rs` (raw-pointer bit
-  reader), `huf.rs` fast loops, `huf_asm.rs` (asm! port of libzstd's
-  Huffman loops), `block.rs` sequence execution and copies, the encoder's
-  match finders and `enc/block_asm.rs` (asm! block loops of `fast` and
-  `dfast`), the encoder's bit writers (`enc/bitwriter.rs`, `enc/huf_enc.rs`:
-  8-byte flushes) and its run-time dispatch to `#[target_feature]` loops
-  (`enc/seq_store.rs`), and the output writes in `decoder.rs`. New `unsafe`
-  needs a benchmark showing the gain.
+  reader, `FastBits` of the sequence loop), `huf.rs` fast loops,
+  `huf_asm.rs` (asm! port of libzstd's Huffman loops), `block.rs`
+  sequence execution and copies, the encoder's match finders and
+  `enc/block_asm.rs` (asm! block loops of `fast` and `dfast`), the
+  encoder's bit writers (`enc/bitwriter.rs`, `enc/huf_enc.rs`: 8-byte
+  flushes) and its run-time dispatch to `#[target_feature]` loops
+  (`enc/seq_store.rs`), the output writes in `decoder.rs`, and the
+  `align_hot_loop!` macro in `lib.rs` (an `asm!` alignment directive
+  before the hot loops). New `unsafe` needs a benchmark showing the gain.
 - CPU-specific code goes behind run-time detection (`cpu.rs`), compiled
   with `#[target_feature]` (BMI2 today), with the generic version selected
   by the `portable` feature for testing.

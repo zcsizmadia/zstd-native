@@ -73,6 +73,26 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
   bits (+1-3% on logs and numeric data, -3% on text: the extra branch
   mispredicts), reading offset and match length bits together (-9%: the
   loop's register allocation is fragile; measure every change).
+  Then to 1.05-1.09x (Silesia geometric means, EPYC): a fast loop with
+  the sentinel bit reader of the Huffman loops (`bits::FastBits`: the
+  container kept left-aligned with a 1 bit below the valid bits, so a
+  read is one shift and a reload needs no bounds check, two registers
+  instead of four), run while 16 bytes remain before the stream start
+  (at most two 8-byte reloads per sequence); the checked reader finishes
+  the block. Rejected: decoding literals into the output buffer after the
+  block's room (libzstd's `ZSTD_in_dst`, one write stream instead of
+  two): neutral once code alignment was held constant.
+- **Code alignment**: the hot loops' speed swings 2-5% with their
+  placement mod 64, which the linker decides from the whole binary
+  (issue #19: the criterion and `profile_decode` binaries differed by
+  3%). `align_hot_loop!(pad)` (an `asm!` `.p2align 6` plus `pad` nops in
+  the loop's preheader, as libzstd's `.p2align` before its sequence
+  loop) pins the loop's first instruction relative to the function;
+  `pad` is tuned per loop so the sequence loop starts on a 64-byte
+  boundary (the other three residues measured 2-4% slower) and the
+  Huffman loops too (32 mod 64 measured 2% slower). The exit of the fast
+  sequence loop is a `#[cold]` call so the loop, not its exit, follows
+  the padding. Re-check with `objdump` after changing a loop's entry.
 - **Huffman**: X1 (one symbol per lookup) and X2 (up to two), chosen per
   block with libzstd's `HUF_selectDecoder` timing table. The X2 table is
   derived from the X1 table (cell `i` = X1 at `i`, plus X1 at
@@ -104,11 +124,11 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
 
 ## Roadmap
 
-1. Decoder speed to >= 1.0x libzstd everywhere (Huffman is there; the
-   sequence loop is within 1-2%): a long-offset decoder with
-   prefetching (libzstd's `ZSTD_decompressSequencesLong`) for large
-   windows; literals placed in the output buffer like libzstd's split
-   literal buffer; more measurement on Silesia (`ZSTD_BENCH_CORPUS`).
+1. ~~Decoder speed to >= 1.0x libzstd everywhere~~ (done: Silesia
+   geometric means 1.05x at L1, 1.08x at L3, 1.09x at L9 and L19 on the
+   EPYC host, every file and level above 1.0x except nci L19 at 0.98x).
+   Remaining: nci L19; the per-block table builds (`fse::build_seq_table`
+   and `spread`, `HufTable::read`: ~8% of cycles vs libzstd's ~6%).
 2. ~~Streaming decoder~~ (done: `stream.rs`, `io.rs`; window buffer of
    window + 2 blocks + 64 with the old segment as history after a wrap;
    0.98-1.21x libzstd's streaming decoder). Next: write into the
@@ -173,8 +193,9 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
    libzstd's speed with 4-8 workers in first measurements (Windows
    laptop), single-threaded speed unchanged. Not ported: `ZSTD_c_rsyncable`,
    checksums (the encoder writes none yet).
-5. Fuzzing (cargo-fuzz, differential vs libzstd), Miri, CI matrix
-   (x86-64/AArch64, Linux/Windows/macOS, 32-bit), AArch64 tuning.
+5. ~~Fuzzing~~ (done, #13: cargo-fuzz targets differential against
+   libzstd, see [Fuzzing](#fuzzing)), Miri, CI matrix (x86-64/AArch64,
+   Linux/Windows/macOS, 32-bit), AArch64 tuning.
 
 ## Benchmarks
 
@@ -182,3 +203,42 @@ Authoritative numbers come from the EPYC host (AMD EPYC 7543, Zen 3,
 AVX2/BMI2), one pinned core (`taskset -c 8`), `cargo bench -p zstd-bench
 --bench decode`. Datasets: the zstd C sources (text), synthetic logs,
 numeric binary, random; add Silesia with `ZSTD_BENCH_CORPUS`.
+
+## Fuzzing
+
+`fuzz/` holds cargo-fuzz targets (libFuzzer, nightly only; its own
+workspace, so the stable CI only checks that it compiles). Every target
+compares zstd-native with C libzstd 1.5.7 (the `zstd` crate), and each
+input picks its parameters with `arbitrary`:
+
+| Target | Input | Checks |
+|---|---|---|
+| `decode` | arbitrary bytes | never panics; the asm and Rust Huffman loops, the slice and the `Vec` APIs agree; whatever zstd-native accepts, libzstd accepts with the same output |
+| `stream_decode` | arbitrary bytes, input pieces, output sizes, a dictionary from arbitrary bytes (raw, trained, or trained and mutated), a window limit | as `decode` for `StreamDecoder` against `ZSTD_decompressStream`, plus the one-shot and `std::io::Read` decoders |
+| `decode_valid` | arbitrary data and parameters (level -7 to 22, checksum, content size, window log, long distance matching, dictionary, flush points) compressed by libzstd | every zstd-native decoding API returns the data exactly, with input and output pieces of arbitrary sizes |
+| `compress` | arbitrary data and parameters (level, window log, long distance matching, workers, job size, overlap, loaded or prepared dictionaries from arbitrary bytes), one-shot with a reused context or a streaming script of input pieces, flushes, frame ends and output sizes | byte-identical with libzstd for the same calls; both libraries decode it back |
+
+The Huffman `asm!` loops are forced on and off per input
+(`__private::set_asm`); the generic code paths need a build with
+`--features portable`. Decoding arbitrary bytes caps the output at 8 MiB
+(an RLE block expands 3 bytes to 128 KiB); the optimal parser gets at
+most 48 KiB of data per input.
+
+```sh
+cargo install cargo-fuzz
+cd fuzz
+cargo +nightly run --release --bin seeds -- corpus   # seed frames for decode and stream_decode
+cargo +nightly fuzz run decode -- -max_len=65536 -timeout=30
+cargo +nightly fuzz run compress --features portable -- -max_len=131072 -timeout=30
+cargo +nightly fuzz run compress -- -fork=8 -ignore_crashes=1 -max_len=131072 -timeout=30
+cargo +nightly fuzz cmin decode                      # minimise the corpus
+```
+
+Crashes land in `fuzz/artifacts/<target>/`; `cargo fuzz fmt <target>
+<file>` prints the `arbitrary` structure of an input, `cargo fuzz tmin`
+minimises it. With AddressSanitizer (the default), build libzstd without
+use-after-scope checks (`CFLAGS="-fsanitize=address
+-fno-sanitize-address-use-after-scope"`): clang 14 poisons a constant
+local table in `zstd_opt.c` that it promoted to a global, a false
+positive. Every bug the fuzzers find gets a regression test in
+`crates/zstd-bench/tests/`.

@@ -1,0 +1,56 @@
+[package]
+name = "zstd-native-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "BSD-3-Clause"
+description = "cargo-fuzz targets: zstd-native against C libzstd 1.5.7 (see docs/PROPOSAL.md, Fuzzing)"
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+## Fuzz the generic code paths (no BMI2, no asm).
+portable = ["zstd-native/portable"]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+zstd-native = { path = "../crates/zstd-native" }
+# C libzstd 1.5.7: the oracle. Never a dependency of zstd-native.
+zstd = { version = "0.14", default-features = false, features = ["zstdmt", "experimental", "zdict_builder"] }
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_valid"
+path = "fuzz_targets/decode_valid.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "compress"
+path = "fuzz_targets/compress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream_decode"
+path = "fuzz_targets/stream_decode.rs"
+test = false
+doc = false
+bench = false
+
+# Its own workspace: the fuzz crate needs nightly and never builds in the
+# stable CI of the main workspace (which excludes `fuzz`).
+[workspace]
+
+[profile.release]
+debug = 1
