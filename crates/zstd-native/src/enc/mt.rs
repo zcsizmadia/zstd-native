@@ -372,7 +372,7 @@ fn run_job(fc: &mut Option<Box<FrameCompressor>>, job: &Job) -> Result<(Vec<u8>,
         FrameCompressor::start_frame(fc, f.cp, f.cdict.as_ref(), f.pledged, false)
     } else {
         // the job's size, the previous job's end as a prefix
-        let fc = FrameCompressor::start_frame(fc, f.cp, None, Some(size as u64), false);
+        let fc = FrameCompressor::start_frame_for_prefix(fc, f.cp, Some(size as u64), false);
         load_prefix(&mut fc.ms, buf, 0, src_start);
         fc
     };

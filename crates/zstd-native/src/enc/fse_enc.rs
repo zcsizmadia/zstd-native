@@ -493,7 +493,9 @@ impl<const STATES: usize, const SYMBOLS: usize> FseCTable<STATES, SYMBOLS> {
         let table_mask = table_size - 1;
         let step = table_step(table_size);
         let mut cumul = [0u32; 257];
-        let mut table_symbol = [0u8; 1 << FSE_MAX_TABLELOG];
+        // (`ts <= STATES`: smaller than libzstd's `1 << FSE_MAX_TABLELOG`
+        // workspace, which matters for the zeroing.)
+        let mut table_symbol = [0u8; STATES];
         let mut high_threshold = table_size - 1;
 
         self.table_log = table_log;
@@ -530,7 +532,7 @@ impl<const STATES: usize, const SYMBOLS: usize> FseCTable<STATES, SYMBOLS> {
             // No low-probability symbols: lay the symbols out in order,
             // then scatter (libzstd's fast path; same result as the loop
             // below).
-            let mut spread = [0u8; 1 << FSE_MAX_TABLELOG];
+            let mut spread = [0u8; STATES];
             let mut pos = 0usize;
             for (s, &n) in norm[..max_sv1].iter().enumerate() {
                 let n = n as usize;

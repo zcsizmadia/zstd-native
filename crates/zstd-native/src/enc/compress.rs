@@ -500,18 +500,26 @@ impl FrameCompressor {
     /// and `ZSTD_reset_compressedBlockState`).
     pub(crate) fn reset(&mut self, level: i32, src_size: usize) {
         let cp = one_shot_cparams(level, src_size as u64);
-        self.reset_with_params(cp, Some(src_size as u64), ldm_enabled(&cp));
+        self.reset_with_params(cp, Some(src_size as u64), ldm_enabled(&cp), true);
     }
 
     /// As [`reset`](Self::reset), with resolved parameters, a frame of
     /// `pledged` bytes (`None`: unknown) and long distance matching if
-    /// `ldm`.
-    pub(crate) fn reset_with_params(&mut self, cp: CParams, pledged: Option<u64>, ldm: bool) {
+    /// `ldm`. With `keep_indices` (no dictionary follows), the match state
+    /// continues its indices when it can
+    /// ([`MatchState::reset_keep_indices`]).
+    pub(crate) fn reset_with_params(
+        &mut self,
+        cp: CParams,
+        pledged: Option<u64>,
+        ldm: bool,
+        keep_indices: bool,
+    ) {
         let use_row = row_match_finder_used(
             cp.strategy,
             resolve_row_match_finder_mode(ParamSwitch::Auto, &cp),
         );
-        self.reset_full(cp, pledged, use_row, &cp, ldm);
+        self.reset_full(cp, pledged, use_row, &cp, ldm, keep_indices);
     }
 
     /// `ZSTD_resetCCtx_internal`: [`reset_with_params`](Self::reset_with_params)
@@ -526,6 +534,7 @@ impl FrameCompressor {
         use_row: bool,
         frame_cp: &CParams,
         ldm: bool,
+        keep_indices: bool,
     ) {
         let bsm = block_size_max(&cp, pledged.unwrap_or(CONTENTSIZE_UNKNOWN));
         self.ldm_on = ldm;
@@ -536,7 +545,11 @@ impl FrameCompressor {
             }
         }
         self.cp = cp;
-        self.ms.reset_with(cp, use_row, false);
+        if keep_indices {
+            self.ms.reset_keep_indices(cp, use_row);
+        } else {
+            self.ms.reset_with(cp, use_row, false);
+        }
         if let Some(o) = self.ms.opt.as_deref_mut() {
             o.dict_costs = None;
         }
@@ -581,6 +594,30 @@ impl FrameCompressor {
         pledged: Option<u64>,
         ldm: bool,
     ) -> &'a mut FrameCompressor {
+        Self::start_frame_impl(slot, frame_cp, cdict, pledged, ldm, true)
+    }
+
+    /// As [`start_frame`](Self::start_frame) without a dictionary, for a
+    /// frame whose prefix is then loaded into the match state
+    /// ([`load_prefix`](super::cdict::load_prefix)): the match state's
+    /// indices restart (no [`MatchState::reset_keep_indices`]).
+    pub(crate) fn start_frame_for_prefix(
+        slot: &mut Option<Box<FrameCompressor>>,
+        frame_cp: CParams,
+        pledged: Option<u64>,
+        ldm: bool,
+    ) -> &mut FrameCompressor {
+        Self::start_frame_impl(slot, frame_cp, None, pledged, ldm, false)
+    }
+
+    fn start_frame_impl<'a>(
+        slot: &'a mut Option<Box<FrameCompressor>>,
+        frame_cp: CParams,
+        cdict: Option<&Arc<CDict>>,
+        pledged: Option<u64>,
+        ldm: bool,
+        keep_indices: bool,
+    ) -> &'a mut FrameCompressor {
         let fc = match slot {
             Some(f) => f,
             None => {
@@ -604,7 +641,7 @@ impl FrameCompressor {
                 }
             }
             _ => {
-                fc.reset_with_params(frame_cp, pledged, ldm);
+                fc.reset_with_params(frame_cp, pledged, ldm, keep_indices && cdict.is_none());
                 if let Some(cd) = cdict {
                     // ZSTD_compress_insertDictionary
                     cd.load_into(&mut fc.ms);
@@ -642,7 +679,7 @@ impl FrameCompressor {
             resolve_row_match_finder_mode(ParamSwitch::Auto, &frame_cp),
         );
         cp.window_log = frame_cp.window_log;
-        self.reset_full(cp, pledged, cd.use_row, &frame_cp, ldm);
+        self.reset_full(cp, pledged, cd.use_row, &frame_cp, ldm, false);
         debug_assert!(self.cp.strategy == cd.cparams.strategy);
         // don't even attach dictionaries with no contents
         if cd.has_window_content() {
@@ -671,7 +708,7 @@ impl FrameCompressor {
     fn copy_cdict(&mut self, frame_cp: CParams, cd: &Arc<CDict>, pledged: Option<u64>, ldm: bool) {
         let mut cp = cd.cparams;
         cp.window_log = frame_cp.window_log;
-        self.reset_full(cp, pledged, cd.use_row, &frame_cp, ldm);
+        self.reset_full(cp, pledged, cd.use_row, &frame_cp, ldm, false);
         let ms = &mut self.ms;
         let src = &cd.ms;
         // copy tables, removing the tags of a fast or dfast CDict's

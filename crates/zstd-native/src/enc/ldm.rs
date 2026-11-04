@@ -40,7 +40,6 @@
 //! it then stays in the [`CDict`]'s buffer, the extDict of the LDM window.
 
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use super::cdict::CDict;
@@ -604,7 +603,7 @@ pub(crate) struct LdmState {
     /// `loadedDictEnd`
     loaded_dict_end: u32,
     /// `hashTable`: `1 << hash_log` entries in buckets.
-    hash_table: Vec<LdmEntry>,
+    hash_table: super::table::Table<LdmEntry>,
     /// `bucketOffsets`: the next entry to replace in each bucket.
     bucket_offsets: Vec<u8>,
     /// The dictionary loaded into the window (its extDict while
@@ -636,7 +635,7 @@ impl LdmState {
             params: LdmParams::new(cp),
             window: Window::new(),
             loaded_dict_end: 0,
-            hash_table: Vec::new(),
+            hash_table: super::table::Table::new(),
             bucket_offsets: Vec::new(),
             dict: None,
             seqs: RawSeqStore::default(),
@@ -653,11 +652,7 @@ impl LdmState {
         let p = LdmParams::new(cp);
         self.params = p;
         let h_size = 1usize << p.hash_log;
-        if self.hash_table.len() == h_size {
-            self.hash_table.fill(LdmEntry::default());
-        } else {
-            self.hash_table = vec![LdmEntry::default(); h_size];
-        }
+        self.hash_table.reset_zeroed(h_size);
         let nb_buckets = 1usize << (p.hash_log - p.bucket_size_log);
         self.bucket_offsets.clear();
         self.bucket_offsets.resize(nb_buckets, 0);
@@ -766,7 +761,7 @@ impl LdmState {
 
     /// `ZSTD_ldm_reduceTable()`.
     fn reduce_table(&mut self, reducer_value: u32) {
-        for e in &mut self.hash_table {
+        for e in self.hash_table.iter_mut() {
             e.offset = e.offset.saturating_sub(reducer_value);
         }
     }

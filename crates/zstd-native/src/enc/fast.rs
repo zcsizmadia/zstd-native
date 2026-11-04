@@ -60,8 +60,6 @@ use super::seq_store::{
     REPCODE1_TO_OFFBASE, SeqStore, count, count_2segments, hash4_ptr, hash5_ptr, hash6_ptr,
     hash7_ptr, hash8_ptr, offset_to_offbase, read32,
 };
-use alloc::vec;
-use alloc::vec::Vec;
 
 /// `ZSTD_WINDOW_START_INDEX`: the index of a fresh window's first byte.
 pub(crate) const WINDOW_START_INDEX: u32 = 2;
@@ -75,6 +73,9 @@ pub(crate) const CURRENT_MAX: u32 = if usize::BITS == 64 {
 } else {
     2000 << 20
 };
+/// `ZSTD_INDEXOVERFLOW_MARGIN`: a reused context resets its indices instead
+/// of continuing them once they are this close to [`CURRENT_MAX`].
+pub(crate) const INDEXOVERFLOW_MARGIN: u32 = 16 << 20;
 /// `ZSTD_HASHLOG3_MAX`: the largest `hashLog3`.
 pub(crate) const HASHLOG3_MAX: u32 = 17;
 /// `ZSTD_CHUNKSIZE_MAX`.
@@ -365,11 +366,11 @@ pub(crate) struct MatchState {
     /// `nextToUpdate`
     pub(crate) next_to_update: u32,
     /// `hashTable`: `1 << cparams.hash_log` entries.
-    pub(crate) hash_table: Vec<u32>,
+    pub(crate) hash_table: super::table::Table<u32>,
     /// `chainTable`: `1 << cparams.chain_log` entries, none for `fast` and
     /// the row match finder. `dfast` uses it as its short-match hash table,
     /// `btlazy2` as its binary tree.
-    pub(crate) chain_table: Vec<u32>,
+    pub(crate) chain_table: super::table::Table<u32>,
     /// `cParams`
     pub(crate) cparams: CParams,
     /// `forceNonContiguous`
@@ -382,7 +383,7 @@ pub(crate) struct MatchState {
     /// between frames of a reused context, only salted differently. Its
     /// stale content never changes the result (see `lazy::row`), so it is
     /// not cleared here either.
-    pub(crate) tag_table: Vec<u8>,
+    pub(crate) tag_table: super::table::Table<u8>,
     /// `hashCache`: the row hashes of the next positions.
     pub(crate) hash_cache: [u32; super::row::ROW_HASH_CACHE_SIZE],
     /// `rowHashLog`: `hash_log - rowLog`.
@@ -398,7 +399,7 @@ pub(crate) struct MatchState {
     /// parser with `minMatch == 3`, else 0 (no table).
     pub(crate) hash_log3: u32,
     /// `hashTable3`: the optimal parser's 3-byte hash table.
-    pub(crate) hash_table3: Vec<u32>,
+    pub(crate) hash_table3: super::table::Table<u32>,
     /// `opt`: the optimal parser's state (btopt and above), allocated on
     /// first use and kept (like libzstd's workspace).
     pub(crate) opt: Option<alloc::boxed::Box<super::opt::OptState>>,
@@ -434,19 +435,19 @@ impl MatchState {
             window: Window::new(),
             loaded_dict_end: 0,
             next_to_update: 0,
-            hash_table: Vec::new(),
-            chain_table: Vec::new(),
+            hash_table: super::table::Table::new(),
+            chain_table: super::table::Table::new(),
             cparams,
             force_non_contiguous: false,
             use_row_match_finder: false,
-            tag_table: Vec::new(),
+            tag_table: super::table::Table::new(),
             hash_cache: [0; super::row::ROW_HASH_CACHE_SIZE],
             row_hash_log: 0,
             hash_salt: 0,
             hash_salt_entropy: 0,
             lazy_skipping: false,
             hash_log3: 0,
-            hash_table3: Vec::new(),
+            hash_table3: super::table::Table::new(),
             opt: None,
             dict: None,
             dms: false,
@@ -455,11 +456,9 @@ impl MatchState {
 
     /// `ZSTD_reset_matchState()` with `ZSTDirp_reset` (indices restart at
     /// `ZSTD_WINDOW_START_INDEX`) and `ZSTDcrp_makeClean` (the hash table is
-    /// zeroed), for the CCtx. libzstd's `ZSTDirp_continue` (reusing a
-    /// context) only shifts the indices; the match finders only compare
-    /// indices with each other (the tables are cleared), so it produces the
-    /// same sequences and this port always resets. With the row match
-    /// finder, the hash salt advances (`ZSTD_advanceHashSalt`).
+    /// zeroed), for the CCtx (see [`reset_keep_indices`](Self::reset_keep_indices)
+    /// for `ZSTDirp_continue`). With the row match finder, the hash salt
+    /// advances (`ZSTD_advanceHashSalt`).
     pub(crate) fn reset(&mut self, cparams: CParams) {
         let use_row = row_match_finder_used(
             cparams.strategy,
@@ -474,46 +473,84 @@ impl MatchState {
     /// (`ZSTD_resetTarget_CDict`: no `hashTable3`, no optimal parser state,
     /// a zeroed tag table and a hash salt of 0).
     pub(crate) fn reset_with(&mut self, cparams: CParams, use_row: bool, for_cdict: bool) {
-        self.window = Window::new();
-        self.lazy_skipping = false;
-        self.invalidate();
+        self.reset_impl(cparams, use_row, for_cdict, false);
+    }
+
+    /// [`reset_with`](Self::reset_with) for a CCtx that then compresses
+    /// without a dictionary, with libzstd's `ZSTDirp_continue`, the index
+    /// policy of a reused context (`ZSTD_resetCCtx_internal`): the window
+    /// keeps its indices and is only cleared (`ZSTD_invalidateMatchState`),
+    /// so every index stored by earlier frames is below the new window, and
+    /// tables of an unchanged size are not zeroed again (libzstd's
+    /// `ZSTD_cwksp_clean_tables` only zeroes newly reserved table space).
+    /// The match finders never use an index below the window, so the
+    /// sequences are the same as after a reset. Falls back to the reset
+    /// when the indices come close to the maximum
+    /// (`ZSTD_indexTooCloseToMax`), when the table sizes, the strategy or
+    /// the match finder change, or after a frame with a dictionary.
+    pub(crate) fn reset_keep_indices(&mut self, cparams: CParams, use_row: bool) {
+        self.reset_impl(cparams, use_row, false, true);
+    }
+
+    fn reset_impl(&mut self, cparams: CParams, use_row: bool, for_cdict: bool, keep: bool) {
         let h_size = 1usize << cparams.hash_log;
-        clear_table(&mut self.hash_table, h_size);
         // ZSTD_allocateChainTable: none for `fast` and the row match finder.
         let c_size = if cparams.strategy == Strategy::Fast || use_row {
             0
         } else {
             1usize << cparams.chain_log
         };
-        clear_table(&mut self.chain_table, c_size);
+        // The optimal parser's tables (hashTable3 only with minMatch 3).
+        let hash_log3 = if cparams.min_match == 3 && !for_cdict {
+            HASHLOG3_MAX.min(cparams.window_log)
+        } else {
+            0
+        };
+        let h3_size = if hash_log3 > 0 {
+            1usize << hash_log3
+        } else {
+            0
+        };
+        let keep = keep
+            && !for_cdict
+            && self.dict.is_none()
+            && !self.dms
+            && !self.window.base_in_dict
+            && !self.window.dict_base_in_dict
+            && self.cparams.strategy == cparams.strategy
+            && self.use_row_match_finder == use_row
+            && self.hash_table.len() == h_size
+            && self.chain_table.len() == c_size
+            && self.hash_table3.len() == h3_size
+            // !ZSTD_indexTooCloseToMax
+            && self.window.next_src.wrapping_sub(self.window.base)
+                <= (CURRENT_MAX - INDEXOVERFLOW_MARGIN) as usize;
+        if !keep {
+            self.window = Window::new();
+        }
+        self.lazy_skipping = false;
+        self.invalidate();
+        if !keep {
+            self.hash_table.reset_zeroed(h_size);
+            self.chain_table.reset_zeroed(c_size);
+            self.hash_table3.reset_zeroed(h3_size);
+        }
         self.use_row_match_finder = use_row;
         if use_row {
             if for_cdict {
-                self.tag_table.clear();
-                self.tag_table.resize(h_size, 0);
+                self.tag_table.reset_zeroed(h_size);
                 self.hash_salt = 0;
             } else {
                 // The tag table is "init once" (see its docs): new bytes are
                 // zeroed, existing ones are kept.
-                self.tag_table.resize(h_size, 0);
+                self.tag_table.resize(h_size);
                 self.advance_hash_salt();
             }
             let row_log = cparams.search_log.clamp(4, 6);
             debug_assert!(cparams.hash_log >= row_log);
             self.row_hash_log = cparams.hash_log - row_log;
         }
-        // The optimal parser's tables (hashTable3 only with minMatch 3).
-        self.hash_log3 = if cparams.min_match == 3 && !for_cdict {
-            HASHLOG3_MAX.min(cparams.window_log)
-        } else {
-            0
-        };
-        let h3_size = if self.hash_log3 > 0 {
-            1usize << self.hash_log3
-        } else {
-            0
-        };
-        clear_table(&mut self.hash_table3, h3_size);
+        self.hash_log3 = hash_log3;
         if cparams.strategy >= Strategy::BtOpt && self.opt.is_none() && !for_cdict {
             self.opt = Some(alloc::boxed::Box::new(super::opt::OptState::new()));
         }
@@ -715,15 +752,6 @@ pub(crate) fn write_tagged_index(table: &mut [u32], hash_and_tag: usize, index: 
     let tag = hash_and_tag as u32 & SHORT_CACHE_TAG_MASK;
     debug_assert!(index >> (32 - SHORT_CACHE_TAG_BITS) == 0);
     table[hash] = (index << SHORT_CACHE_TAG_BITS) | tag;
-}
-
-/// Resizes `table` to `size` zeroed entries, reusing its allocation.
-fn clear_table(table: &mut Vec<u32>, size: usize) {
-    if table.len() == size {
-        table.fill(0);
-    } else {
-        *table = vec![0; size];
-    }
 }
 
 /// Safe `ZSTD_hashPtr` on a buffer position (reads `HASH_READ_SIZE` bytes).
@@ -2173,6 +2201,7 @@ pub(super) mod tests {
         MINMATCH, REP_START_VALUE, SeqStore, offbase_is_offset, offbase_to_offset,
     };
     use super::*;
+    use alloc::vec;
     use alloc::vec::Vec;
 
     /// Replays the sequences of `ss` (with repcode history `rep`) onto
@@ -2516,5 +2545,42 @@ pub(super) mod tests {
                 .iter()
                 .all(|&v| v == 0 || (2..1002).contains(&v))
         );
+    }
+
+    #[test]
+    fn keep_indices() {
+        let src = texty(1000, 11);
+        let cp = one_shot_cparams(1, 1000);
+        let mut ms = MatchState::new(cp);
+        ms.update_window(0, src.len());
+        ms.fill_hash_table(&src, src.len(), TableLoadMethod::Fast);
+        let filled = ms.hash_table.iter().filter(|&&v| v != 0).count();
+        assert!(filled > 0);
+        // same parameters: the indices continue past the first frame, the
+        // table is kept
+        ms.reset_keep_indices(cp, false);
+        assert!(!ms.window.has_ext_dict());
+        assert_eq!(ms.window.dict_limit, 1002);
+        assert_eq!(ms.next_to_update, 1002);
+        assert_eq!(ms.hash_table.iter().filter(|&&v| v != 0).count(), filled);
+        ms.update_window(0, src.len());
+        assert_eq!(ms.window.index(0), 1002);
+        assert_eq!(ms.window.dict_limit, 1002);
+        assert!(!ms.window.has_ext_dict());
+        // other parameters: a reset
+        let cp2 = one_shot_cparams(3, 1000);
+        ms.reset_keep_indices(cp2, false);
+        assert_eq!(ms.window, Window::new());
+        assert!(ms.hash_table.iter().all(|&v| v == 0));
+        // indices close to the maximum: a reset
+        ms.reset_keep_indices(cp, false);
+        ms.window.next_src = ms
+            .window
+            .base
+            .wrapping_add((CURRENT_MAX - INDEXOVERFLOW_MARGIN) as usize + 1);
+        ms.hash_table[0] = 7;
+        ms.reset_keep_indices(cp, false);
+        assert_eq!(ms.window, Window::new());
+        assert_eq!(ms.hash_table[0], 0);
     }
 }

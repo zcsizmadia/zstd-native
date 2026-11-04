@@ -289,6 +289,24 @@ fn reused_context_identical() {
             compare(&format!("L{level}"), i, data.len(), got, want);
         }
     }
+    // Runs of frames with the same parameters: both libraries keep the
+    // indices of the previous frames (ZSTDirp_continue) and don't clear
+    // the tables in between; all levels, including fast and dfast.
+    for &level in LEVELS {
+        let mut native = zstd_native::Compressor::new(level);
+        let mut c = zstd::bulk::Compressor::new(level).unwrap();
+        let mut start = 0;
+        for (i, n) in [16_384usize, 16_384, 16_384, 4_096, 4_096, 300_000, 300_000]
+            .into_iter()
+            .enumerate()
+        {
+            let data = &src[start..start + n];
+            start += n / 3;
+            let got = native.compress(data).unwrap();
+            let want = c.compress(data).unwrap();
+            compare(&format!("same-size runs, L{level}"), i, n, got, want);
+        }
+    }
     // Switching levels on the same contexts, including frames that don't
     // use the row match finder (which leave the salt alone).
     let mut native = zstd_native::Compressor::new(1);
