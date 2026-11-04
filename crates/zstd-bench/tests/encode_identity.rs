@@ -3,13 +3,14 @@
 
 use zstd_bench::{Rng, c_compress, datasets, source_corpus};
 
-const LEVELS: &[i32] = &[1, 2, -1, -3, -7];
+const LEVELS: &[i32] = &[1, 2, 3, 4, -1, -3, -7];
 
 fn check(name: &str, data: &[u8], level: i32) {
     let got = match zstd_native::compress(data, level) {
         Ok(v) => v,
         // Strategy not ported yet for this level and size (issues #7-#9).
-        Err(zstd_native::Error::UnsupportedFrameParameter) => return,
+        // (level 4 is greedy for inputs up to 16 KB and of 128-256 KB).
+        Err(zstd_native::Error::UnsupportedFrameParameter) if level > 3 => return,
         Err(e) => panic!("{name} L{level}: {e}"),
     };
     let want = c_compress(data, level);

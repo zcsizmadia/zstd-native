@@ -45,7 +45,7 @@ pub(crate) const WINDOW_START_INDEX: u32 = 2;
 /// `HASH_READ_SIZE`: the match finders read up to 8 bytes per position.
 pub(crate) const HASH_READ_SIZE: usize = 8;
 /// `kSearchStrength`.
-const K_SEARCH_STRENGTH: u32 = 8;
+pub(crate) const K_SEARCH_STRENGTH: u32 = 8;
 /// `ZSTD_CURRENT_MAX`: indices above this trigger overflow correction.
 pub(crate) const CURRENT_MAX: u32 = if usize::BITS == 64 {
     3500 << 20
@@ -295,6 +295,9 @@ pub(crate) struct MatchState {
     pub(crate) next_to_update: u32,
     /// `hashTable`: `1 << cparams.hash_log` entries.
     pub(crate) hash_table: Vec<u32>,
+    /// `chainTable`: `1 << cparams.chain_log` entries, none for `fast`.
+    /// `dfast` uses it as its short-match hash table.
+    pub(crate) chain_table: Vec<u32>,
     /// `cParams`
     pub(crate) cparams: CParams,
     /// `forceNonContiguous`
@@ -310,6 +313,7 @@ impl MatchState {
             loaded_dict_end: 0,
             next_to_update: 0,
             hash_table: Vec::new(),
+            chain_table: Vec::new(),
             cparams,
             force_non_contiguous: false,
         };
@@ -325,12 +329,14 @@ impl MatchState {
     pub(crate) fn reset(&mut self, cparams: CParams) {
         self.window = Window::new();
         self.invalidate();
-        let h_size = 1usize << cparams.hash_log;
-        if self.hash_table.len() == h_size {
-            self.hash_table.fill(0);
+        clear_table(&mut self.hash_table, 1usize << cparams.hash_log);
+        // ZSTD_allocateChainTable: none for `fast`.
+        let c_size = if cparams.strategy == Strategy::Fast {
+            0
         } else {
-            self.hash_table = vec![0; h_size];
-        }
+            1usize << cparams.chain_log
+        };
+        clear_table(&mut self.chain_table, c_size);
         self.cparams = cparams;
         self.force_non_contiguous = false;
     }
@@ -392,9 +398,14 @@ impl MatchState {
         let max_dist = 1u32 << self.cparams.window_log;
         if self.window.need_overflow_correction(iend) {
             let correction = self.window.correct_overflow(cycle_log, max_dist, ip);
-            // ZSTD_reduceIndex: only the hash table exists for `fast`.
-            debug_assert!(self.cparams.strategy == Strategy::Fast);
+            // ZSTD_reduceIndex for `fast` and `dfast` (btlazy2's chain
+            // table needs ZSTD_reduceTable_btlazy2).
+            debug_assert!(matches!(
+                self.cparams.strategy,
+                Strategy::Fast | Strategy::DFast
+            ));
             reduce_table(&mut self.hash_table, correction);
+            reduce_table(&mut self.chain_table, correction);
             self.next_to_update = self.next_to_update.saturating_sub(correction);
             self.loaded_dict_end = 0;
         }
@@ -446,6 +457,15 @@ impl MatchState {
     }
 }
 
+/// Resizes `table` to `size` zeroed entries, reusing its allocation.
+fn clear_table(table: &mut Vec<u32>, size: usize) {
+    if table.len() == size {
+        table.fill(0);
+    } else {
+        *table = vec![0; size];
+    }
+}
+
 /// Safe `ZSTD_hashPtr` on a buffer position (reads `HASH_READ_SIZE` bytes).
 fn hash_at_buf(buf: &[u8], pos: usize, h_bits: u32, mls: u32) -> usize {
     super::seq_store::hash_at(buf, pos, h_bits, mls)
@@ -476,7 +496,10 @@ pub(crate) fn build_seq_store(
     if curr > ms.next_to_update + 384 {
         ms.next_to_update = curr - 192u32.min(curr - ms.next_to_update - 384);
     }
-    let last_ll_size = compress_block_fast(ms, ss, rep, buf, start, end);
+    let last_ll_size = match ms.cparams.strategy {
+        Strategy::DFast => super::dfast::compress_block_double_fast(ms, ss, rep, buf, start, end),
+        _ => compress_block_fast(ms, ss, rep, buf, start, end),
+    };
     ss.store_last_literals(&buf[end - last_ll_size..end]);
     true
 }
@@ -517,7 +540,7 @@ pub(crate) fn compress_block_fast(
 /// `p..p + 8` must be readable.
 #[allow(unsafe_code)]
 #[inline(always)]
-unsafe fn hash_mls<const MLS: u32>(p: *const u8, h_bits: u32) -> usize {
+pub(crate) unsafe fn hash_mls<const MLS: u32>(p: *const u8, h_bits: u32) -> usize {
     // SAFETY: per the caller.
     unsafe {
         match MLS {
@@ -532,7 +555,7 @@ unsafe fn hash_mls<const MLS: u32>(p: *const u8, h_bits: u32) -> usize {
 
 /// `PREFETCH_L1`.
 #[inline(always)]
-fn prefetch_l1(p: *const u8) {
+pub(crate) fn prefetch_l1(p: *const u8) {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: prefetching never faults, whatever the address.
     #[allow(unsafe_code, unused_unsafe)]
@@ -894,7 +917,7 @@ unsafe fn offset_match(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::params::{CParams, one_shot_cparams};
     use super::super::seq_store::{
         MINMATCH, REP_START_VALUE, SeqStore, offbase_is_offset, offbase_to_offset,
@@ -946,7 +969,7 @@ mod tests {
     /// Compresses `src` like libzstd's one-shot frame loop (block splitting
     /// at `block_size`), replays the sequences and checks they rebuild
     /// `src`. Returns the total number of sequences.
-    fn roundtrip(src: &[u8], cparams: CParams, block_size: usize) -> usize {
+    pub(crate) fn roundtrip(src: &[u8], cparams: CParams, block_size: usize) -> usize {
         let mut ms = MatchState::new(cparams);
         let mut ss = SeqStore::new(block_size, cparams.min_match);
         ms.update_window(0, src.len());
@@ -977,7 +1000,7 @@ mod tests {
         nb_seq
     }
 
-    fn xorshift(state: &mut u64) -> u64 {
+    pub(crate) fn xorshift(state: &mut u64) -> u64 {
         *state ^= *state << 13;
         *state ^= *state >> 7;
         *state ^= *state << 17;
@@ -985,7 +1008,7 @@ mod tests {
     }
 
     /// Text-like data: words from a small vocabulary, with some noise.
-    fn texty(n: usize, seed: u64) -> Vec<u8> {
+    pub(crate) fn texty(n: usize, seed: u64) -> Vec<u8> {
         const WORDS: [&[u8]; 12] = [
             b"the ",
             b"quick ",
@@ -1014,7 +1037,7 @@ mod tests {
         v
     }
 
-    fn random(n: usize, seed: u64) -> Vec<u8> {
+    pub(crate) fn random(n: usize, seed: u64) -> Vec<u8> {
         let mut s = seed | 1;
         (0..n).map(|_| xorshift(&mut s) as u8).collect()
     }
