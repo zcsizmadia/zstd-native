@@ -213,6 +213,121 @@ impl<'a> BitReader<'a> {
     pub(crate) fn is_end(&self) -> bool {
         self.ip == self.start && self.consumed == 64
     }
+
+    /// Bytes between the stream start and the window.
+    #[inline]
+    pub(crate) fn pos(&self) -> usize {
+        self.ip as usize - self.start as usize
+    }
+
+    /// The stream start.
+    #[inline]
+    pub(crate) fn start(&self) -> *const u8 {
+        self.start
+    }
+
+    /// This reader's state as a [`FastBits`]. Requires `consumed <= 63`:
+    /// true right after a reload with 8 bytes before the window, which
+    /// every sequence but the last of a block ends with.
+    #[inline(always)]
+    pub(crate) fn fast(&self) -> FastBits {
+        debug_assert!(self.consumed <= 63);
+        FastBits {
+            b: (self.container | 1) << self.consumed,
+            ip: self.ip,
+        }
+    }
+
+    /// A reader continuing where `fb` stopped, in the same stream. Cold so
+    /// the fast loop, not its exit, follows its preheader (and the
+    /// alignment padding there) in the code layout.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn resume(&self, fb: FastBits) -> Self {
+        let consumed = u64::from(fb.b.trailing_zeros());
+        debug_assert!(fb.ip >= self.start);
+        // SAFETY: `fb.ip` is inside the stream with 8 bytes after it (the
+        // fast loop only moves it toward `start`, never below).
+        let container = unsafe { u64::from_le(fb.ip.cast::<u64>().read_unaligned()) };
+        BitReader {
+            container,
+            consumed,
+            ip: fb.ip,
+            start: self.start,
+            _src: PhantomData,
+        }
+    }
+}
+
+/// The reads the sequence decoder needs, over either reader.
+pub(crate) trait SeqBits {
+    /// The next `n` bits, `1 <= n <= 56`.
+    fn read_fast(&mut self, n: u32) -> u64;
+    /// The next `n` bits, `0 <= n <= 56`.
+    fn read(&mut self, n: u32) -> u64;
+    /// Refills the container.
+    fn reload(&mut self);
+}
+
+impl SeqBits for BitReader<'_> {
+    #[inline(always)]
+    fn read_fast(&mut self, n: u32) -> u64 {
+        BitReader::read_fast(self, n)
+    }
+    #[inline(always)]
+    fn read(&mut self, n: u32) -> u64 {
+        BitReader::read(self, n)
+    }
+    #[inline(always)]
+    fn reload(&mut self) {
+        BitReader::reload(self);
+    }
+}
+
+/// The bit reader of the fast sequence loop: the container is kept
+/// left-aligned (consumed bits shifted out) with a sentinel 1 bit right
+/// below the valid bits, like the Huffman fast loops. A read is then one
+/// shift and the consumed count is the sentinel's position
+/// (`trailing_zeros`), so the reader is two registers instead of four and
+/// a reload needs no bounds check: the caller guarantees the bytes before
+/// `ip` (at most 8 per reload).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FastBits {
+    b: u64,
+    /// Start of the 8-byte window.
+    pub ip: *const u8,
+}
+
+impl SeqBits for FastBits {
+    #[inline(always)]
+    fn read_fast(&mut self, n: u32) -> u64 {
+        debug_assert!((1..=56).contains(&n));
+        let v = self.b >> (64 - n);
+        self.b <<= n;
+        v
+    }
+
+    #[inline(always)]
+    fn read(&mut self, n: u32) -> u64 {
+        debug_assert!(n <= 56);
+        let v = self.b.wrapping_shr(64 - n) & ((1u64 << n) - 1);
+        self.b <<= n;
+        v
+    }
+
+    /// Refills to at least 57 valid bits. The caller guarantees 8 readable
+    /// bytes before `ip` (`ip - 8 >= start`).
+    #[inline(always)]
+    fn reload(&mut self) {
+        let ctz = self.b.trailing_zeros();
+        debug_assert!(ctz <= 64);
+        // SAFETY: per the caller: `ip - (ctz >> 3) >= start`, and the
+        // window stays inside the stream since `ip` only decreases.
+        unsafe {
+            self.ip = self.ip.sub((ctz >> 3) as usize);
+            self.b = (u64::from_le(self.ip.cast::<u64>().read_unaligned()) | 1) << (ctz & 7);
+        }
+    }
 }
 
 #[cfg(test)]

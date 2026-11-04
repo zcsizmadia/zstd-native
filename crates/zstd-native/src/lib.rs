@@ -66,6 +66,30 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+/// Aligns the code that follows to a 64-byte boundary plus `$pad` bytes
+/// of `nop`, for the top of a hot loop (libzstd does the same before its
+/// sequence loop). The hot loops' speed swings by a few percent with where
+/// the linker puts them; this pins their placement to the function instead
+/// of the whole binary. `$pad` is tuned per loop so that the loop's first
+/// instruction (after the compiler's own preheader tail) lands where it
+/// measured fastest. The padding runs once per loop entry.
+macro_rules! align_hot_loop {
+    ($pad:literal) => {
+        #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+        // SAFETY: an alignment directive and `nop`s; they touch no state.
+        #[allow(unsafe_code, unused_unsafe)]
+        unsafe {
+            core::arch::asm!(
+                ".p2align 6",
+                concat!(".rept ", $pad),
+                "nop",
+                ".endr",
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+    };
+}
+
 mod bits;
 mod block;
 mod cpu;
