@@ -794,6 +794,9 @@ fn abandoned_frames() {
     drop(e);
 }
 
+// libzstd's level-22 multithreaded context (round buffer of window + jobs)
+// does not fit a 32-bit address space: "Allocation error: not enough memory".
+#[cfg(target_pointer_width = "64")]
 #[test]
 fn level22_automatic_ldm() {
     // level 22 with an unknown size: 128 MiB window, LDM on by itself, the
