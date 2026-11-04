@@ -55,7 +55,9 @@
 //! Debug builds check every read with `chk`.
 
 use super::compress::EntropyTables;
-use super::fast::{DmsView, ExtWindow, HASH_READ_SIZE, MatchState, hash_mls, index_overlap_check};
+use super::fast::{
+    DmsView, ExtWindow, HASH_READ_SIZE, MatchState, hash_mls, index_overlap_check, prefetch_l1,
+};
 use super::hist::hist_count_simple;
 use super::huf_enc::HufRepeat;
 use super::ldm::RawSeq;
@@ -194,6 +196,20 @@ pub(crate) struct OptStats {
     match_length_sum_base_price: u32,
     off_code_sum_base_price: u32,
     price_type: PriceType,
+    /// The dynamic price of each literal length code and match length code
+    /// (`LL_bits * MULTIPLIER + sumBasePrice - WEIGHT(freq)`, the parts of
+    /// `ZSTD_litLengthPrice` and `ZSTD_getMatchPrice` that only depend on
+    /// the code), tabulated whenever the base prices change
+    /// ([`OptStats::set_base_prices`]): the parser prices every match length
+    /// of every candidate, and this takes the `highbit` and the weight out
+    /// of that loop. Only read with `price_type == Dynamic`.
+    ll_code_price: [u32; MAX_LL as usize + 1],
+    ml_code_price: [u32; MAX_ML as usize + 1],
+    /// The match length part of the price by `mlBase` (`matchLength -
+    /// MINMATCH`) for `mlBase < 128` (longer lengths go through the code),
+    /// for either price type: the hot loop reads it without a code lookup
+    /// or a price type test.
+    ml_len_price: [u32; 128],
 }
 
 /// libzstd's `optState_t` (the literal compression mode is always "on":
@@ -235,6 +251,9 @@ impl OptState {
                 match_length_sum_base_price: 0,
                 off_code_sum_base_price: 0,
                 price_type: PriceType::Dynamic,
+                ll_code_price: [0; MAX_LL as usize + 1],
+                ml_code_price: [0; MAX_ML as usize + 1],
+                ml_len_price: [0; 128],
             },
             price_table: vec![Optimal::default(); OPT_SIZE],
             match_table: vec![Match::default(); OPT_SIZE],
@@ -309,6 +328,66 @@ impl OptStats {
         self.lit_length_sum_base_price = weight::<OPT_LEVEL>(self.lit_length_sum);
         self.match_length_sum_base_price = weight::<OPT_LEVEL>(self.match_length_sum);
         self.off_code_sum_base_price = weight::<OPT_LEVEL>(self.off_code_sum);
+        // the per-code prices (the same wrapping sums as libzstd's)
+        for (code, p) in self.ll_code_price.iter_mut().enumerate() {
+            *p = (u32::from(LL_BITS[code]) * BITCOST_MULTIPLIER)
+                .wrapping_add(self.lit_length_sum_base_price)
+                .wrapping_sub(weight::<OPT_LEVEL>(self.lit_length_freq[code]));
+        }
+        for (code, p) in self.ml_code_price.iter_mut().enumerate() {
+            *p = (u32::from(ML_BITS[code]) * BITCOST_MULTIPLIER).wrapping_add(
+                self.match_length_sum_base_price
+                    .wrapping_sub(weight::<OPT_LEVEL>(self.match_length_freq[code])),
+            );
+        }
+        let predef = self.price_type == PriceType::Predef;
+        for (ml_base, p) in self.ml_len_price.iter_mut().enumerate() {
+            *p = if predef {
+                weight::<OPT_LEVEL>(ml_base as u32)
+            } else {
+                self.ml_code_price[ml_code(ml_base as u32) as usize]
+            };
+        }
+    }
+
+    /// The offset part of `ZSTD_getMatchPrice()`, with the constant of the
+    /// dynamic scheme (the "fewer sequences" heuristic): invariant over the
+    /// match lengths of a candidate.
+    #[inline(always)]
+    fn match_off_price<const OPT_LEVEL: u32>(&self, off_base: u32) -> u32 {
+        let off_code = highbit32(off_base);
+        if self.price_type == PriceType::Predef {
+            // fixed scheme, does not use statistics
+            return (16 + off_code) * BITCOST_MULTIPLIER;
+        }
+        // dynamic statistics
+        let mut price = (off_code * BITCOST_MULTIPLIER).wrapping_add(
+            self.off_code_sum_base_price
+                .wrapping_sub(weight::<OPT_LEVEL>(self.off_code_freq[off_code as usize])),
+        );
+        if OPT_LEVEL < 2 && off_code >= 20 {
+            // handicap for long distance offsets, favor decompression speed
+            price = price.wrapping_add((off_code - 19) * 2 * BITCOST_MULTIPLIER);
+        }
+        // heuristic: make matches a bit more costly to favor fewer
+        // sequences (faster decompression)
+        price.wrapping_add(BITCOST_MULTIPLIER / 5)
+    }
+
+    /// The match length part of `ZSTD_getMatchPrice()`.
+    #[inline(always)]
+    fn ml_len_price<const OPT_LEVEL: u32>(&self, match_length: u32) -> u32 {
+        debug_assert!(match_length >= MINMATCH);
+        let ml_base = match_length - MINMATCH;
+        if ml_base < 128 {
+            return self.ml_len_price[ml_base as usize];
+        }
+        if self.price_type == PriceType::Predef {
+            return weight::<OPT_LEVEL>(ml_base);
+        }
+        // `ZSTD_MLcode()` for mlBase >= 128: highbit + 36, at most MaxML
+        // (match lengths are below 2^17)
+        self.ml_code_price[(highbit32(ml_base) + 36).min(u32::from(MAX_ML)) as usize]
     }
 
     /// `ZSTD_rescaleFreqs()`: on the first block of a frame
@@ -399,10 +478,7 @@ impl OptStats {
             return BITCOST_MULTIPLIER as i32 + self.ll_price::<OPT_LEVEL>(lit_length - 1);
         }
         // dynamic statistics
-        let code = ll_code(lit_length) as usize;
-        (u32::from(LL_BITS[code]) * BITCOST_MULTIPLIER)
-            .wrapping_add(self.lit_length_sum_base_price)
-            .wrapping_sub(weight::<OPT_LEVEL>(self.lit_length_freq[code])) as i32
+        self.ll_code_price[ll_code(lit_length) as usize] as i32
     }
 
     /// `LL_INCPRICE`: the price change of one more literal.
@@ -416,39 +492,8 @@ impl OptStats {
     /// handicap (favoring decompression speed).
     #[inline(always)]
     fn match_price<const OPT_LEVEL: u32>(&self, off_base: u32, match_length: u32) -> i32 {
-        let off_code = highbit32(off_base);
-        debug_assert!(match_length >= MINMATCH);
-        let ml_base = match_length - MINMATCH;
-
-        if self.price_type == PriceType::Predef {
-            // fixed scheme, does not use statistics
-            return weight::<OPT_LEVEL>(ml_base).wrapping_add((16 + off_code) * BITCOST_MULTIPLIER)
-                as i32;
-        }
-
-        // dynamic statistics
-        let mut price = (off_code * BITCOST_MULTIPLIER).wrapping_add(
-            self.off_code_sum_base_price
-                .wrapping_sub(weight::<OPT_LEVEL>(self.off_code_freq[off_code as usize])),
-        );
-        if OPT_LEVEL < 2 && off_code >= 20 {
-            // handicap for long distance offsets, favor decompression speed
-            price = price.wrapping_add((off_code - 19) * 2 * BITCOST_MULTIPLIER);
-        }
-
-        // match length
-        let ml_code = ml_code(ml_base) as usize;
-        price = price.wrapping_add(
-            (u32::from(ML_BITS[ml_code]) * BITCOST_MULTIPLIER).wrapping_add(
-                self.match_length_sum_base_price
-                    .wrapping_sub(weight::<OPT_LEVEL>(self.match_length_freq[ml_code])),
-            ),
-        );
-
-        // heuristic: make matches a bit more costly to favor fewer
-        // sequences (faster decompression)
-        price = price.wrapping_add(BITCOST_MULTIPLIER / 5);
-        price as i32
+        self.match_off_price::<OPT_LEVEL>(off_base)
+            .wrapping_add(self.ml_len_price::<OPT_LEVEL>(match_length)) as i32
     }
 
     /// `ZSTD_updateStats()`.
@@ -634,6 +679,47 @@ impl Bt {
         }
     }
 
+    /// Prefetches what the search (or insertion) of the position after `ip`
+    /// starts with. The parser searches and inserts consecutive positions,
+    /// and each one begins with random accesses into tables of up to 16 MiB
+    /// (hash) and 64 MiB (tree) at the high levels and into the window,
+    /// missing every cache with nothing to overlap the misses with: the
+    /// bucket of `ip + 2` (so that it is readable here for `ip + 1` next
+    /// time, with the tree node and the bytes of its head), the 3-byte
+    /// bucket and the tree slot of `ip + 1`. Hints only: a stale or empty
+    /// head only wastes the fetch.
+    ///
+    /// # Safety
+    /// `ip + 8 <= iend` (the hashes read up to 8 bytes at `ip + 1` and
+    /// `ip + 2`, checked against `iend` here).
+    #[allow(unsafe_code)]
+    #[inline(always)]
+    unsafe fn prefetch_next<const MLS: u32>(&self, ip: *const u8, iend: *const u8) {
+        // SAFETY: the reads are inside the block (checked), the hash table
+        // read is masked into the table; prefetches never fault.
+        unsafe {
+            if ip.add(1 + HASH_READ_SIZE) > iend {
+                return;
+            }
+            let nip = ip.add(1);
+            let curr = self.idx(ip);
+            let head = *self.hash_table.add(hash_mls::<MLS>(nip, self.hash_log));
+            prefetch_l1(self.bt.add(2 * (head & self.bt_mask) as usize).cast());
+            prefetch_l1(self.pos(head));
+            prefetch_l1(self.bt.add(2 * ((curr + 1) & self.bt_mask) as usize).cast());
+            if MLS == 3 {
+                prefetch_l1(self.hash_table3.add(hash3_ptr(nip, self.hash_log3)).cast());
+            }
+            if ip.add(2 + HASH_READ_SIZE) <= iend {
+                prefetch_l1(
+                    self.hash_table
+                        .add(hash_mls::<MLS>(ip.add(2), self.hash_log))
+                        .cast(),
+                );
+            }
+        }
+    }
+
     /// `ZSTD_getLowestMatchIndex()`.
     #[inline(always)]
     fn lowest_match_index(&self, curr: u32) -> u32 {
@@ -743,6 +829,7 @@ unsafe fn insert_bt1<const MLS: u32, const EXT: bool>(
     // the prefix reaches it).
     unsafe {
         s.chk(ip, 8);
+        s.prefetch_next::<MLS>(ip, iend);
         let h = hash_mls::<MLS>(ip, s.hash_log);
         let mut match_index = *s.hash_table.add(h);
         let mut smaller_ptr = bt.add(2 * (curr & bt_mask) as usize);
@@ -866,6 +953,7 @@ unsafe fn get_all_matches<const MLS: u32, const EXT: bool, const DMS: bool>(
     // the 3-byte hash and tree candidates are at or above `matchLow` and
     // before `curr`; forward reads stop at `ilimit` (the block end).
     unsafe {
+        s.prefetch_next::<MLS>(ip, iend);
         update_tree::<MLS, EXT>(s, ip, iend);
 
         let curr = s.idx(ip);
@@ -1889,12 +1977,18 @@ fn opt_generic<
                             } else {
                                 min_match
                             };
+                            // the price without the match length part
+                            // (`base_price + ZSTD_getMatchPrice()` is the
+                            // same wrapping sum)
+                            let off_price = (base_price as u32)
+                                .wrapping_add(stats.match_off_price::<OPT_LEVEL>(offset));
                             let mut mlen = last_ml;
                             while mlen >= start_ml {
                                 // scan downward
                                 let pos = cur + mlen;
-                                let price =
-                                    base_price + stats.match_price::<OPT_LEVEL>(offset, mlen);
+                                let price = off_price
+                                    .wrapping_add(stats.ml_len_price::<OPT_LEVEL>(mlen))
+                                    as i32;
                                 if pos > last_pos || price < opt[pos as usize].price {
                                     while last_pos < pos {
                                         // fill empty positions, for future
