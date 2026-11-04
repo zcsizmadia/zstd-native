@@ -205,6 +205,11 @@ pub(crate) struct OptStats {
     /// of that loop. Only read with `price_type == Dynamic`.
     ll_code_price: [u32; MAX_LL as usize + 1],
     ml_code_price: [u32; MAX_ML as usize + 1],
+    /// The match length part of the price by `mlBase` (`matchLength -
+    /// MINMATCH`) for `mlBase < 128` (longer lengths go through the code),
+    /// for either price type: the hot loop reads it without a code lookup
+    /// or a price type test.
+    ml_len_price: [u32; 128],
 }
 
 /// libzstd's `optState_t` (the literal compression mode is always "on":
@@ -248,6 +253,7 @@ impl OptState {
                 price_type: PriceType::Dynamic,
                 ll_code_price: [0; MAX_LL as usize + 1],
                 ml_code_price: [0; MAX_ML as usize + 1],
+                ml_len_price: [0; 128],
             },
             price_table: vec![Optimal::default(); OPT_SIZE],
             match_table: vec![Match::default(); OPT_SIZE],
@@ -334,6 +340,54 @@ impl OptStats {
                     .wrapping_sub(weight::<OPT_LEVEL>(self.match_length_freq[code])),
             );
         }
+        let predef = self.price_type == PriceType::Predef;
+        for (ml_base, p) in self.ml_len_price.iter_mut().enumerate() {
+            *p = if predef {
+                weight::<OPT_LEVEL>(ml_base as u32)
+            } else {
+                self.ml_code_price[ml_code(ml_base as u32) as usize]
+            };
+        }
+    }
+
+    /// The offset part of `ZSTD_getMatchPrice()`, with the constant of the
+    /// dynamic scheme (the "fewer sequences" heuristic): invariant over the
+    /// match lengths of a candidate.
+    #[inline(always)]
+    fn match_off_price<const OPT_LEVEL: u32>(&self, off_base: u32) -> u32 {
+        let off_code = highbit32(off_base);
+        if self.price_type == PriceType::Predef {
+            // fixed scheme, does not use statistics
+            return (16 + off_code) * BITCOST_MULTIPLIER;
+        }
+        // dynamic statistics
+        let mut price = (off_code * BITCOST_MULTIPLIER).wrapping_add(
+            self.off_code_sum_base_price
+                .wrapping_sub(weight::<OPT_LEVEL>(self.off_code_freq[off_code as usize])),
+        );
+        if OPT_LEVEL < 2 && off_code >= 20 {
+            // handicap for long distance offsets, favor decompression speed
+            price = price.wrapping_add((off_code - 19) * 2 * BITCOST_MULTIPLIER);
+        }
+        // heuristic: make matches a bit more costly to favor fewer
+        // sequences (faster decompression)
+        price.wrapping_add(BITCOST_MULTIPLIER / 5)
+    }
+
+    /// The match length part of `ZSTD_getMatchPrice()`.
+    #[inline(always)]
+    fn ml_len_price<const OPT_LEVEL: u32>(&self, match_length: u32) -> u32 {
+        debug_assert!(match_length >= MINMATCH);
+        let ml_base = match_length - MINMATCH;
+        if ml_base < 128 {
+            return self.ml_len_price[ml_base as usize];
+        }
+        if self.price_type == PriceType::Predef {
+            return weight::<OPT_LEVEL>(ml_base);
+        }
+        // `ZSTD_MLcode()` for mlBase >= 128: highbit + 36, at most MaxML
+        // (match lengths are below 2^17)
+        self.ml_code_price[(highbit32(ml_base) + 36).min(u32::from(MAX_ML)) as usize]
     }
 
     /// `ZSTD_rescaleFreqs()`: on the first block of a frame
@@ -438,33 +492,8 @@ impl OptStats {
     /// handicap (favoring decompression speed).
     #[inline(always)]
     fn match_price<const OPT_LEVEL: u32>(&self, off_base: u32, match_length: u32) -> i32 {
-        let off_code = highbit32(off_base);
-        debug_assert!(match_length >= MINMATCH);
-        let ml_base = match_length - MINMATCH;
-
-        if self.price_type == PriceType::Predef {
-            // fixed scheme, does not use statistics
-            return weight::<OPT_LEVEL>(ml_base).wrapping_add((16 + off_code) * BITCOST_MULTIPLIER)
-                as i32;
-        }
-
-        // dynamic statistics
-        let mut price = (off_code * BITCOST_MULTIPLIER).wrapping_add(
-            self.off_code_sum_base_price
-                .wrapping_sub(weight::<OPT_LEVEL>(self.off_code_freq[off_code as usize])),
-        );
-        if OPT_LEVEL < 2 && off_code >= 20 {
-            // handicap for long distance offsets, favor decompression speed
-            price = price.wrapping_add((off_code - 19) * 2 * BITCOST_MULTIPLIER);
-        }
-
-        // match length
-        price = price.wrapping_add(self.ml_code_price[ml_code(ml_base) as usize]);
-
-        // heuristic: make matches a bit more costly to favor fewer
-        // sequences (faster decompression)
-        price = price.wrapping_add(BITCOST_MULTIPLIER / 5);
-        price as i32
+        self.match_off_price::<OPT_LEVEL>(off_base)
+            .wrapping_add(self.ml_len_price::<OPT_LEVEL>(match_length)) as i32
     }
 
     /// `ZSTD_updateStats()`.
@@ -1948,12 +1977,18 @@ fn opt_generic<
                             } else {
                                 min_match
                             };
+                            // the price without the match length part
+                            // (`base_price + ZSTD_getMatchPrice()` is the
+                            // same wrapping sum)
+                            let off_price = (base_price as u32)
+                                .wrapping_add(stats.match_off_price::<OPT_LEVEL>(offset));
                             let mut mlen = last_ml;
                             while mlen >= start_ml {
                                 // scan downward
                                 let pos = cur + mlen;
-                                let price =
-                                    base_price + stats.match_price::<OPT_LEVEL>(offset, mlen);
+                                let price = off_price
+                                    .wrapping_add(stats.ml_len_price::<OPT_LEVEL>(mlen))
+                                    as i32;
                                 if pos > last_pos || price < opt[pos as usize].price {
                                     while last_pos < pos {
                                         // fill empty positions, for future
