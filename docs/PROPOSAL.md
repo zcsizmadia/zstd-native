@@ -107,9 +107,10 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
    prefetching (libzstd's `ZSTD_decompressSequencesLong`) for large
    windows; literals placed in the output buffer like libzstd's split
    literal buffer; more measurement on Silesia (`ZSTD_BENCH_CORPUS`).
-2. Streaming decoder: push API (`no_std`) and `std::io::Read`/`BufRead`
-   adapters, window buffer with the dictionary-as-history mechanism the
-   block decoder already supports; memory/window limits.
+2. ~~Streaming decoder~~ (done: `stream.rs`, `io.rs`; window buffer of
+   window + 2 blocks + 64 with the old segment as history after a wrap;
+   0.98-1.21x libzstd's streaming decoder). Next: write into the
+   caller's buffer directly when it can hold the frame.
 3. Encoder: levels 1-22 (fast, dfast, greedy, lazy, lazy2, btlazy2, btopt,
    btultra, btultra2), aiming at byte-identical output with libzstd per
    level (the oracle for tests, and it makes speed the only variable).

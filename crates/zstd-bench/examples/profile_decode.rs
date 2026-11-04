@@ -30,6 +30,30 @@ fn main() {
     let mut c = zstd::bulk::Decompressor::new().unwrap();
     while t.elapsed().as_secs_f64() < secs {
         let len = match lib {
+            "native-stream" => {
+                use std::io::Read;
+                let mut d = zstd_native::Decoder::with_buffer(&comp[..]);
+                let mut total = 0;
+                loop {
+                    let n = d.read(&mut out[..128 << 10]).unwrap();
+                    if n == 0 {
+                        break total;
+                    }
+                    total += n;
+                }
+            }
+            "c-stream" => {
+                use std::io::Read;
+                let mut d = zstd::stream::read::Decoder::with_buffer(&comp[..]).unwrap();
+                let mut total = 0;
+                loop {
+                    let n = d.read(&mut out[..128 << 10]).unwrap();
+                    if n == 0 {
+                        break total;
+                    }
+                    total += n;
+                }
+            }
             "native" | "native-noasm" | "native-asm" => {
                 native.decompress_to_slice(&comp, &mut out).unwrap()
             }

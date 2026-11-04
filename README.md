@@ -3,10 +3,10 @@
 Pure Rust [Zstandard](https://facebook.github.io/zstd/) (RFC 8878), built
 to match or beat C libzstd 1.5.7 in speed. No C code, `no_std` + `alloc`.
 
-**Status: early development.** The decoder is complete for single-call use
-(all frame and block types, dictionaries, checksums, concatenated and
-skippable frames) and tested against libzstd; streaming and the encoder
-are next (see [docs/PROPOSAL.md](docs/PROPOSAL.md)).
+**Status: early development.** The decoder is complete: one-shot and
+streaming (`std::io::Read` and a `no_std` push API), all frame and block
+types, dictionaries, checksums, concatenated and skippable frames, tested
+against libzstd. The encoder is next (see [docs/PROPOSAL.md](docs/PROPOSAL.md)).
 
 ```rust
 let data = zstd_native::decompress(&compressed)?;
@@ -14,6 +14,10 @@ let data = zstd_native::decompress(&compressed)?;
 // Reuse tables and buffers across calls, optionally with a dictionary:
 let mut d = zstd_native::Decompressor::with_dictionary(zstd_native::Dictionary::new(&dict_bytes)?);
 let n = d.decompress_to_slice(&compressed, &mut buffer)?;
+
+// Streaming from any reader:
+let mut out = Vec::new();
+std::io::copy(&mut zstd_native::Decoder::new(file), &mut out)?;
 ```
 
 ## Speed

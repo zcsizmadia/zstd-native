@@ -14,6 +14,21 @@
 //! hold a [`Dictionary`]); [`decompress_to_slice`] writes into a buffer
 //! you provide.
 //!
+//! # Streaming
+//!
+//! [`Decoder`] reads a zstd stream from any `std::io::Read` (frame after
+//! frame); [`StreamDecoder`] is the push API underneath (input and output
+//! in pieces of any size, no `std` needed).
+//!
+//! ```
+//! use std::io::Read;
+//! # let compressed: &[u8] = &[0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x05, 0x29, 0x00, 0x00, b'h', b'e', b'l', b'l', b'o'];
+//! let mut text = String::new();
+//! zstd_native::Decoder::new(compressed).read_to_string(&mut text)?;
+//! # assert_eq!(text, "hello");
+//! # Ok::<(), std::io::Error>(())
+//! ```
+//!
 //! # Speed
 //!
 //! The hot loops (4-stream Huffman decoding, sequence decoding and
@@ -39,12 +54,18 @@ mod fse;
 pub(crate) mod huf;
 #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
 mod huf_asm;
+#[cfg(feature = "std")]
+mod io;
+mod stream;
 mod xxhash;
 
 pub use decoder::{Decompressor, content_size, decompress, decompress_to_slice};
 pub use dict::Dictionary;
 pub use error::Error;
 pub use frame::FrameHeader;
+#[cfg(feature = "std")]
+pub use io::Decoder;
+pub use stream::{Progress, StreamDecoder};
 pub use xxhash::xxh64;
 
 #[doc(hidden)]
