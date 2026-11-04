@@ -813,7 +813,8 @@ fn abandoned_frames() {
 }
 
 // libzstd's level-22 multithreaded context (round buffer of window + jobs)
-// does not fit a 32-bit address space: "Allocation error: not enough memory".
+// does not fit a 32-bit address space: "Allocation error : not enough
+// memory". Both encoders fail there (the 32-bit version of this test below).
 #[cfg(target_pointer_width = "64")]
 #[test]
 fn level22_automatic_ldm() {
@@ -822,6 +823,36 @@ fn level22_automatic_ldm() {
     let data = input(1_200_000, MB, 14);
     let f = Frame::streamed(Params::new(22, 2, 0, 0), data.len(), 300_000, 0);
     check("level 22", std::slice::from_ref(&f), &data, Dict::None);
+}
+
+// On 32-bit targets the same frame fails in both: libzstd's round buffer
+// (max(window, 2 jobs) + 3 jobs of slack = 2.5 GiB) can't be allocated
+// (`memory_allocation`), and zstd-native returns
+// `Error::MemoryAllocation` before allocating anything.
+#[cfg(target_pointer_width = "32")]
+#[test]
+fn level22_automatic_ldm() {
+    let data = input(1_200_000, MB, 14);
+    let p = Params::new(22, 2, 0, 0);
+    let mut out = vec![0u8; 1 << 16];
+
+    let mut c = c_context(Dict::None);
+    set_c(&mut c, &p);
+    let mut ob = OutBuffer::around(&mut out[..]);
+    let mut ib = InBuffer::around(&data[..300_000]);
+    let r = c.compress_stream2(&mut ob, &mut ib, ZSTD_EndDirective::ZSTD_e_continue);
+    let err = r.expect_err("libzstd allocates its round buffer");
+    assert_eq!(
+        zstd::zstd_safe::get_error_name(err),
+        "Allocation error : not enough memory"
+    );
+
+    let mut e = StreamEncoder::new(3);
+    set_native(&mut e, &p);
+    assert_eq!(
+        e.compress(&data[..300_000], &mut out, EndOp::Continue),
+        Err(zstd_native::Error::MemoryAllocation)
+    );
 }
 
 /// With the content checksum (`ZSTD_c_checksumFlag`), which the

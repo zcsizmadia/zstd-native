@@ -154,7 +154,10 @@ impl StreamDecoder {
     }
 
     /// Sets the largest window accepted (frames needing more fail with
-    /// [`Error::WindowTooLarge`]), as `1 << log`, `log` 10 to 31.
+    /// [`Error::WindowTooLarge`]), as `1 << log`, `log` 10 to 31 (30 on
+    /// 32-bit targets, as libzstd); values outside are clamped. Frames
+    /// with a window log over 31 (30 on 32-bit) are rejected in every
+    /// mode, one-shot decoding included.
     /// The default is 27 (128 MiB), libzstd's.
     pub fn set_window_log_max(&mut self, log: u32) {
         self.window_max = 1u64 << log.clamp(10, frame::WINDOWLOG_MAX);

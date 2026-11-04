@@ -288,6 +288,14 @@ impl Compressor {
     /// worker, a compressor's tables for the level; per job in flight (at
     /// most the smallest power of 2 above the worker count plus 2), its
     /// input and output.
+    ///
+    /// On 32-bit targets, large jobs and many workers can need more memory
+    /// than the address space has: libzstd's round buffer of the input is
+    /// `workers + 3` jobs (`+ 2` without overlap; at least the window plus
+    /// the slack jobs with long distance matching), so level 22's 512 MiB jobs, or a 512 MiB job size, need
+    /// 2 GiB with one worker. Compressing a frame then fails with
+    /// [`Error::MemoryAllocation`](crate::Error::MemoryAllocation), as
+    /// libzstd fails to allocate it (`memory_allocation`).
     #[cfg(feature = "std")]
     pub fn set_workers(&mut self, n: u32) {
         self.mt_params.set_workers(n);
@@ -341,7 +349,7 @@ impl Compressor {
             let m = self
                 .mt
                 .get_or_insert_with(|| alloc::boxed::Box::new(mt::MtCtx::new()));
-            m.init_frame(&self.mt_params, cp, ldm, cd, pledged, self.fparams);
+            m.init_frame(&self.mt_params, cp, ldm, cd, pledged, self.fparams)?;
             match dst {
                 Some(d) => {
                     let p = m.compress(src, d, EndOp::End)?;

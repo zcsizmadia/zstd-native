@@ -33,6 +33,11 @@ pub enum Error {
     /// The operation is not possible at this stage of a stream (for example,
     /// setting the pledged source size in the middle of a frame).
     StageWrong,
+    /// The buffers the compression parameters need don't fit in this
+    /// platform's memory (libzstd's `memory_allocation` error): for
+    /// example, multithreaded compression with a large job size and many
+    /// workers on a 32-bit target.
+    MemoryAllocation,
 }
 
 impl fmt::Display for Error {
@@ -50,6 +55,7 @@ impl fmt::Display for Error {
             Error::OutputTooLarge => "decompressed size is too large",
             Error::SrcSizeWrong => "input size differs from the pledged source size",
             Error::StageWrong => "operation not possible at this stage of the stream",
+            Error::MemoryAllocation => "not enough memory for the compression parameters",
         })
     }
 }
@@ -61,6 +67,7 @@ impl From<Error> for std::io::Error {
     fn from(e: Error) -> Self {
         let kind = match e {
             Error::Truncated => std::io::ErrorKind::UnexpectedEof,
+            Error::MemoryAllocation => std::io::ErrorKind::OutOfMemory,
             _ => std::io::ErrorKind::InvalidData,
         };
         std::io::Error::new(kind, e)
