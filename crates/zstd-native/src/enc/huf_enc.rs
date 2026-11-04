@@ -23,7 +23,7 @@ use super::fse_enc::{
     FseCTable, fse_compress_using_ctable, fse_normalize_count, fse_optimal_table_log,
     fse_optimal_table_log_internal, fse_write_ncount, highbit32,
 };
-use super::hist::{hist_count, hist_count_simple};
+use super::hist::{hist_count, hist_count_simple, hist_largest_count};
 use crate::error::{Error, Result};
 
 /// libzstd's `HUF_TABLELOG_MAX`.
@@ -1161,19 +1161,11 @@ fn huf_compress_internal(
     if flags & HUF_FLAGS_SUSPECT_UNCOMPRESSIBLE != 0
         && src_size >= SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE * SUSPECT_INCOMPRESSIBLE_SAMPLE_RATIO
     {
-        let mut largest_total = 0usize;
-        let mut msv_begin = max_symbol_value;
-        largest_total += hist_count_simple(
-            &mut count,
-            &mut msv_begin,
-            &src[..SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE],
-        ) as usize;
-        let mut msv_end = max_symbol_value;
-        largest_total += hist_count_simple(
-            &mut count,
-            &mut msv_end,
-            &src[src_size - SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE..],
-        ) as usize;
+        // libzstd counts each sample with `HIST_count_simple` (one table,
+        // slow on repetitive bytes); only the largest counts are used, and
+        // the lane counter gives the same ones.
+        let largest_total = hist_largest_count(&src[..SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE]) as usize
+            + hist_largest_count(&src[src_size - SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE..]) as usize;
         if largest_total <= ((2 * SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE) >> 7) + 4 {
             return Ok(0); // heuristic: probably not compressible enough
         }

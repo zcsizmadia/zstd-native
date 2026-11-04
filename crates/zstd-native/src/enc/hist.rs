@@ -65,38 +65,68 @@ fn hist_count_parallel(
         *max_symbol_value = 0;
         return Ok(0);
     }
-    let mut c = [[0u32; 256]; 4];
-    // One table per byte lane of each 32-bit word, as libzstd (which
-    // unrolls 4 words per iteration; the sums are the same).
-    let (chunks, rest) = src.as_chunks::<4>();
-    for w in chunks {
-        let v = u32::from_le_bytes(*w);
-        c[0][(v & 0xFF) as usize] += 1;
-        c[1][((v >> 8) & 0xFF) as usize] += 1;
-        c[2][((v >> 16) & 0xFF) as usize] += 1;
-        c[3][(v >> 24) as usize] += 1;
-    }
-    for &b in rest {
-        c[0][b as usize] += 1;
-    }
-    let mut max = 0;
-    for s in 0..256 {
-        let v = c[0][s] + c[1][s] + c[2][s] + c[3][s];
-        c[0][s] = v;
-        if v > max {
-            max = v;
-        }
-    }
+    // One table per byte lane of each word: libzstd's four lanes of a
+    // 32-bit word, or eight lanes of a 64-bit word for large inputs. A
+    // byte that repeats with the word's period (x-ray's 16-bit samples,
+    // whose high byte barely changes) hits the same counter every word,
+    // and each increment waits for the previous one's store; twice the
+    // lanes halve the length of those chains. The sums are the same.
+    let (c, max) = if src.len() < LANES8_MIN {
+        count_lanes::<4>(src)
+    } else {
+        count_lanes::<8>(src)
+    };
     let mut max_sv = 255;
-    while c[0][max_sv] == 0 {
+    while c[max_sv] == 0 {
         max_sv -= 1;
     }
     if check && max_sv > *max_symbol_value as usize {
         return Err(Error::Corrupted);
     }
     *max_symbol_value = max_sv as u32;
-    count[..count_len].copy_from_slice(&c[0][..count_len]);
+    count[..count_len].copy_from_slice(&c[..count_len]);
     Ok(max)
+}
+
+/// Inputs this long use eight lanes (the tables cost 8 KB to zero and sum).
+const LANES8_MIN: usize = 8 * 1024;
+
+/// The largest count of a byte in `src` (what `HIST_count_simple` returns),
+/// counted in lanes.
+pub(crate) fn hist_largest_count(src: &[u8]) -> u32 {
+    if src.len() < LANES8_MIN {
+        count_lanes::<4>(src).1
+    } else {
+        count_lanes::<8>(src).1
+    }
+}
+
+/// The histogram of `src` counted in `L` lane tables, summed; and the
+/// largest count.
+#[inline(always)]
+fn count_lanes<const L: usize>(src: &[u8]) -> ([u32; 256], u32) {
+    let mut c = [[0u32; 256]; L];
+    let (chunks, rest) = src.as_chunks::<L>();
+    for w in chunks {
+        for (lane, &b) in c.iter_mut().zip(w) {
+            lane[b as usize] += 1;
+        }
+    }
+    for &b in rest {
+        c[0][b as usize] += 1;
+    }
+    let mut max = 0;
+    for s in 0..256 {
+        let mut v = 0;
+        for lane in &c {
+            v += lane[s];
+        }
+        c[0][s] = v;
+        if v > max {
+            max = v;
+        }
+    }
+    (c[0], max)
 }
 
 /// libzstd's `HIST_countFast_wksp`: trusts the input (bytes above
@@ -161,11 +191,12 @@ mod tests {
     #[test]
     fn matches_reference() {
         for &n in &[
-            0usize, 1, 3, 15, 16, 17, 100, 1499, 1500, 1501, 5000, 131072,
+            0usize, 1, 3, 15, 16, 17, 100, 1499, 1500, 1501, 5000, 8191, 8192, 8200, 131072,
         ] {
             for &alpha in &[1u32, 2, 40, 200, 256] {
                 let src = data(n, n as u64 * 31 + u64::from(alpha), alpha);
                 let (rc, rmax, rl) = reference(&src);
+                assert_eq!(hist_largest_count(&src), rl, "n={n} alpha={alpha}");
                 for f in 0..4 {
                     let mut count = [7u32; 256];
                     let mut max = 255;
