@@ -67,6 +67,11 @@ jobs:
         run: cargo test -p zstd-bench --profile ci --test corruption
         env:
           ZSTD_NATIVE_CORRUPTION_ITERS: "200000"
+      - name: Test (32-bit)
+        if: matrix.name == 'windows-x64'
+        run: |
+          rustup target add i686-pc-windows-msvc
+          cargo test --workspace --profile ci --target i686-pc-windows-msvc
 
   msrv:
     name: MSRV 1.89

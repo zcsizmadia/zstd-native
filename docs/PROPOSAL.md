@@ -61,9 +61,16 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
   region offsets folded into `next_state`), so the loop needs one table
   pointer; repeat offsets as scalars; dictionary matches in a cold
   function. These cut the loop from 87% to ~95% of libzstd's speed by
-  keeping its state in registers. Tried and rejected: decoding batches of
-  sequences before executing them (-15%), prefetching the match source
-  just before the copy (-3%).
+  keeping its state in registers. Then to ~99-100%: bounds checks as plain
+  address comparisons (in `u64`, so they can't wrap on 32-bit) instead of
+  `saturating_sub` (+3%), and one read for the three FSE state updates
+  (up to 26 bits, split with shifts and masks) instead of three dependent
+  reads (+1-3%). Tried and rejected: decoding batches of sequences before
+  executing them (-15%), prefetching the match source just before the
+  copy (-3%), reading all extra bits at once when they total under 31
+  bits (+1-3% on logs and numeric data, -3% on text: the extra branch
+  mispredicts), reading offset and match length bits together (-9%: the
+  loop's register allocation is fragile; measure every change).
 - **Huffman**: X1 (one symbol per lookup) and X2 (up to two), chosen per
   block with libzstd's `HUF_selectDecoder` timing table. The X2 table is
   derived from the X1 table (cell `i` = X1 at `i`, plus X1 at
@@ -85,7 +92,7 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
 ## Roadmap
 
 1. Decoder speed to >= 1.0x libzstd everywhere (Huffman is there; the
-   sequence loop is ~5% behind): a long-offset decoder with
+   sequence loop is within 1-2%): a long-offset decoder with
    prefetching (libzstd's `ZSTD_decompressSequencesLong`) for large
    windows; literals placed in the output buffer like libzstd's split
    literal buffer; more measurement on Silesia (`ZSTD_BENCH_CORPUS`).
