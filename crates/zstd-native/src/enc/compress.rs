@@ -3,15 +3,19 @@
 //! `ZSTD_writeFrameHeader`, `ZSTD_writeEpilogue`), one-shot.
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use super::fast::{MatchState, build_seq_store};
+use super::cdict::{CDict, DictSlot, frame_cparams, should_attach, use_cdict_tables};
+use super::fast::{MatchState, SHORT_CACHE_TAG_BITS, build_seq_store};
 use super::hist::hist_count_fast;
 use super::huf_enc::HufRepeat;
 use super::literals::{HufCTables, compress_literals, min_gain};
+use super::opt::DictCosts;
 use super::params::{
-    CONTENTSIZE_UNKNOWN, CParams, Strategy, block_size_max, block_splitter_enabled,
-    one_shot_cparams,
+    CONTENTSIZE_UNKNOWN, CParamMode, CParams, ParamSwitch, Strategy, adjust_cparams_internal,
+    block_size_max, block_splitter_enabled, ldm_enabled, one_shot_cparams,
+    resolve_row_match_finder_mode, row_match_finder_used,
 };
 use super::presplit::{FpStats, optimal_block_size};
 use super::seq_store::{
@@ -58,7 +62,7 @@ pub(crate) struct EntropyTables {
 }
 
 impl EntropyTables {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         EntropyTables {
             huf: HufCTables::new(),
             fse: FseCTables::new(),
@@ -442,6 +446,8 @@ pub(crate) struct FrameCompressor {
     /// `consumedSrcSize` and `producedCSize` for the frame.
     consumed: u64,
     produced: u64,
+    /// `dictID`: the frame's dictionary ID (0: none written).
+    dict_id: u32,
 }
 
 impl FrameCompressor {
@@ -469,6 +475,7 @@ impl FrameCompressor {
             pledged,
             consumed: 0,
             produced: 0,
+            dict_id: 0,
         }
     }
 
@@ -483,9 +490,24 @@ impl FrameCompressor {
     /// As [`reset`](Self::reset), with resolved parameters and a frame of
     /// `pledged` bytes (`None`: unknown).
     pub(crate) fn reset_with_params(&mut self, cp: CParams, pledged: Option<u64>) {
+        let use_row = row_match_finder_used(
+            cp.strategy,
+            resolve_row_match_finder_mode(ParamSwitch::Auto, &cp),
+        );
+        self.reset_full(cp, pledged, use_row, &cp);
+    }
+
+    /// `ZSTD_resetCCtx_internal`: [`reset_with_params`](Self::reset_with_params)
+    /// with the row match finder use given and the post-block splitter
+    /// resolved from the frame's parameters `frame_cp` (with a CDict, `cp`
+    /// holds the CDict's table parameters instead).
+    fn reset_full(&mut self, cp: CParams, pledged: Option<u64>, use_row: bool, frame_cp: &CParams) {
         let bsm = block_size_max(&cp, pledged.unwrap_or(CONTENTSIZE_UNKNOWN));
         self.cp = cp;
-        self.ms.reset(cp);
+        self.ms.reset_with(cp, use_row, false);
+        if let Some(o) = self.ms.opt.as_deref_mut() {
+            o.dict_costs = None;
+        }
         if self.ss.max_nb_lit < bsm || self.ss.max_nb_seq < max_nb_seq(bsm, cp.min_match) {
             self.ss = SeqStore::new(bsm, cp.min_match);
         } else {
@@ -500,12 +522,141 @@ impl FrameCompressor {
         }
         self.rep = REP_START_VALUE;
         self.first_block = true;
-        self.split = block_splitter_enabled(&cp);
+        self.split = block_splitter_enabled(frame_cp);
         self.block_size_max = bsm;
         self.stage = FrameStage::Init;
         self.pledged = pledged;
         self.consumed = 0;
         self.produced = 0;
+        self.dict_id = 0;
+    }
+
+    /// Starts a frame of `pledged` bytes (`None`: unknown) with the frame
+    /// parameters `frame_cp` (see [`frame_cparams`](super::cdict::frame_cparams))
+    /// and the dictionary `cdict`: libzstd's `ZSTD_compressBegin_internal`,
+    /// which starts from the CDict's tables (attached or copied, see the
+    /// `cdict` module) or loads its content into tables with the frame's
+    /// parameters. Reuses `slot`'s compressor, or makes one.
+    pub(crate) fn start_frame<'a>(
+        slot: &'a mut Option<Box<FrameCompressor>>,
+        frame_cp: CParams,
+        cdict: Option<&Arc<CDict>>,
+        pledged: Option<u64>,
+    ) -> &'a mut FrameCompressor {
+        let fc = match slot {
+            Some(f) => f,
+            None => {
+                let f = slot.insert(Box::new(FrameCompressor::with_params(frame_cp, pledged)));
+                // a new context: its one reset below must advance the hash
+                // salt from 0
+                f.ms.clear_hash_salt();
+                f
+            }
+        };
+        let size = pledged.unwrap_or(CONTENTSIZE_UNKNOWN);
+        match cdict {
+            Some(cd) if use_cdict_tables(cd, size) => {
+                if should_attach(cd, size) {
+                    fc.attach_cdict(frame_cp, cd, pledged);
+                } else {
+                    fc.copy_cdict(frame_cp, cd, pledged);
+                }
+            }
+            _ => {
+                fc.reset_with_params(frame_cp, pledged);
+                if let Some(cd) = cdict {
+                    // ZSTD_compress_insertDictionary
+                    cd.load_into(&mut fc.ms);
+                    fc.take_block_state(cd);
+                }
+            }
+        }
+        fc
+    }
+
+    /// `ZSTD_resetCCtx_byAttachingCDict()`: the context's tables are sized
+    /// for the source only, the match finders search the CDict's too
+    /// (dictMatchState).
+    fn attach_cdict(&mut self, frame_cp: CParams, cd: &Arc<CDict>, pledged: Option<u64>) {
+        let size = pledged.unwrap_or(CONTENTSIZE_UNKNOWN);
+        // Resize working context table params for input only, since the
+        // dict has its own tables.
+        let mut cp = adjust_cparams_internal(
+            cd.cparams,
+            size,
+            cd.content.len() as u64,
+            CParamMode::AttachDict,
+            resolve_row_match_finder_mode(ParamSwitch::Auto, &frame_cp),
+        );
+        cp.window_log = frame_cp.window_log;
+        self.reset_full(cp, pledged, cd.use_row, &frame_cp);
+        debug_assert!(self.cp.strategy == cd.cparams.strategy);
+        // don't even attach dictionaries with no contents
+        if cd.has_window_content() {
+            let w = &cd.ms.window;
+            let cdict_end = w.index(w.next_src);
+            let ms = &mut self.ms;
+            ms.dict = Some(cd.clone());
+            ms.dms = true;
+            // prep working match state so dict matches never have negative
+            // indices when they are translated to the working context's
+            // index space
+            if ms.window.dict_limit < cdict_end {
+                ms.window.next_src = ms.window.base.wrapping_add(cdict_end as usize);
+                ms.window.clear();
+            }
+            // loadedDictEnd is expressed within the referential of the
+            // active context
+            ms.loaded_dict_end = ms.window.dict_limit;
+        }
+        self.take_block_state(cd);
+    }
+
+    /// `ZSTD_resetCCtx_byCopyingCDict()`: the context gets the CDict's
+    /// table parameters (with the frame's window), tables and window; the
+    /// dictionary is then its extDict.
+    fn copy_cdict(&mut self, frame_cp: CParams, cd: &Arc<CDict>, pledged: Option<u64>) {
+        let mut cp = cd.cparams;
+        cp.window_log = frame_cp.window_log;
+        self.reset_full(cp, pledged, cd.use_row, &frame_cp);
+        let ms = &mut self.ms;
+        let src = &cd.ms;
+        // copy tables, removing the tags of a fast or dfast CDict's
+        let tagged = matches!(cp.strategy, Strategy::Fast | Strategy::DFast);
+        let copy = |dst: &mut [u32], src: &[u32]| {
+            debug_assert_eq!(dst.len(), src.len());
+            if tagged {
+                for (d, &s) in dst.iter_mut().zip(src) {
+                    *d = s >> SHORT_CACHE_TAG_BITS;
+                }
+            } else {
+                dst.copy_from_slice(src);
+            }
+        };
+        copy(&mut ms.hash_table, &src.hash_table);
+        copy(&mut ms.chain_table, &src.chain_table);
+        if cd.use_row {
+            ms.tag_table.copy_from_slice(&src.tag_table);
+            ms.hash_salt = src.hash_salt;
+        }
+        // copy dictionary offsets (the window is in the CDict's buffer)
+        ms.window = src.window;
+        ms.next_to_update = src.next_to_update;
+        ms.loaded_dict_end = src.loaded_dict_end;
+        ms.dict = Some(cd.clone());
+        self.take_block_state(cd);
+    }
+
+    /// The dictionary's ID, and its entropy tables and repcodes as the
+    /// previous block's (`cdict->cBlockState`), with what the optimal
+    /// parser seeds its statistics from.
+    fn take_block_state(&mut self, cd: &CDict) {
+        self.dict_id = cd.dict_id;
+        (*self.prev).clone_from(&cd.entropy);
+        self.rep = cd.rep;
+        if let Some(o) = self.ms.opt.as_deref_mut() {
+            o.dict_costs = DictCosts::new(&cd.entropy);
+        }
     }
 
     /// libzstd's `ZSTD_compressBlock_internal`: 0 = store raw, 1 = RLE
@@ -631,7 +782,7 @@ impl FrameCompressor {
     ) -> Result<usize> {
         let mut fh_size = 0;
         if self.stage == FrameStage::Init {
-            fh_size = write_frame_header(dst, &self.cp, self.pledged)?;
+            fh_size = write_frame_header(dst, &self.cp, self.pledged, self.dict_id)?;
             self.stage = FrameStage::Ongoing;
         }
         if start == end {
@@ -686,9 +837,14 @@ impl FrameCompressor {
     }
 }
 
-/// libzstd's `ZSTD_writeFrameHeader` (no checksum, no dictionary): with the
-/// content size when `pledged` holds it.
-fn write_frame_header(dst: &mut [u8], cp: &CParams, pledged: Option<u64>) -> Result<usize> {
+/// libzstd's `ZSTD_writeFrameHeader` (no checksum): with the content size
+/// when `pledged` holds it, and the dictionary ID unless it is 0.
+fn write_frame_header(
+    dst: &mut [u8],
+    cp: &CParams,
+    pledged: Option<u64>,
+    dict_id: u32,
+) -> Result<usize> {
     if dst.len() < 18 {
         return Err(Error::OutputTooSmall);
     }
@@ -705,11 +861,28 @@ fn write_frame_header(dst: &mut [u8], cp: &CParams, pledged: Option<u64>) -> Res
         0
     };
     dst[..4].copy_from_slice(&crate::frame::MAGIC.to_le_bytes());
-    dst[4] = (u8::from(single) << 5) + (fcs_code << 6);
+    let dict_id_size_code =
+        u8::from(dict_id > 0) + u8::from(dict_id >= 256) + u8::from(dict_id >= 65536);
+    dst[4] = dict_id_size_code + (u8::from(single) << 5) + (fcs_code << 6);
     let mut pos = 5;
     if !single {
         dst[pos] = wlog_byte;
         pos += 1;
+    }
+    match dict_id_size_code {
+        0 => {}
+        1 => {
+            dst[pos] = dict_id as u8;
+            pos += 1;
+        }
+        2 => {
+            dst[pos..pos + 2].copy_from_slice(&(dict_id as u16).to_le_bytes());
+            pos += 2;
+        }
+        _ => {
+            dst[pos..pos + 4].copy_from_slice(&dict_id.to_le_bytes());
+            pos += 4;
+        }
     }
     match fcs_code {
         0 => {
@@ -768,6 +941,43 @@ pub(crate) fn compress_with(
 ) -> Result<Vec<u8>> {
     let mut out = alloc::vec![0u8; compress_bound(src.len())];
     let n = compress_to_slice_with(fc, src, &mut out, level, fresh)?;
+    out.truncate(n);
+    Ok(out)
+}
+
+/// As [`compress_to_slice_with`], with the compressor's dictionary `dict`
+/// (libzstd's `ZSTD_compress2` on a context with a loaded or referenced
+/// dictionary; with `fresh`, a new context).
+pub(crate) fn compress_dict_to_slice_with(
+    fc: &mut Option<Box<FrameCompressor>>,
+    dict: &mut DictSlot,
+    src: &[u8],
+    dst: &mut [u8],
+    level: i32,
+    fresh: bool,
+) -> Result<usize> {
+    let (cd, level) = dict.for_frame(level)?;
+    let pledged = Some(src.len() as u64);
+    let frame_cp = frame_cparams(level, cd.as_deref(), pledged, 0);
+    if ldm_enabled(&frame_cp) {
+        return Err(Error::UnsupportedFrameParameter);
+    }
+    if let Some(f) = fc.as_deref_mut().filter(|_| fresh) {
+        f.ms.clear_hash_salt();
+    }
+    FrameCompressor::start_frame(fc, frame_cp, cd.as_ref(), pledged).compress(dst, src)
+}
+
+/// As [`compress_dict_to_slice_with`], into a new vector.
+pub(crate) fn compress_dict_with(
+    fc: &mut Option<Box<FrameCompressor>>,
+    dict: &mut DictSlot,
+    src: &[u8],
+    level: i32,
+    fresh: bool,
+) -> Result<Vec<u8>> {
+    let mut out = alloc::vec![0u8; compress_bound(src.len())];
+    let n = compress_dict_to_slice_with(fc, dict, src, &mut out, level, fresh)?;
     out.truncate(n);
     Ok(out)
 }

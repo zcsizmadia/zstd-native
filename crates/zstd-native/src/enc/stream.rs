@@ -17,6 +17,13 @@
 //! the `fast` module docs) map `base + i` (prefix) and `dictBase + i`
 //! (extDict) into it.
 //!
+//! # Dictionaries
+//!
+//! A dictionary ([`StreamEncoder::with_dictionary`],
+//! [`StreamEncoder::with_prepared_dictionary`]) applies to every frame; the
+//! frame starts from it like a one-shot frame (see the `cdict` module), its
+//! content staying in its own buffer.
+//!
 //! # Parameters
 //!
 //! They are chosen when the first call of a frame starts it
@@ -39,11 +46,9 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+use super::cdict::{DictSlot, EncoderDictionary, frame_cparams};
 use super::compress::{FrameCompressor, FrameStage, compress_bound};
-use super::params::{
-    CONTENTSIZE_UNKNOWN, CParamMode, CParams, ParamSwitch, WINDOWLOG_ABSOLUTEMIN, WINDOWLOG_MAX,
-    adjust_cparams_internal, get_cparams_internal, ldm_enabled,
-};
+use super::params::{CONTENTSIZE_UNKNOWN, WINDOWLOG_ABSOLUTEMIN, WINDOWLOG_MAX, ldm_enabled};
 use crate::error::{Error, Result};
 
 /// Bytes after the input buffer's ring, never part of the window: reads
@@ -155,6 +160,8 @@ pub struct StreamEncoder {
     out_content: usize,
     out_flushed: usize,
     frame_ended: bool,
+    /// The dictionary of the next frames.
+    dict: DictSlot,
 }
 
 impl core::fmt::Debug for StreamEncoder {
@@ -185,12 +192,68 @@ impl StreamEncoder {
             out_content: 0,
             out_flushed: 0,
             frame_ended: false,
+            dict: DictSlot::None,
         }
     }
 
-    /// Changes the level, from the next frame on.
+    /// A streaming compressor for `level` with the dictionary `dict` (see
+    /// [`set_dictionary`](Self::set_dictionary)).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidDictionary`] if a zstd-format dictionary is corrupt.
+    pub fn with_dictionary(level: i32, dict: &[u8]) -> Result<Self> {
+        let mut e = Self::new(level);
+        e.set_dictionary(dict)?;
+        Ok(e)
+    }
+
+    /// A streaming compressor with a prepared dictionary, at its level (see
+    /// [`set_prepared_dictionary`](Self::set_prepared_dictionary)).
+    pub fn with_prepared_dictionary(dict: &EncoderDictionary) -> Self {
+        let mut e = Self::new(dict.level());
+        e.dict = DictSlot::Prepared(dict.inner.clone());
+        e
+    }
+
+    /// Changes the level, from the next frame on. With a prepared
+    /// dictionary, frames take the dictionary's level instead (see
+    /// [`Compressor::set_level`](crate::Compressor::set_level)).
     pub fn set_level(&mut self, level: i32) {
         self.level = level;
+    }
+
+    /// Uses `dict` for the next frames (libzstd's
+    /// `ZSTD_CCtx_loadDictionary`; see
+    /// [`Compressor::set_dictionary`](crate::Compressor::set_dictionary)),
+    /// replacing any dictionary; an empty `dict` removes it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StageWrong`] in the middle of a frame,
+    /// [`Error::InvalidDictionary`] if a zstd-format dictionary is corrupt
+    /// (the encoder then has no dictionary).
+    pub fn set_dictionary(&mut self, dict: &[u8]) -> Result<()> {
+        if self.stage != Stage::Init {
+            return Err(Error::StageWrong);
+        }
+        self.dict = DictSlot::None;
+        self.dict = DictSlot::local(dict)?;
+        Ok(())
+    }
+
+    /// Uses the prepared `dict` for the next frames, at its level (libzstd's
+    /// `ZSTD_CCtx_refCDict`), replacing any dictionary.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StageWrong`] in the middle of a frame.
+    pub fn set_prepared_dictionary(&mut self, dict: &EncoderDictionary) -> Result<()> {
+        if self.stage != Stage::Init {
+            return Err(Error::StageWrong);
+        }
+        self.dict = DictSlot::Prepared(dict.inner.clone());
+        Ok(())
     }
 
     /// Overrides the window log (libzstd's `ZSTD_c_windowLog`; 0 restores
@@ -278,34 +341,19 @@ impl StreamEncoder {
         r
     }
 
-    /// The parameters of a new frame (`ZSTD_getCParamsFromCCtxParams`).
-    fn frame_params(&self) -> CParams {
-        let size = self.pledged.unwrap_or(CONTENTSIZE_UNKNOWN);
-        let mut cp = get_cparams_internal(self.level, size, 0, CParamMode::NoAttachDict);
-        if self.window_log != 0 {
-            cp.window_log = self.window_log; // ZSTD_overrideCParams
-        }
-        adjust_cparams_internal(cp, size, 0, CParamMode::NoAttachDict, ParamSwitch::Auto)
-    }
-
-    /// `ZSTD_CCtx_init_compressStream2`: starts a frame.
+    /// `ZSTD_CCtx_init_compressStream2`: starts a frame (with the
+    /// dictionary, if any: `ZSTD_compressBegin_internal`).
     fn init(&mut self, op: EndOp, in_size: usize) -> Result<()> {
         if op == EndOp::End {
             self.pledged = Some(in_size as u64); // auto-determine pledgedSrcSize
         }
-        let cp = self.frame_params();
+        let (cd, level) = self.dict.for_frame(self.level)?;
+        // ZSTD_getCParamsFromCCtxParams
+        let cp = frame_cparams(level, cd.as_deref(), self.pledged, self.window_log);
         if ldm_enabled(&cp) {
             return Err(Error::UnsupportedFrameParameter);
         }
-        let fc = match &mut self.fc {
-            Some(fc) => {
-                fc.reset_with_params(cp, self.pledged);
-                fc
-            }
-            None => self
-                .fc
-                .insert(Box::new(FrameCompressor::with_params(cp, self.pledged))),
-        };
+        let fc = FrameCompressor::start_frame(&mut self.fc, cp, cd.as_ref(), self.pledged);
         let bsm = fc.block_size_max;
         let pledged = self.pledged.unwrap_or(CONTENTSIZE_UNKNOWN);
         let window_size = (1u64 << cp.window_log).min(pledged).max(1) as usize;

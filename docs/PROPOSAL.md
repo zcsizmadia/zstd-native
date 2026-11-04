@@ -39,6 +39,8 @@ crates/zstd-native/   the library (no_std + alloc; `std` for CPU detection)
   src/block.rs        literals, sequences header, fused decode+execute loop
   src/frame.rs        frame headers
   src/dict.rs         zstd-format and raw content dictionaries
+  src/enc/           the encoder (enc/mod.rs lists its modules;
+                      enc/cdict.rs: compression dictionaries)
   src/decoder.rs      Decompressor, one-shot API (Vec / slice)
   src/xxhash.rs       XXH64 content checksum
   src/cpu.rs          run-time CPU feature detection
@@ -127,9 +129,23 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
    ring buffer of window + block, libzstd's end-of-input shortcut, flush
    and end), with the extDict variants of every match finder for the
    wrapped ring; byte-identical with libzstd for the same calls.
-   Next: speed (#17), dictionaries, multithreading, LDM.
-4. Multithreaded compression, dictionaries for the encoder, long distance
-   matching.
+   Dictionaries (#22, `enc/cdict.rs`): zstd-format and raw content
+   (`ZSTD_compress_insertDictionary`, `ZSTD_loadCEntropy`,
+   `ZSTD_loadDictionaryContent` with its size limits), CDicts with tagged
+   `fast`/`dfast` tables (`EncoderDictionary`), and how a context uses
+   one (`ZSTD_compressBegin_internal`): attached for small sources (the
+   `_dictMatchState` variants of every match finder search its tables),
+   copied above the per-strategy cutoffs (the dictionary is then the
+   extDict, kept in its own buffer), or reloaded with the frame's
+   parameters for large sources; the dictionary's entropy tables seed the
+   first block and the optimal parser's statistics, its ID goes in the
+   frame header. Byte-identical with libzstd for loaded
+   (`ZSTD_CCtx_loadDictionary`) and referenced (`ZSTD_CCtx_refCDict`)
+   dictionaries, one-shot, reused and streaming; on par with libzstd's
+   speed in first measurements. Not ported: dedicated dictionary search
+   (off by default), prefix dictionaries.
+   Next: speed (#17), multithreading, LDM.
+4. Multithreaded compression, long distance matching.
 5. Fuzzing (cargo-fuzz, differential vs libzstd), Miri, CI matrix
    (x86-64/AArch64, Linux/Windows/macOS, 32-bit), AArch64 tuning.
 

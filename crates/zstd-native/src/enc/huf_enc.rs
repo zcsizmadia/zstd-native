@@ -115,6 +115,108 @@ fn get_nb_bits(elt: u64) -> u32 {
     (elt & 0xFF) as u32
 }
 
+/// libzstd's `HUF_readCTable` (with `HUF_readStats`): reads a Huffman tree
+/// description (a dictionary's literals table) into `ct`. Returns the
+/// bytes read and whether some symbol has a zero weight (`hasZeroWeights`);
+/// `ct.max_symbol_value` is the last symbol described.
+///
+/// # Errors
+///
+/// [`Error::InvalidDictionary`] if the description is corrupt.
+pub(crate) fn huf_read_ctable(ct: &mut HufCTable, src: &[u8]) -> Result<(usize, bool)> {
+    let bad = Error::InvalidDictionary;
+    let mut weights = [0u8; 256];
+    let &header = src.first().ok_or(bad)?;
+    let mut i_size = header as usize;
+    let o_size;
+    if i_size >= 128 {
+        // special header
+        o_size = i_size - 127;
+        i_size = o_size.div_ceil(2);
+        if i_size + 1 > src.len() || o_size >= 256 {
+            return Err(bad);
+        }
+        for n in (0..o_size).step_by(2) {
+            let b = src[1 + n / 2];
+            weights[n] = b >> 4;
+            weights[n + 1] = b & 15;
+        }
+    } else {
+        // header compressed with FSE (normal case)
+        if i_size + 1 > src.len() {
+            return Err(bad);
+        }
+        o_size =
+            crate::fse::decompress_weights(&src[1..1 + i_size], &mut weights).map_err(|_| bad)?;
+        if o_size >= 256 {
+            return Err(bad);
+        }
+    }
+
+    // collect weight stats
+    let mut rank_val = [0u32; HUF_TABLELOG_MAX as usize + 2];
+    let mut weight_total = 0u32;
+    for &w in &weights[..o_size] {
+        if u32::from(w) > HUF_TABLELOG_MAX {
+            return Err(bad);
+        }
+        rank_val[w as usize] += 1;
+        weight_total += (1 << w) >> 1;
+    }
+    if weight_total == 0 {
+        return Err(bad);
+    }
+    // get last non-null symbol weight (implied, total must be 2^n)
+    let table_log = highbit32(weight_total) + 1;
+    if table_log > HUF_TABLELOG_MAX {
+        return Err(bad);
+    }
+    let rest = (1u32 << table_log) - weight_total;
+    let verif = 1u32 << highbit32(rest);
+    let last_weight = highbit32(rest) + 1;
+    if verif != rest {
+        return Err(bad); // last value must be a clean power of 2
+    }
+    weights[o_size] = last_weight as u8;
+    rank_val[last_weight as usize] += 1;
+    // check tree construction validity
+    if rank_val[1] < 2 || rank_val[1] & 1 != 0 {
+        return Err(bad);
+    }
+    let nb_symbols = o_size + 1;
+    let has_zero_weights = rank_val[0] > 0;
+
+    *ct = HufCTable::new();
+    ct.table_log = table_log;
+    ct.max_symbol_value = nb_symbols as u32 - 1;
+    // fill nbBits
+    for n in 0..nb_symbols {
+        let w = u32::from(weights[n]);
+        ct.elts[n] = u64::from(if w != 0 { table_log + 1 - w } else { 0 });
+    }
+    // fill val
+    let mut nb_per_rank = [0u16; HUF_TABLELOG_MAX as usize + 2];
+    let mut val_per_rank = [0u16; HUF_TABLELOG_MAX as usize + 2];
+    for n in 0..nb_symbols {
+        nb_per_rank[get_nb_bits(ct.elts[n]) as usize] += 1;
+    }
+    // determine starting value per rank
+    val_per_rank[table_log as usize + 1] = 0; // for w==0
+    let mut min = 0u16;
+    for n in (1..=table_log as usize).rev() {
+        val_per_rank[n] = min; // get starting value within each rank
+        min += nb_per_rank[n];
+        min >>= 1;
+    }
+    // assign value within rank, symbol order
+    for n in 0..nb_symbols {
+        let r = get_nb_bits(ct.elts[n]) as usize;
+        set_value(&mut ct.elts[n], u64::from(val_per_rank[r]));
+        val_per_rank[r] = val_per_rank[r].wrapping_add(1);
+    }
+    Ok((i_size + 1, has_zero_weights))
+}
+
 /// libzstd's `HUF_setValue` on an element whose length is set.
 #[inline(always)]
 fn set_value(elt: &mut u64, value: u64) {

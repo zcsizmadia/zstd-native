@@ -36,6 +36,9 @@
 //! same bytes as libzstd 1.5.7 at every level. [`Encoder`] compresses into
 //! any `std::io::Write`; [`StreamEncoder`] is the push API underneath
 //! (libzstd's `ZSTD_compressStream2`, byte-identical for the same calls).
+//! All of them take dictionaries too ([`compress_with_dictionary`],
+//! [`Compressor::with_dictionary`], or an [`EncoderDictionary`] prepared
+//! once), with libzstd's output.
 //!
 //! ```
 //! use std::io::Write;
@@ -80,7 +83,8 @@ mod xxhash;
 pub use decoder::{Decompressor, content_size, decompress, decompress_to_slice};
 pub use dict::Dictionary;
 pub use enc::{
-    CompressProgress, Compressor, EndOp, StreamEncoder, compress, compress_bound, compress_to_slice,
+    CompressProgress, Compressor, EncoderDictionary, EndOp, StreamEncoder, compress,
+    compress_bound, compress_to_slice, compress_with_dictionary,
 };
 pub use error::Error;
 pub use frame::FrameHeader;

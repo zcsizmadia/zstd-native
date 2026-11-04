@@ -15,9 +15,13 @@ included). All levels work (negative and 1 to 22: every strategy from
 `fast` to `btultra2`, with libzstd's block splitters), at about
 0.9-0.96x libzstd's speed for `fast`/`dfast`, on par for the lazy
 strategies and 0.9-1.05x for the optimal parser (first measurements).
-Not yet: long distance matching, which libzstd turns on by itself only
-at level 22 for inputs over 64 MiB or of unknown size
-(`UnsupportedFrameParameter`), dictionaries and multithreading.
+Dictionaries work too, zstd-format (as made by `zstd --train`) and raw
+content, loaded into a compressor (`ZSTD_CCtx_loadDictionary`) or
+prepared once (`EncoderDictionary`, libzstd's `ZSTD_CDict`), byte-identical
+with libzstd's attached, copied or reloaded dictionary tables at every
+level, one-shot and streaming. Not yet: long distance matching, which
+libzstd turns on by itself only at level 22 for inputs over 64 MiB or of
+unknown size (`UnsupportedFrameParameter`), and multithreading.
 
 ```rust
 let compressed = zstd_native::compress(&data, 1)?; // same bytes as libzstd
@@ -36,6 +40,13 @@ std::io::copy(&mut zstd_native::Decoder::new(file), &mut out)?;
 let mut enc = zstd_native::Encoder::new(Vec::new(), 3);
 std::io::copy(&mut file, &mut enc)?;
 let compressed = enc.finish()?;
+
+// Compression with a dictionary (same bytes as the zstd crate's
+// `bulk::Compressor::with_dictionary` / `with_prepared_dictionary`):
+let mut c = zstd_native::Compressor::with_dictionary(3, &dict_bytes)?;
+let compressed = c.compress(&message)?;
+let prepared = zstd_native::EncoderDictionary::new(&dict_bytes, 3)?;
+let mut enc = zstd_native::Encoder::with_prepared_dictionary(Vec::new(), &prepared);
 ```
 
 ## Speed
