@@ -55,7 +55,9 @@
 //! Debug builds check every read with `chk`.
 
 use super::compress::EntropyTables;
-use super::fast::{DmsView, ExtWindow, HASH_READ_SIZE, MatchState, hash_mls, index_overlap_check};
+use super::fast::{
+    DmsView, ExtWindow, HASH_READ_SIZE, MatchState, hash_mls, index_overlap_check, prefetch_l1,
+};
 use super::hist::hist_count_simple;
 use super::huf_enc::HufRepeat;
 use super::ldm::RawSeq;
@@ -866,9 +868,24 @@ unsafe fn get_all_matches<const MLS: u32, const EXT: bool, const DMS: bool>(
     // the 3-byte hash and tree candidates are at or above `matchLow` and
     // before `curr`; forward reads stop at `ilimit` (the block end).
     unsafe {
+        let curr = s.idx(ip);
+        // The parser searches consecutive positions: prefetch the next one's
+        // hash bucket(s) and its slot in the tree (random accesses into
+        // tables of up to 16 and 64 MiB at the high levels, missing every
+        // cache) now, so that the misses overlap this position's search.
+        // The hash reads 8 bytes at `ip + 1`, in the block when
+        // `ip + 1 + 8 <= iend`.
+        if ip.add(1 + HASH_READ_SIZE) <= iend {
+            let nip = ip.add(1);
+            prefetch_l1(s.hash_table.add(hash_mls::<MLS>(nip, s.hash_log)).cast());
+            if MLS == 3 {
+                prefetch_l1(s.hash_table3.add(hash3_ptr(nip, s.hash_log3)).cast());
+            }
+            prefetch_l1(bt.add(2 * ((curr + 1) & bt_mask) as usize).cast());
+        }
+
         update_tree::<MLS, EXT>(s, ip, iend);
 
-        let curr = s.idx(ip);
         let dict_limit = s.dict_limit;
         let bt_low = curr.saturating_sub(bt_mask);
         let window_low = s.lowest_match_index(curr);
