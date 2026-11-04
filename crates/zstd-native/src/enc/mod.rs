@@ -50,6 +50,8 @@
 #![allow(dead_code)] // filled in step by step (issue #6)
 
 pub(crate) mod bitwriter;
+#[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+pub(crate) mod block_asm;
 pub(crate) mod cdict;
 pub(crate) mod compress;
 pub(crate) mod dfast;
@@ -66,8 +68,6 @@ pub(crate) mod opt;
 pub(crate) mod params;
 pub(crate) mod presplit;
 pub(crate) mod row;
-#[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
-pub(crate) mod search_asm;
 pub(crate) mod seq_store;
 pub(crate) mod sequences;
 pub(crate) mod split;

@@ -109,9 +109,7 @@ pub(crate) fn compress_block_double_fast(
     }
 }
 
-/// Loop invariants of the noDict position search ([`search`]), laid out
-/// for the asm loop (`search_asm::dfast_search` reads it by field offset).
-#[repr(C)]
+/// Loop invariants of the noDict position search ([`search_rust`]).
 pub(super) struct Search {
     /// Return once the next position is at or past `lim`
     /// ([`EXIT_LIMIT`]).
@@ -127,9 +125,6 @@ pub(super) struct Search {
     pub(super) hash_small: *mut u32,
     /// `prefixLowestIndex`.
     pub(super) low: u64,
-    /// `1 - offset_1` (wrapping): the repcode candidate of `ip + 1` is at
-    /// `ip + rep_disp`.
-    pub(super) rep_disp: usize,
     /// `64 - chainLog`.
     pub(super) shift_s: u64,
     /// `64 - hashLog`.
@@ -139,8 +134,7 @@ pub(super) struct Search {
     pub(super) iend: *const u8,
 }
 
-/// Position search state, in and out of [`search`].
-#[repr(C)]
+/// Position search state, in and out of [`search_rust`].
 pub(super) struct Cursor {
     pub(super) ip: *const u8,
     pub(super) ip1: *const u8,
@@ -165,36 +159,6 @@ pub(super) const EXIT_SHORT: u32 = 2;
 /// `hl`/`idxl` in `c`) is at or past `lim`: the caller updates the step and
 /// limits, sets `c.ip1` and continues.
 pub(super) const EXIT_LIMIT: u32 = 3;
-/// [`search_rust`] searched its `ITERS` positions without a match or
-/// limit (cursor at the next position).
-const EXIT_PAUSE: u32 = 4;
-
-/// [`search_rust`], or its `asm!` version on x86-64 with BMI2 (`use_asm`;
-/// the asm loop has no `offset_1 == 0` case, `s.rep_disp` is then unused).
-///
-/// # Safety
-/// As [`search_rust`].
-#[allow(unsafe_code)]
-#[inline(always)]
-unsafe fn search<const MLS: u32>(s: &Search, c: &mut Cursor, offset_1: u32, use_asm: bool) -> u32 {
-    #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
-    if use_asm && offset_1 != 0 {
-        debug_assert!(s.rep_disp == 1usize.wrapping_sub(offset_1 as usize));
-        // The first positions in Rust: matches are often found right away
-        // (text), where entering the asm costs more than it saves.
-        // SAFETY: per the caller.
-        let exit = unsafe { search_rust::<MLS, 4>(s, c, offset_1) };
-        if exit != EXIT_PAUSE {
-            return exit;
-        }
-        // SAFETY: per the caller; `use_asm` is only set with BMI2.
-        return unsafe { super::search_asm::dfast_search(s, c) };
-    }
-    let _ = use_asm;
-    // SAFETY: per the caller.
-    unsafe { search_rust::<MLS, 0>(s, c, offset_1) }
-}
-
 /// The inner loop of `ZSTD_compressBlock_doubleFast_noDict_generic`
 /// (positions `ip`, `ip1 = ip + step`, ...): inserts each position in both
 /// tables, checks the repcode at `ip + 1`, then the long and the short
@@ -209,11 +173,7 @@ unsafe fn search<const MLS: u32>(s: &Search, c: &mut Cursor, offset_1: u32, use_
 /// have `1 << h_bits` entries.
 #[allow(unsafe_code)]
 #[inline(always)]
-unsafe fn search_rust<const MLS: u32, const ITERS: usize>(
-    s: &Search,
-    c: &mut Cursor,
-    offset_1: u32,
-) -> u32 {
+unsafe fn search_rust<const MLS: u32>(s: &Search, c: &mut Cursor, offset_1: u32) -> u32 {
     // ~random data, unlikely to match: read instead of the table candidate
     // when that is invalid, to avoid an unpredictable branch.
     static DUMMY: [u8; 10] = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0xe2, 0xb4];
@@ -227,7 +187,6 @@ unsafe fn search_rust<const MLS: u32, const ITERS: usize>(
     let mut ip1 = c.ip1;
     let mut hl0 = c.hl;
     let mut idxl0 = c.idxl as u32;
-    let mut iters = 0usize;
     let (step, lim, low) = (s.step, s.lim, s.low as u32);
     // SAFETY: per the function contract; candidates are only read when
     // their index is at least `s.low`.
@@ -313,19 +272,6 @@ unsafe fn search_rust<const MLS: u32, const ITERS: usize>(
                     idxs: u64::from(idxs0),
                 };
                 return EXIT_LIMIT;
-            }
-            if ITERS != 0 {
-                iters += 1;
-                if iters == ITERS {
-                    *c = Cursor {
-                        ip,
-                        ip1,
-                        hl: hl0,
-                        idxl: u64::from(idxl0),
-                        idxs: 0,
-                    };
-                    return EXIT_PAUSE;
-                }
             }
         }
     }
@@ -425,7 +371,6 @@ fn no_dict_generic<const MLS: u32>(
             hash_mls::<MLS>(p, h_bits_s)
         };
 
-        let use_asm = crate::cpu::Features::detect().bmi2;
         let mut s = Search {
             lim: 0,
             step: 1,
@@ -435,7 +380,6 @@ fn no_dict_generic<const MLS: u32>(
             hash_long,
             hash_small,
             low: u64::from(prefix_lowest_index),
-            rep_disp: 0,
             shift_s: u64::from(64 - h_bits_s),
             shift_l: u64::from(64 - h_bits_l),
             lowest,
@@ -444,6 +388,63 @@ fn no_dict_generic<const MLS: u32>(
 
         // Outer loop: one iteration per match found and stored.
         'outer: loop {
+            // The rest of the block in asm once the first repcode is valid
+            // (the asm has no `offset_1 == 0` case): the whole loop, match
+            // handling included, see `block_asm`.
+            #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+            if offset_1 != 0 && crate::cpu::Features::detect().bmi2 {
+                use super::seq_store::{LongLengthType, SeqDef, WILDCOPY_OVERLENGTH};
+                let lit_base = ss.lit_buf.as_mut_ptr();
+                let seq_base = ss.sequences.as_mut_ptr();
+                let mut ctx = super::block_asm::DfastCtx {
+                    prime_s: hash_prime::<MLS>(),
+                    prime_l: PRIME8BYTES,
+                    shift_s: u64::from(64 - h_bits_s),
+                    shift_l: u64::from(64 - h_bits_l),
+                    low: u64::from(prefix_lowest_index),
+                    rep_disp: 1usize.wrapping_sub(offset_1 as usize),
+                    step: 1,
+                    lim: 0,
+                    next_step: 0,
+                    anchor,
+                    iend,
+                    ilimit,
+                    prefix_lowest,
+                    lit_limit_w: (iend as usize).saturating_sub(WILDCOPY_OVERLENGTH),
+                    lit: lit_base.add(ss.lit_len),
+                    seq: seq_base.add(ss.nb_seq),
+                    off1: u64::from(offset_1),
+                    off2: u64::from(offset_2),
+                    llt: 0,
+                    llpos: core::ptr::null_mut(),
+                    curr_pos: core::ptr::null(),
+                };
+                // SAFETY: the invariants of this function at the top of
+                // the outer loop (see the docs), `ss.reserve(end - start)`
+                // above, and the CPU has BMI1/BMI2 (`Features::detect`).
+                super::block_asm::dfast_block(&mut ctx, ip, hash_long, hash_small, base);
+                anchor = ctx.anchor;
+                offset_1 = ctx.off1 as u32;
+                offset_2 = ctx.off2 as u32;
+                debug_assert!(istart <= anchor && anchor <= iend);
+                debug_assert!(offset_1 != 0 && (ctx.off1 >> 32) == 0 && (ctx.off2 >> 32) == 0);
+                debug_assert!(ctx.lit >= lit_base && ctx.seq >= seq_base);
+                ss.lit_len = ctx.lit as usize - lit_base as usize;
+                ss.nb_seq = (ctx.seq as usize - seq_base as usize) / size_of::<SeqDef>();
+                debug_assert!(ss.lit_len <= ss.max_nb_lit && ss.nb_seq <= ss.max_nb_seq);
+                if ctx.llt != 0 {
+                    debug_assert!(ss.long_length_type == LongLengthType::None);
+                    ss.long_length_type = if ctx.llt == 1 {
+                        LongLengthType::LiteralLength
+                    } else {
+                        LongLengthType::MatchLength
+                    };
+                    ss.long_length_pos =
+                        ((ctx.llpos as usize - seq_base as usize) / size_of::<SeqDef>()) as u32;
+                }
+                break 'outer;
+            }
+
             let mut step = 1usize;
             let mut next_step = ip.wrapping_add(K_STEP_INCR);
             let mut ip1 = ip.wrapping_add(step);
@@ -456,7 +457,6 @@ fn no_dict_generic<const MLS: u32>(
             // `ip1 < lim` neither fires.
             s.lim = (next_step as usize).min((ilimit as usize + 1).wrapping_sub(step));
             s.step = step;
-            s.rep_disp = 1usize.wrapping_sub(offset_1 as usize);
 
             let hl0 = hash_l(ip);
             let mut cur = Cursor {
@@ -476,7 +476,9 @@ fn no_dict_generic<const MLS: u32>(
             let found: Option<(u32, usize)>;
             let m_length: usize;
             loop {
-                let exit = search::<MLS>(&s, &mut cur, offset_1, use_asm);
+                // SAFETY: the invariants above (`ip1 <= ilimit`, `lim`, the
+                // window reads debug-checked).
+                let exit = search_rust::<MLS>(&s, &mut cur, offset_1);
                 if exit == EXIT_LIMIT {
                     ip1 = cur.ip;
                     if ip1 >= next_step {
