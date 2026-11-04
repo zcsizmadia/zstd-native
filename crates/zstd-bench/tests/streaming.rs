@@ -154,6 +154,90 @@ fn window_limit() {
     assert!(stream_decode(&mut dec, &c, &mut rng, 1 << 16, 1 << 16).unwrap() == data);
 }
 
+/// An empty frame (one empty last raw block) whose header gives window log
+/// `log`, with no content size (`fcs: false`) or a content size of 0 (so the
+/// streaming decoder needs no window buffer).
+fn empty_frame(log: u32, fcs: bool) -> Vec<u8> {
+    let mut f = 0xFD2F_B528u32.to_le_bytes().to_vec();
+    f.push(if fcs { 0x80 } else { 0 }); // not single segment
+    f.push(((log - 10) << 3) as u8);
+    if fcs {
+        f.extend_from_slice(&[0; 4]);
+    }
+    f.extend_from_slice(&[1, 0, 0]);
+    f
+}
+
+/// Streams `src` through `dec` in one call.
+fn stream_once(dec: &mut StreamDecoder, src: &[u8]) -> Result<bool, Error> {
+    let mut out = [0u8; 64];
+    let p = dec.decode(src, &mut out)?;
+    Ok(p.read == src.len() && p.written == 0 && p.at_frame_boundary)
+}
+
+#[test]
+fn window_log_max_by_pointer_width() {
+    // ZSTD_WINDOWLOG_MAX is 31, 30 on 32-bit targets: larger frame headers
+    // fail with frameParameter_windowTooLarge in every mode, one-shot too
+    let w31 = empty_frame(31, false);
+    let w31_fcs = empty_frame(31, true);
+    let w30_fcs = empty_frame(30, true);
+    let c_ok = |f: &[u8]| {
+        zstd::bulk::Decompressor::new()
+            .unwrap()
+            .decompress(f, 16)
+            .is_ok()
+    };
+    let io_decode = |f: &[u8], log: u32| {
+        let mut d = Decoder::new(f);
+        d.set_window_log_max(log);
+        let mut v = Vec::new();
+        d.read_to_end(&mut v).map(|_| v)
+    };
+    // window log 30: accepted everywhere (the streaming limit can be 30)
+    assert!(c_ok(&w30_fcs));
+    assert_eq!(zstd_native::decompress(&w30_fcs), Ok(Vec::new()));
+    let mut dec = StreamDecoder::new();
+    dec.set_window_log_max(31); // clamped to 30 on 32-bit targets
+    assert_eq!(stream_once(&mut dec, &w30_fcs), Ok(true));
+    assert!(io_decode(&w30_fcs, 31).unwrap().is_empty());
+    // the default streaming limit (27) rejects window log 31 everywhere
+    let mut dec = StreamDecoder::new();
+    assert_eq!(stream_once(&mut dec, &w31_fcs), Err(Error::WindowTooLarge));
+
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert!(c_ok(&w31));
+        let fh = zstd_native::FrameHeader::parse(&w31).unwrap();
+        assert_eq!(fh.window_size, 1 << 31);
+        assert_eq!(zstd_native::content_size(&w31), Ok(None));
+        assert_eq!(zstd_native::decompress(&w31), Ok(Vec::new()));
+        let mut dec = StreamDecoder::new();
+        dec.set_window_log_max(31);
+        assert_eq!(stream_once(&mut dec, &w31_fcs), Ok(true));
+        assert!(io_decode(&w31_fcs, 31).unwrap().is_empty());
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        assert!(!c_ok(&w31));
+        assert_eq!(
+            zstd_native::FrameHeader::parse(&w31),
+            Err(Error::WindowTooLarge)
+        );
+        assert_eq!(zstd_native::content_size(&w31), Err(Error::WindowTooLarge));
+        assert_eq!(zstd_native::decompress(&w31), Err(Error::WindowTooLarge));
+        assert_eq!(
+            zstd_native::decompress(&w31_fcs),
+            Err(Error::WindowTooLarge)
+        );
+        let mut dec = StreamDecoder::new();
+        dec.set_window_log_max(31);
+        assert_eq!(stream_once(&mut dec, &w31_fcs), Err(Error::WindowTooLarge));
+        let e = io_decode(&w31_fcs, 31).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+    }
+}
+
 #[test]
 fn dictionary_streaming() {
     let corpus = log_corpus(2 << 20);

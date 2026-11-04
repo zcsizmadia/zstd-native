@@ -96,7 +96,7 @@ pub(crate) const BLOCKSIZE_MAX: usize = 1 << 17;
 /// `ZSTD_TARGETLENGTH_MAX`.
 pub(crate) const TARGETLENGTH_MAX: u32 = BLOCKSIZE_MAX as u32;
 /// `ZSTD_WINDOWLOG_MAX` (30 on 32-bit targets, 31 on 64-bit).
-pub(crate) const WINDOWLOG_MAX: u32 = if usize::BITS == 32 { 30 } else { 31 };
+pub(crate) const WINDOWLOG_MAX: u32 = crate::frame::WINDOWLOG_MAX;
 /// `ZSTD_WINDOWLOG_ABSOLUTEMIN`.
 pub(crate) const WINDOWLOG_ABSOLUTEMIN: u32 = 10;
 /// `ZSTD_HASHLOG_MIN`.

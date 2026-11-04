@@ -5,7 +5,10 @@ use crate::error::{Error, Result};
 pub(crate) const MAGIC: u32 = 0xFD2F_B528;
 pub(crate) const SKIPPABLE_MAGIC_MASK: u32 = 0xFFFF_FFF0;
 pub(crate) const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
-pub(crate) const WINDOWLOG_MAX: u32 = 31;
+/// `ZSTD_WINDOWLOG_MAX`: the largest window log a frame header may give,
+/// 30 on 32-bit targets and 31 on 64-bit, as in libzstd (`zstd.h`); larger
+/// frames fail with [`Error::WindowTooLarge`] in every decoding mode.
+pub(crate) const WINDOWLOG_MAX: u32 = if usize::BITS == 32 { 30 } else { 31 };
 const WINDOWLOG_ABSOLUTEMIN: u32 = 10;
 /// Magic + frame header descriptor (libzstd's `ZSTD_startingInputLength`).
 pub(crate) const STARTING_INPUT_LENGTH: usize = 5;
