@@ -37,7 +37,9 @@ On this Windows machine, cargo is in `~/.cargo/bin` (not on PATH in Bash).
 - `unsafe` is denied by default and allowed only in hot paths, each block
   with a SAFETY comment and debug assertions: `bits.rs` (raw-pointer bit
   reader), `huf.rs` fast loops, `huf_asm.rs` (asm! port of libzstd's
-  Huffman loops), `block.rs` sequence execution and copies,
+  Huffman loops), `block.rs` sequence execution and copies, the encoder's
+  match finders and `enc/search_asm.rs` (asm! search loops of `fast` and
+  `dfast`),
   and the output writes in `decoder.rs`. New `unsafe` needs a benchmark
   showing the gain.
 - CPU-specific code goes behind run-time detection (`cpu.rs`), compiled

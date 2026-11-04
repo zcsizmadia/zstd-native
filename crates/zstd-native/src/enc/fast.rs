@@ -58,7 +58,7 @@ use super::params::{
 };
 use super::seq_store::{
     REPCODE1_TO_OFFBASE, SeqStore, count, count_2segments, hash4_ptr, hash5_ptr, hash6_ptr,
-    hash7_ptr, hash8_ptr, offset_to_offbase, read32,
+    hash7_ptr, hash8_ptr, offset_to_offbase, read_le64, read32,
 };
 
 /// `ZSTD_WINDOW_START_INDEX`: the index of a fresh window's first byte.
@@ -937,6 +937,288 @@ pub(crate) fn prefetch_l1(p: *const u8) {
     let _ = p;
 }
 
+/// Loop invariants of the noDict position search ([`fast_search`]), laid
+/// out for the asm loop (`search_asm::fast_search` reads it by field
+/// offset).
+#[repr(C)]
+pub(super) struct FastSearch {
+    /// Hash: `(read64(p) * prime) >> shift` (see [`hash_prime`]).
+    pub(super) prime: u64,
+    pub(super) step: usize,
+    /// Return once the new `ip2` is at or past `lim` ([`FAST_LIMIT`]).
+    pub(super) lim: usize,
+    pub(super) base: *const u8,
+    pub(super) ht: *mut u32,
+    /// `prefixStartIndex`.
+    pub(super) low: u64,
+    /// `-rep_offset1` (wrapping): the repcode candidate of `ip2` is at
+    /// `ip2 + rep_disp`.
+    pub(super) rep_disp: usize,
+    /// `64 - hashLog`.
+    pub(super) shift: u64,
+    /// Readable window `[lowest, iend)`, for debug assertions.
+    pub(super) lowest: *const u8,
+    pub(super) iend: *const u8,
+}
+
+/// Position search state of [`fast_search`]. At the top of the loop
+/// (in, and out at [`FAST_LIMIT`]): `ip1 = ip0 + 1`, `ip3 = ip2 + 1`,
+/// `hash0`/`hash1` the hashes of `ip0`/`ip1`, `match_idx` the table entry
+/// of `ip0`.
+#[repr(C)]
+pub(super) struct FastCursor {
+    pub(super) ip0: *const u8,
+    pub(super) ip2: *const u8,
+    pub(super) hash0: usize,
+    pub(super) hash1: usize,
+    pub(super) match_idx: u64,
+}
+
+/// [`fast_search`] found a repcode match at `ip2` (cursor as at the top of
+/// the loop, `ip0`'s entry written).
+pub(super) const FAST_REP: u32 = 0;
+/// A table match at `ip0` (cursor as at the top of the loop).
+pub(super) const FAST_MATCH0: u32 = 1;
+/// A table match at the second position: `ip0` is that position,
+/// `ip2` holds its `ip1` and `hash1` the hash of that `ip1`; `match_idx` the
+/// matching entry.
+pub(super) const FAST_MATCH1: u32 = 2;
+/// No match, and the new `ip2` is at or past `lim` (cursor at the top of
+/// the next iteration): the caller updates the step and limits.
+pub(super) const FAST_LIMIT: u32 = 3;
+/// [`fast_search_rust`] ran its `ITERS` iterations without a match or
+/// limit (cursor at the top of the next iteration).
+const FAST_PAUSE: u32 = 4;
+
+/// [`fast_search_rust`], or its `asm!` version on x86-64 with BMI2
+/// (`use_asm`; the asm loop has no `rep_offset1 == 0` case, `s.rep_disp` is
+/// then unused).
+///
+/// # Safety
+/// As [`fast_search_rust`].
+#[allow(unsafe_code)]
+#[inline(always)]
+unsafe fn fast_search<const MLS: u32, const USE_CMOV: bool>(
+    s: &FastSearch,
+    c: &mut FastCursor,
+    rep_offset1: u32,
+    use_asm: bool,
+) -> u32 {
+    #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+    if use_asm && rep_offset1 != 0 {
+        debug_assert!(s.rep_disp == 0usize.wrapping_sub(rep_offset1 as usize));
+        // The first iteration in Rust: matches are often found right away
+        // (text), where entering the asm costs more than it saves.
+        // SAFETY: per the caller.
+        let exit = unsafe { fast_search_rust::<MLS, USE_CMOV, 1>(s, c, rep_offset1) };
+        if exit != FAST_PAUSE {
+            return exit;
+        }
+        // SAFETY: per the caller; `use_asm` is only set with BMI2.
+        return unsafe { super::search_asm::fast_search(s, c) };
+    }
+    let _ = use_asm;
+    // SAFETY: per the caller.
+    unsafe { fast_search_rust::<MLS, USE_CMOV, 0>(s, c, rep_offset1) }
+}
+
+/// `(read64(p) * prime) >> shift`: [`hash_mls`] with `prime =
+/// hash_prime::<MLS>()` and `shift = 64 - hBits`.
+///
+/// # Safety
+/// `p..p + 8` must be readable.
+#[allow(unsafe_code)]
+#[inline(always)]
+pub(crate) unsafe fn hash_with(p: *const u8, prime: u64, shift: u64) -> usize {
+    debug_assert!(shift < 64);
+    // SAFETY: per the caller.
+    (unsafe { read_le64(p) }.wrapping_mul(prime) >> shift) as usize
+}
+
+/// `ZSTD_hashPtr(p, hBits, mls)` is `(read64(p) * prime) >> (64 - hBits)`
+/// with this prime (libzstd's, pre-shifted by `64 - 8 * mls`).
+#[inline(always)]
+pub(crate) const fn hash_prime<const MLS: u32>() -> u64 {
+    use super::seq_store::{PRIME4BYTES, PRIME5BYTES, PRIME6BYTES, PRIME7BYTES, PRIME8BYTES};
+    match MLS {
+        5 => PRIME5BYTES << 24,
+        6 => PRIME6BYTES << 16,
+        7 => PRIME7BYTES << 8,
+        8 => PRIME8BYTES,
+        _ => (PRIME4BYTES as u64) << 32,
+    }
+}
+
+/// The inner loop of `ZSTD_compressBlock_fast_noDict_generic` (two
+/// positions per iteration, see the libzstd source): writes each searched
+/// position to the table and returns at the first repcode or table match,
+/// or once the new `ip2` reaches `lim`.
+///
+/// # Safety
+/// The invariants of `no_dict_generic`: at entry `ip3 = ip2 + 1 <
+/// ilimit`, and `lim <= ilimit - 1` (so every iteration's `ip3` stays below
+/// `ilimit`); the index of `ip0` is at least `s.low`; `ip2 - rep_offset1`
+/// is readable; the table has `1 << hlog` entries.
+#[allow(unsafe_code)]
+#[inline(always)]
+unsafe fn fast_search_rust<const MLS: u32, const USE_CMOV: bool, const ITERS: usize>(
+    s: &FastSearch,
+    c: &mut FastCursor,
+    rep_offset1: u32,
+) -> u32 {
+    static DUMMY: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
+    let chk = |p: *const u8, n: usize| {
+        debug_assert!(
+            (p as usize) >= (s.lowest as usize) && (p as usize) + n <= (s.iend as usize),
+            "read out of the window"
+        );
+    };
+    let base = s.base;
+    let low = s.low as u32;
+    let ht = s.ht;
+    let idx = |p: *const u8| (p as usize).wrapping_sub(base as usize) as u32;
+    // SAFETY: per the function contract; table candidates are read only
+    // when their index is at least `s.low`.
+    unsafe {
+        let hash = |p: *const u8| {
+            chk(p, HASH_READ_SIZE);
+            hash_with(p, hash_prime::<MLS>(), s.shift)
+        };
+        let match_found = |cur: *const u8, match_idx: u32| -> bool {
+            if USE_CMOV {
+                // ZSTD_match4Found_cmov
+                let valid = match_idx >= low;
+                // A branchless select, as libzstd forces with inline asm
+                // (`ZSTD_selectAddr`): the condition is unpredictable.
+                let mval_addr = core::hint::select_unpredictable(
+                    valid,
+                    base.wrapping_add(match_idx as usize),
+                    DUMMY.as_ptr(),
+                );
+                if valid {
+                    chk(mval_addr, 4);
+                }
+                if read32(cur) != read32(mval_addr) {
+                    return false;
+                }
+                valid
+            } else {
+                // ZSTD_match4Found_branch
+                let mval = if match_idx >= low {
+                    let m = base.wrapping_add(match_idx as usize);
+                    chk(m, 4);
+                    read32(m)
+                } else {
+                    read32(cur) ^ 1
+                };
+                read32(cur) == mval
+            }
+        };
+
+        let FastCursor {
+            mut ip0,
+            mut ip2,
+            mut hash0,
+            mut hash1,
+            match_idx,
+        } = *c;
+        let mut match_idx = match_idx as u32;
+        let mut iters = 0usize;
+        let (step, lim) = (s.step, s.lim);
+        loop {
+            // load repcode match for ip[2]
+            let rep_ptr = ip2.wrapping_sub(rep_offset1 as usize);
+            chk(rep_ptr, 4);
+            let rval = read32(rep_ptr);
+
+            // write back hash table entry
+            *ht.add(hash0) = idx(ip0);
+
+            // check repcode at ip[2]
+            if (read32(ip2) == rval) & (rep_offset1 > 0) {
+                *c = FastCursor {
+                    ip0,
+                    ip2,
+                    hash0,
+                    hash1,
+                    match_idx: u64::from(match_idx),
+                };
+                return FAST_REP;
+            }
+
+            if match_found(ip0, match_idx) {
+                *c = FastCursor {
+                    ip0,
+                    ip2,
+                    hash0,
+                    hash1,
+                    match_idx: u64::from(match_idx),
+                };
+                return FAST_MATCH0;
+            }
+
+            // lookup ip[1]
+            match_idx = *ht.add(hash1);
+
+            // hash ip[2]
+            hash0 = hash1;
+            hash1 = hash(ip2);
+
+            // advance to next positions: ip0 = ip1, ip1 = ip2, ip2 = ip3
+            ip0 = ip0.wrapping_add(1);
+
+            // write back hash table entry
+            *ht.add(hash0) = idx(ip0);
+
+            if match_found(ip0, match_idx) {
+                *c = FastCursor {
+                    ip0,
+                    ip2,
+                    hash0,
+                    hash1,
+                    match_idx: u64::from(match_idx),
+                };
+                return FAST_MATCH1;
+            }
+
+            // lookup ip[1]
+            match_idx = *ht.add(hash1);
+
+            // hash ip[2] (= ip3 = ip2 + 1)
+            hash0 = hash1;
+            hash1 = hash(ip2.wrapping_add(1));
+
+            // advance to next positions
+            ip0 = ip2;
+            ip2 = ip0.wrapping_add(step);
+
+            if ip2 as usize >= lim {
+                *c = FastCursor {
+                    ip0,
+                    ip2,
+                    hash0,
+                    hash1,
+                    match_idx: u64::from(match_idx),
+                };
+                return FAST_LIMIT;
+            }
+            if ITERS != 0 {
+                iters += 1;
+                if iters == ITERS {
+                    *c = FastCursor {
+                        ip0,
+                        ip2,
+                        hash0,
+                        hash1,
+                        match_idx: u64::from(match_idx),
+                    };
+                    return FAST_PAUSE;
+                }
+            }
+        }
+    }
+}
+
 /// `ZSTD_compressBlock_fast_noDict_generic()`; see the libzstd source for
 /// the pipelining scheme (hash, table lookup, match read and compare
 /// interleaved over positions ip0..ip3).
@@ -958,7 +1240,6 @@ fn no_dict_generic<const MLS: u32, const USE_CMOV: bool>(
     start: usize,
     end: usize,
 ) -> usize {
-    static DUMMY: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
     const K_STEP_INCR: usize = 1 << (K_SEARCH_STRENGTH - 1);
 
     let cparams = ms.cparams;
@@ -1025,51 +1306,44 @@ fn no_dict_generic<const MLS: u32, const USE_CMOV: bool>(
             chk(p, HASH_READ_SIZE);
             hash_mls::<MLS>(p, hlog)
         };
-        let match_found = |cur: *const u8, match_idx: u32| -> bool {
-            if USE_CMOV {
-                // ZSTD_match4Found_cmov
-                let valid = match_idx >= prefix_start_index;
-                // A branchless select, as libzstd forces with inline asm
-                // (`ZSTD_selectAddr`): the condition is unpredictable.
-                let mval_addr = core::hint::select_unpredictable(
-                    valid,
-                    base.wrapping_add(match_idx as usize),
-                    DUMMY.as_ptr(),
-                );
-                if valid {
-                    chk(mval_addr, 4);
-                }
-                if read32(cur) != read32(mval_addr) {
-                    return false;
-                }
-                valid
-            } else {
-                // ZSTD_match4Found_branch
-                let mval = if match_idx >= prefix_start_index {
-                    let m = base.wrapping_add(match_idx as usize);
-                    chk(m, 4);
-                    read32(m)
-                } else {
-                    read32(cur) ^ 1
-                };
-                read32(cur) == mval
-            }
+        let use_asm = crate::cpu::Features::detect().bmi2;
+        let mut s = FastSearch {
+            prime: hash_prime::<MLS>(),
+            step: step_size,
+            lim: 0,
+            base,
+            ht,
+            low: u64::from(prefix_start_index),
+            rep_disp: 0,
+            shift: u64::from(64 - hlog),
+            lowest,
+            iend,
         };
 
         'start: loop {
             let mut step = step_size;
             let mut next_step = ip0.wrapping_add(K_STEP_INCR);
-            let mut ip1 = ip0.wrapping_add(1);
-            let mut ip2 = ip0.wrapping_add(step);
-            let mut ip3 = ip2.wrapping_add(1);
+            let ip1 = ip0.wrapping_add(1);
+            let ip2 = ip0.wrapping_add(step);
+            let ip3 = ip2.wrapping_add(1);
 
             if ip3 >= ilimit {
                 break 'start;
             }
+            // One limit for the two end-of-iteration tests (`ip2 >=
+            // nextStep`, and `ip3 >= ilimit`).
+            s.lim = (next_step as usize).min(ilimit as usize - 1);
+            s.step = step;
+            s.rep_disp = 0usize.wrapping_sub(rep_offset1 as usize);
 
-            let mut hash0 = hash(ip0);
-            let mut hash1 = hash(ip1);
-            let mut match_idx = *ht.add(hash0);
+            let hash0 = hash(ip0);
+            let mut cur = FastCursor {
+                ip0,
+                ip2,
+                hash0,
+                hash1: hash(ip1),
+                match_idx: u64::from(*ht.add(hash0)),
+            };
 
             let current0: u32;
             let mut match0: *const u8;
@@ -1077,18 +1351,28 @@ fn no_dict_generic<const MLS: u32, const USE_CMOV: bool>(
             let offcode: u32;
 
             loop {
-                // load repcode match for ip[2]
-                let rep_ptr = ip2.wrapping_sub(rep_offset1 as usize);
-                chk(rep_ptr, 4);
-                let rval = read32(rep_ptr);
-
-                // write back hash table entry
-                let c0 = idx(ip0);
-                *ht.add(hash0) = c0;
-
-                // check repcode at ip[2]
-                if (read32(ip2) == rval) & (rep_offset1 > 0) {
-                    ip0 = ip2;
+                let exit = fast_search::<MLS, USE_CMOV>(&s, &mut cur, rep_offset1, use_asm);
+                if exit == FAST_LIMIT {
+                    // calculate step
+                    let ip2 = cur.ip2;
+                    if ip2 >= next_step {
+                        step += 1;
+                        prefetch_l1(cur.ip0.wrapping_add(1 + 64));
+                        prefetch_l1(cur.ip0.wrapping_add(1 + 128));
+                        next_step = next_step.wrapping_add(K_STEP_INCR);
+                    }
+                    if ip2.wrapping_add(1) >= ilimit {
+                        break 'start;
+                    }
+                    s.lim = (next_step as usize).min(ilimit as usize - 1);
+                    s.step = step;
+                    continue;
+                }
+                ip0 = cur.ip0;
+                current0 = idx(ip0);
+                if exit == FAST_REP {
+                    let ip1 = ip0.wrapping_add(1);
+                    ip0 = cur.ip2;
                     match0 = ip0.wrapping_sub(rep_offset1 as usize);
                     chk(match0.wrapping_sub(1), 1);
                     m_length = (*ip0.sub(1) == *match0.sub(1)) as usize;
@@ -1099,86 +1383,29 @@ fn no_dict_generic<const MLS: u32, const USE_CMOV: bool>(
                     // Write next hash table entry: it's already calculated.
                     // This write is known to be safe because ip1 is before
                     // the repcode (ip2).
-                    *ht.add(hash1) = idx(ip1);
-                    current0 = c0;
-                    break;
-                }
-
-                if match_found(ip0, match_idx) {
-                    // Write next hash table entry (it's already calculated).
-                    *ht.add(hash1) = idx(ip1);
-                    current0 = c0;
-                    (match0, m_length, offcode) = offset_match(
-                        base,
-                        match_idx,
-                        &mut ip0,
-                        anchor,
-                        prefix_start,
-                        &mut rep_offset1,
-                        &mut rep_offset2,
-                    );
-                    break;
-                }
-
-                // lookup ip[1]
-                match_idx = *ht.add(hash1);
-
-                // hash ip[2]
-                hash0 = hash1;
-                hash1 = hash(ip2);
-
-                // advance to next positions
-                ip0 = ip1;
-                ip1 = ip2;
-                ip2 = ip3;
-
-                // write back hash table entry
-                let c0 = idx(ip0);
-                *ht.add(hash0) = c0;
-
-                if match_found(ip0, match_idx) {
-                    // Write next hash table entry, since it's already
-                    // calculated, unless search resumes at or before it.
-                    if step <= 4 {
-                        *ht.add(hash1) = idx(ip1);
+                    *ht.add(cur.hash1) = idx(ip1);
+                } else {
+                    if exit == FAST_MATCH0 {
+                        // Write next hash table entry (it's already
+                        // calculated).
+                        *ht.add(cur.hash1) = idx(ip0.wrapping_add(1));
+                    } else if step <= 4 {
+                        // FAST_MATCH1: write next hash table entry, since
+                        // it's already calculated, unless search resumes at
+                        // or before it.
+                        *ht.add(cur.hash1) = idx(cur.ip2);
                     }
-                    current0 = c0;
                     (match0, m_length, offcode) = offset_match(
                         base,
-                        match_idx,
+                        cur.match_idx as u32,
                         &mut ip0,
                         anchor,
                         prefix_start,
                         &mut rep_offset1,
                         &mut rep_offset2,
                     );
-                    break;
                 }
-
-                // lookup ip[1]
-                match_idx = *ht.add(hash1);
-
-                // hash ip[2]
-                hash0 = hash1;
-                hash1 = hash(ip2);
-
-                // advance to next positions
-                ip0 = ip1;
-                ip1 = ip2;
-                ip2 = ip0.wrapping_add(step);
-                ip3 = ip1.wrapping_add(step);
-
-                // calculate step
-                if ip2 >= next_step {
-                    step += 1;
-                    prefetch_l1(ip1.wrapping_add(64));
-                    prefetch_l1(ip1.wrapping_add(128));
-                    next_step = next_step.wrapping_add(K_STEP_INCR);
-                }
-
-                if ip3 >= ilimit {
-                    break 'start;
-                }
+                break;
             }
 
             // _match: count the forward length.
