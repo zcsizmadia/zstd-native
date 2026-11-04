@@ -1,6 +1,10 @@
 //! Compress one dataset in a loop (MiB/s of input), zstd-native vs libzstd.
 //!
 //! `cargo run --profile bench -p zstd-bench --example profile_encode -- <dataset> <level> <native|c|native-stream|c-stream> <seconds> [chunk]`
+//!
+//! `ZSTD_BENCH_WORKERS=n` compresses with n worker threads (one-shot modes),
+//! and `ZSTD_BENCH_REPEAT=k` repeats the dataset k times (multithreading
+//! needs inputs of several jobs).
 
 use std::time::Instant;
 
@@ -15,6 +19,9 @@ fn main() {
         .find(|(n, _)| n == ds)
         .expect("dataset")
         .1;
+    let repeat: usize = std::env::var("ZSTD_BENCH_REPEAT").map_or(1, |s| s.parse().unwrap());
+    data = data.repeat(repeat);
+    let workers: u32 = std::env::var("ZSTD_BENCH_WORKERS").map_or(0, |s| s.parse().unwrap());
     // Optional chunk size: compress many independent frames of that size.
     let chunk: usize = args.get(5).map_or(0, |s| s.parse().unwrap());
     if chunk > 0 {
@@ -22,6 +29,12 @@ fn main() {
     }
     let mut out = vec![0u8; zstd_native::compress_bound(data.len()) + 64];
     let mut c = zstd::bulk::Compressor::new(level).unwrap();
+    let mut nc = zstd_native::Compressor::new(level);
+    if workers > 0 {
+        c.set_parameter(zstd::zstd_safe::CParameter::NbWorkers(workers))
+            .unwrap();
+        nc.set_workers(workers);
+    }
     let mut n = 0u64;
     let mut size = 0;
     let t = Instant::now();
@@ -34,7 +47,7 @@ fn main() {
         };
         for p in pieces {
             size += match lib {
-                "native" => zstd_native::compress_to_slice(p, &mut out, level).unwrap(),
+                "native" => nc.compress_to_slice(p, &mut out).unwrap(),
                 // Streaming: 128 KB writes into an `io::Write` encoder.
                 "native-stream" => {
                     use std::io::Write;
