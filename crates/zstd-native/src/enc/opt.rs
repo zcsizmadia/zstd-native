@@ -196,6 +196,15 @@ pub(crate) struct OptStats {
     match_length_sum_base_price: u32,
     off_code_sum_base_price: u32,
     price_type: PriceType,
+    /// The dynamic price of each literal length code and match length code
+    /// (`LL_bits * MULTIPLIER + sumBasePrice - WEIGHT(freq)`, the parts of
+    /// `ZSTD_litLengthPrice` and `ZSTD_getMatchPrice` that only depend on
+    /// the code), tabulated whenever the base prices change
+    /// ([`OptStats::set_base_prices`]): the parser prices every match length
+    /// of every candidate, and this takes the `highbit` and the weight out
+    /// of that loop. Only read with `price_type == Dynamic`.
+    ll_code_price: [u32; MAX_LL as usize + 1],
+    ml_code_price: [u32; MAX_ML as usize + 1],
 }
 
 /// libzstd's `optState_t` (the literal compression mode is always "on":
@@ -237,6 +246,8 @@ impl OptState {
                 match_length_sum_base_price: 0,
                 off_code_sum_base_price: 0,
                 price_type: PriceType::Dynamic,
+                ll_code_price: [0; MAX_LL as usize + 1],
+                ml_code_price: [0; MAX_ML as usize + 1],
             },
             price_table: vec![Optimal::default(); OPT_SIZE],
             match_table: vec![Match::default(); OPT_SIZE],
@@ -311,6 +322,18 @@ impl OptStats {
         self.lit_length_sum_base_price = weight::<OPT_LEVEL>(self.lit_length_sum);
         self.match_length_sum_base_price = weight::<OPT_LEVEL>(self.match_length_sum);
         self.off_code_sum_base_price = weight::<OPT_LEVEL>(self.off_code_sum);
+        // the per-code prices (the same wrapping sums as libzstd's)
+        for (code, p) in self.ll_code_price.iter_mut().enumerate() {
+            *p = (u32::from(LL_BITS[code]) * BITCOST_MULTIPLIER)
+                .wrapping_add(self.lit_length_sum_base_price)
+                .wrapping_sub(weight::<OPT_LEVEL>(self.lit_length_freq[code]));
+        }
+        for (code, p) in self.ml_code_price.iter_mut().enumerate() {
+            *p = (u32::from(ML_BITS[code]) * BITCOST_MULTIPLIER).wrapping_add(
+                self.match_length_sum_base_price
+                    .wrapping_sub(weight::<OPT_LEVEL>(self.match_length_freq[code])),
+            );
+        }
     }
 
     /// `ZSTD_rescaleFreqs()`: on the first block of a frame
@@ -401,10 +424,7 @@ impl OptStats {
             return BITCOST_MULTIPLIER as i32 + self.ll_price::<OPT_LEVEL>(lit_length - 1);
         }
         // dynamic statistics
-        let code = ll_code(lit_length) as usize;
-        (u32::from(LL_BITS[code]) * BITCOST_MULTIPLIER)
-            .wrapping_add(self.lit_length_sum_base_price)
-            .wrapping_sub(weight::<OPT_LEVEL>(self.lit_length_freq[code])) as i32
+        self.ll_code_price[ll_code(lit_length) as usize] as i32
     }
 
     /// `LL_INCPRICE`: the price change of one more literal.
@@ -439,13 +459,7 @@ impl OptStats {
         }
 
         // match length
-        let ml_code = ml_code(ml_base) as usize;
-        price = price.wrapping_add(
-            (u32::from(ML_BITS[ml_code]) * BITCOST_MULTIPLIER).wrapping_add(
-                self.match_length_sum_base_price
-                    .wrapping_sub(weight::<OPT_LEVEL>(self.match_length_freq[ml_code])),
-            ),
-        );
+        price = price.wrapping_add(self.ml_code_price[ml_code(ml_base) as usize]);
 
         // heuristic: make matches a bit more costly to favor fewer
         // sequences (faster decompression)
