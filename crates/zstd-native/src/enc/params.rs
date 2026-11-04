@@ -293,6 +293,20 @@ pub(crate) fn row_match_finder_used(strategy: Strategy, mode: ParamSwitch) -> bo
     row_match_finder_supported(strategy) && mode == ParamSwitch::Enable
 }
 
+/// `ZSTD_resolveBlockSplitterMode()` with the default (`ZSTD_ps_auto`):
+/// the post-block splitter (`ZSTD_compressBlock_splitBlock`) is used for
+/// `btopt` and above with `windowLog >= 17`.
+pub(crate) fn block_splitter_enabled(cparams: &CParams) -> bool {
+    cparams.strategy >= Strategy::BtOpt && cparams.window_log >= 17
+}
+
+/// `ZSTD_resolveEnableLdm()` with the default (`ZSTD_ps_auto`): long
+/// distance matching is enabled for `btopt` and above with
+/// `windowLog >= 27`.
+pub(crate) fn ldm_enabled(cparams: &CParams) -> bool {
+    cparams.strategy >= Strategy::BtOpt && cparams.window_log >= 27
+}
+
 /// `ZSTD_resolveRowMatchFinderMode()`.
 pub(crate) fn resolve_row_match_finder_mode(mode: ParamSwitch, cparams: &CParams) -> ParamSwitch {
     if mode != ParamSwitch::Auto {

@@ -1,37 +1,46 @@
 //! The encoder must produce exactly libzstd's bytes (`ZSTD_compress`) for
 //! the same input and level.
 
+use zstd::zstd_safe::{CParameter, ParamSwitch};
 use zstd_bench::{Rng, c_compress, datasets, source_corpus};
 
 const LEVELS: &[i32] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, -1, -3, -7,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, -1, -3, -7,
 ];
 
-/// The highest level whose strategy is ported (`btlazy2` or below) for an
-/// input of `n` bytes (libzstd's clevels.h: the table depends on the size).
-fn max_supported_level(n: usize) -> i32 {
-    if n <= 16 << 10 {
-        10
-    } else if n <= 256 << 10 {
-        12
+/// From this level up (btultra and btultra2 with deep searches), the large
+/// inputs are cut to [`SLOW_INPUT_MAX`] bytes to keep the test time
+/// reasonable: still several blocks, over 256 KB (the largest parameter
+/// table).
+const SLOW_LEVEL: i32 = 17;
+const SLOW_INPUT_MAX: usize = 600_000;
+
+/// libzstd enables long distance matching, which is not ported, for
+/// `btopt` and above with `windowLog >= 27`: level 22 on inputs over
+/// 64 MiB (its window log 27 is cut to the input size below that).
+fn ldm_enabled(n: usize, level: i32) -> bool {
+    level >= 22 && n > 1 << 26
+}
+
+/// `data`, cut to [`SLOW_INPUT_MAX`] bytes for the slow levels.
+fn for_level(data: &[u8], level: i32) -> &[u8] {
+    if level >= SLOW_LEVEL {
+        &data[..data.len().min(SLOW_INPUT_MAX)]
     } else {
-        15
+        data
     }
 }
 
 fn check(name: &str, data: &[u8], level: i32) {
     let got = match zstd_native::compress(data, level) {
         Ok(v) => v,
-        // btopt and above are not ported yet (issue #9).
-        Err(zstd_native::Error::UnsupportedFrameParameter)
-            if level > max_supported_level(data.len()) =>
-        {
+        Err(zstd_native::Error::UnsupportedFrameParameter) if ldm_enabled(data.len(), level) => {
             return;
         }
         Err(e) => panic!("{name} L{level}: {e}"),
     };
     assert!(
-        level <= max_supported_level(data.len()),
+        !ldm_enabled(data.len(), level),
         "{name} L{level}: expected UnsupportedFrameParameter"
     );
     let want = c_compress(data, level);
@@ -58,7 +67,7 @@ fn check(name: &str, data: &[u8], level: i32) {
 fn datasets_identical() {
     for (name, data) in datasets() {
         for &level in LEVELS {
-            check(&name, &data, level);
+            check(&name, for_level(&data, level), level);
         }
     }
 }
@@ -139,12 +148,84 @@ fn special_inputs_identical() {
     let mut mixed = source_corpus()[..200_000].to_vec();
     mixed.extend(vec![7u8; 300_000]);
     mixed.extend_from_slice(&source_corpus()[300_000..500_000]);
-    cases.push(("mixed rle".into(), mixed));
+    cases.push(("mixed rle".into(), mixed.clone()));
+    // The same, short enough for the slow levels to see all of it.
+    let mut short_mixed = source_corpus()[..150_000].to_vec();
+    short_mixed.extend(vec![7u8; 200_000]);
+    short_mixed.extend_from_slice(&source_corpus()[300_000..450_000]);
+    cases.push(("short mixed rle".into(), short_mixed));
+    // Incompressible stretches between text (raw partitions of split
+    // blocks, repcodes across them).
+    let mut r = Rng::new(21);
+    let mut patchy = Vec::new();
+    for i in 0..8 {
+        let at = 100_000 * i;
+        patchy.extend_from_slice(&source_corpus()[at..at + 40_000]);
+        patchy.extend((0..10_000 + 3_000 * i).map(|_| r.below(256) as u8));
+    }
+    cases.push(("patchy".into(), patchy));
     for (name, data) in cases {
         for &level in LEVELS {
-            check(&name, &data, level);
+            check(&name, for_level(&data, level), level);
         }
     }
+}
+
+/// libzstd with its post-block splitter (`ZSTD_c_splitAfterSequences`)
+/// disabled.
+fn c_compress_unsplit(data: &[u8], level: i32) -> Vec<u8> {
+    let mut c = zstd::bulk::Compressor::new(level).unwrap();
+    c.set_parameter(CParameter::UseBlockSplitter(ParamSwitch::Disable))
+        .unwrap();
+    c.compress(data).unwrap()
+}
+
+/// The post-block splitter (btopt and above, `windowLog >= 17`): inputs
+/// where libzstd's output depends on it, i.e. where blocks really get
+/// split.
+#[test]
+fn block_splitter_identical() {
+    let src = source_corpus();
+    let numeric = datasets().swap_remove(2).1;
+    let inputs: [(&str, &[u8]); 6] = [
+        ("source 100K", &src[..100_000]),
+        ("source 131072", &src[50_000..181_072]),
+        ("source 200K", &src[400_000..600_000]),
+        ("source 700K", &src[900_000..1_600_000]),
+        ("numeric 300K", &numeric[..300_000]),
+        // windowLog 16: no splitter
+        ("source 60K", &src[..60_000]),
+    ];
+    let mut splits = 0;
+    for (name, data) in inputs {
+        for level in [13, 15, 16, 17, 18, 19, 20, 21, 22] {
+            check(name, data, level);
+            if c_compress(data, level) != c_compress_unsplit(data, level) {
+                splits += 1;
+            }
+        }
+    }
+    // Most of these frames have blocks split in partitions.
+    assert!(splits >= 30, "only {splits} frames with split blocks");
+}
+
+/// Long distance matching (not ported) is reported, not ignored.
+#[test]
+fn ldm_unsupported() {
+    let big = vec![0u8; (64 << 20) + 1];
+    assert_eq!(
+        zstd_native::compress(&big, 22),
+        Err(zstd_native::Error::UnsupportedFrameParameter)
+    );
+    assert_eq!(
+        zstd_native::Compressor::new(22).compress(&big),
+        Err(zstd_native::Error::UnsupportedFrameParameter)
+    );
+    let mut dst = vec![0u8; 100];
+    assert_eq!(
+        zstd_native::compress_to_slice(&big, &mut dst, 22),
+        Err(zstd_native::Error::UnsupportedFrameParameter)
+    );
 }
 
 #[test]
@@ -153,26 +234,29 @@ fn small_destination_buffers() {
     let mut r = Rng::new(8);
     for n in [0usize, 10, 1000, 50_000, 300_000] {
         let data = &src[..n];
-        let full = zstd_native::compress(data, 1).unwrap();
-        for _ in 0..40 {
-            let cap = r.below(full.len() as u64) as usize;
-            let mut buf = vec![0u8; cap];
-            assert_eq!(
-                zstd_native::compress_to_slice(data, &mut buf, 1),
-                Err(zstd_native::Error::OutputTooSmall),
-                "n {n} cap {cap}"
-            );
+        for level in [1, 19] {
+            let full = zstd_native::compress(data, level).unwrap();
+            for _ in 0..20 {
+                let cap = r.below(full.len() as u64) as usize;
+                let mut buf = vec![0u8; cap];
+                assert_eq!(
+                    zstd_native::compress_to_slice(data, &mut buf, level),
+                    Err(zstd_native::Error::OutputTooSmall),
+                    "n {n} cap {cap} L{level}"
+                );
+            }
+            let mut buf = vec![0u8; zstd_native::compress_bound(n)];
+            let k = zstd_native::compress_to_slice(data, &mut buf, level).unwrap();
+            assert_eq!(&buf[..k], &full[..]);
         }
-        let mut buf = vec![0u8; zstd_native::compress_bound(n)];
-        let k = zstd_native::compress_to_slice(data, &mut buf, 1).unwrap();
-        assert_eq!(&buf[..k], &full[..]);
     }
 }
 
 /// One reused `zstd_native::Compressor` against one reused libzstd context
 /// (`ZSTD_compress2` on the same `ZSTD_CCtx`): the row match finder's hash
 /// salt changes from frame to frame (`ZSTD_advanceHashSalt`, mixing in the
-/// hashes searched so far), and its tag table is not cleared.
+/// hashes searched so far), and its tag table is not cleared; the optimal
+/// parser's statistics restart with each frame.
 #[test]
 fn reused_context_identical() {
     let src = source_corpus();
@@ -209,34 +293,28 @@ fn reused_context_identical() {
             );
         }
     };
-    for level in [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15] {
+    for level in 4..=22 {
         let mut native = zstd_native::Compressor::new(level);
         let mut c = zstd::bulk::Compressor::new(level).unwrap();
         for (i, data) in inputs.iter().enumerate() {
-            if level > max_supported_level(data.len()) {
-                continue; // btopt: the libzstd context still compresses it
-            }
+            let data = for_level(data, level);
             let got = native.compress(data).unwrap();
             let want = c.compress(data).unwrap();
             compare(&format!("L{level}"), i, data.len(), got, want);
         }
     }
     // Switching levels on the same contexts, including frames that don't
-    // use the row match finder (and frames libzstd compresses with btopt,
-    // which leave the salt alone too).
+    // use the row match finder (which leave the salt alone).
     let mut native = zstd_native::Compressor::new(1);
     let mut c = zstd::bulk::Compressor::new(1).unwrap();
     let mut k = 0;
     for round in 0..3 {
-        for &level in &[6, 3, 12, 5, 16, 7, 1, 9, 13, 8] {
-            let data = inputs[(k * 7 + round) % inputs.len()];
+        for &level in &[6, 3, 12, 5, 16, 7, 19, 1, 9, 22, 13, 8, 17] {
+            let data = for_level(inputs[(k * 7 + round) % inputs.len()], level);
             k += 1;
             native.set_level(level);
             c.set_compression_level(level).unwrap();
             let want = c.compress(data).unwrap();
-            if level > max_supported_level(data.len()) {
-                continue;
-            }
             let got = native.compress(data).unwrap();
             compare(&format!("switching, L{level}"), k, data.len(), got, want);
         }

@@ -19,7 +19,11 @@
 //! - `lazy`: compress/zstd_lazy.c (greedy, lazy, lazy2, btlazy2: parser,
 //!   hash chain and binary tree)
 //! - `row`: compress/zstd_lazy.c (the row-based match finder)
+//! - `opt`: compress/zstd_opt.c (btopt, btultra, btultra2: price model,
+//!   binary tree match finder, optimal parser)
 //! - `presplit`: compress/zstd_preSplit.c
+//! - `split`: the post-block splitter from compress/zstd_compress.c
+//!   (`ZSTD_compressBlock_splitBlock`)
 #![allow(dead_code)] // filled in step by step (issue #6)
 
 pub(crate) mod bitwriter;
@@ -31,11 +35,13 @@ pub(crate) mod hist;
 pub(crate) mod huf_enc;
 pub(crate) mod lazy;
 pub(crate) mod literals;
+pub(crate) mod opt;
 pub(crate) mod params;
 pub(crate) mod presplit;
 pub(crate) mod row;
 pub(crate) mod seq_store;
 pub(crate) mod sequences;
+pub(crate) mod split;
 
 pub use compress::compress_bound;
 
@@ -43,9 +49,10 @@ pub use compress::compress_bound;
 /// faster; 0 means the default, 3), like libzstd's `ZSTD_compress`: the
 /// output is byte-identical to libzstd 1.5.7's.
 ///
-/// Work in progress (issue #6): the strategies up to `btlazy2` are
-/// implemented (levels up to 15 for inputs over 256 KB, 12 for 16-256 KB,
-/// 10 up to 16 KB); higher levels (`btopt` and above) return
+/// Every level and strategy is implemented, `fast` to `btultra2`, with
+/// libzstd's block splitters. Long distance matching is not: libzstd
+/// enables it by itself at level 22 for inputs over 64 MiB, where this
+/// returns
 /// [`Error::UnsupportedFrameParameter`](crate::Error::UnsupportedFrameParameter).
 ///
 /// ```
@@ -58,7 +65,8 @@ pub use compress::compress_bound;
 /// # Errors
 ///
 /// [`Error::UnsupportedFrameParameter`](crate::Error::UnsupportedFrameParameter)
-/// for levels not implemented yet.
+/// when libzstd would use long distance matching (level 22, inputs over
+/// 64 MiB), which is not implemented yet.
 pub fn compress(src: &[u8], level: i32) -> crate::error::Result<alloc::vec::Vec<u8>> {
     check_level(level, src.len())?;
     with_cached(|fc| compress::compress_with(fc, src, level, true))
@@ -153,9 +161,13 @@ impl Compressor {
     }
 }
 
+/// Rejects the parameters that would make libzstd enable a feature this
+/// port doesn't have: long distance matching, which libzstd turns on by
+/// itself (`ZSTD_resolveEnableLdm`) for `btopt` and above with a window
+/// of at least 128 MiB (level 22 on inputs over 64 MiB).
 fn check_level(level: i32, src_size: usize) -> crate::error::Result<()> {
     let cp = params::one_shot_cparams(level, src_size as u64);
-    if cp.strategy > params::Strategy::BtLazy2 {
+    if params::ldm_enabled(&cp) {
         return Err(crate::error::Error::UnsupportedFrameParameter);
     }
     Ok(())

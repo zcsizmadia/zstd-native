@@ -116,8 +116,13 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
    negative; `enc/`, issue #6) and dfast (levels 3-4, #7), 0.90-0.96x
    libzstd's speed; the lazy family (greedy, lazy, lazy2 with the hash
    chain and row-based match finders, btlazy2: levels 4/5 to 15, #8), on
-   par with libzstd in first measurements. Next: speed (#17), optimal
-   parsing (#9), streaming/dictionaries/multithreading (#10).
+   par with libzstd in first measurements; the optimal parser (btopt,
+   btultra, btultra2: levels 16-22, down to 11 for small inputs, with
+   btultra2's two-pass first block, `enc/opt.rs`) and the post-block
+   splitter (`enc/split.rs`, #9), 0.9-1.05x libzstd's speed in first
+   measurements. Long distance matching (auto-enabled by libzstd at
+   level 22 above 64 MiB) is reported as `UnsupportedFrameParameter`.
+   Next: speed (#17), streaming/dictionaries/multithreading (#10), LDM.
 4. Multithreaded compression, dictionaries for the encoder, long distance
    matching.
 5. Fuzzing (cargo-fuzz, differential vs libzstd), Miri, CI matrix

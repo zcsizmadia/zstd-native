@@ -54,6 +54,8 @@ pub(crate) const CURRENT_MAX: u32 = if usize::BITS == 64 {
 } else {
     2000 << 20
 };
+/// `ZSTD_HASHLOG3_MAX`: the largest `hashLog3`.
+pub(crate) const HASHLOG3_MAX: u32 = 17;
 /// `ZSTD_CHUNKSIZE_MAX`.
 pub(crate) const CHUNKSIZE_MAX: u32 = u32::MAX - CURRENT_MAX;
 /// `MIN_CBLOCK_SIZE + ZSTD_blockHeaderSize + 1 + 1`: `ZSTD_buildSeqStore`
@@ -312,7 +314,7 @@ pub(crate) enum TableLoadMethod {
     Full,
 }
 
-/// `ZSTD_MatchState_t` without the dictionary and optimal-parser parts.
+/// `ZSTD_MatchState_t` without the dictionary parts.
 #[derive(Debug)]
 pub(crate) struct MatchState {
     /// `window`
@@ -351,6 +353,14 @@ pub(crate) struct MatchState {
     pub(crate) hash_salt_entropy: u32,
     /// `lazySkipping`
     pub(crate) lazy_skipping: bool,
+    /// `hashLog3`: `min(ZSTD_HASHLOG3_MAX, windowLog)` for the optimal
+    /// parser with `minMatch == 3`, else 0 (no table).
+    pub(crate) hash_log3: u32,
+    /// `hashTable3`: the optimal parser's 3-byte hash table.
+    pub(crate) hash_table3: Vec<u32>,
+    /// `opt`: the optimal parser's state (btopt and above), allocated on
+    /// first use and kept (like libzstd's workspace).
+    pub(crate) opt: Option<alloc::boxed::Box<super::opt::OptState>>,
 }
 
 impl MatchState {
@@ -372,6 +382,9 @@ impl MatchState {
             hash_salt: 0,
             hash_salt_entropy: 0,
             lazy_skipping: false,
+            hash_log3: 0,
+            hash_table3: Vec::new(),
+            opt: None,
         };
         ms.reset(cparams);
         ms
@@ -411,6 +424,21 @@ impl MatchState {
             debug_assert!(cparams.hash_log >= row_log);
             self.row_hash_log = cparams.hash_log - row_log;
         }
+        // The optimal parser's tables (hashTable3 only with minMatch 3).
+        self.hash_log3 = if cparams.min_match == 3 {
+            HASHLOG3_MAX.min(cparams.window_log)
+        } else {
+            0
+        };
+        let h3_size = if self.hash_log3 > 0 {
+            1usize << self.hash_log3
+        } else {
+            0
+        };
+        clear_table(&mut self.hash_table3, h3_size);
+        if cparams.strategy >= Strategy::BtOpt && self.opt.is_none() {
+            self.opt = Some(alloc::boxed::Box::new(super::opt::OptState::new()));
+        }
         self.cparams = cparams;
         self.force_non_contiguous = false;
     }
@@ -432,6 +460,10 @@ impl MatchState {
         self.window.clear();
         self.next_to_update = self.window.dict_limit;
         self.loaded_dict_end = 0;
+        // force reset of btopt stats
+        if let Some(opt) = self.opt.as_deref_mut() {
+            opt.stats.lit_length_sum = 0;
+        }
     }
 
     /// The window-update step of `ZSTD_compressContinue_internal`: appends
@@ -492,6 +524,7 @@ impl MatchState {
             } else {
                 reduce_table(&mut self.chain_table, correction);
             }
+            reduce_table(&mut self.hash_table3, correction);
             self.next_to_update = self.next_to_update.saturating_sub(correction);
             self.loaded_dict_end = 0;
         }
@@ -589,7 +622,7 @@ pub(crate) fn build_seq_store(
             super::lazy::compress_block_lazy(ms, ss, rep, buf, start, end)
         }
         Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
-            unimplemented!("strategy {:?} (issue #9)", ms.cparams.strategy)
+            super::opt::compress_block_opt(ms, ss, rep, buf, start, end)
         }
     };
     ss.store_last_literals(&buf[end - last_ll_size..end]);

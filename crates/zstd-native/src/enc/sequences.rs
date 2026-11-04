@@ -70,7 +70,7 @@ const K_INVERSE_PROBABILITY_LOG256: [u32; 256] = [
 ];
 
 /// libzstd's error values compare as huge sizes in the cost comparisons.
-const COST_ERROR: usize = usize::MAX;
+pub(crate) const COST_ERROR: usize = usize::MAX;
 
 /// libzstd's `ZSTD_useLowProbCount`.
 fn use_low_prob_count(nb_seq: usize) -> bool {
@@ -111,7 +111,7 @@ fn entropy_cost(count: &[u32], max: u32, total: usize) -> usize {
 }
 
 /// libzstd's `ZSTD_fseBitCost`.
-fn fse_bit_cost<const N: usize, const S: usize>(
+pub(crate) fn fse_bit_cost<const N: usize, const S: usize>(
     ct: &FseCTable<N, S>,
     count: &[u32],
     max: u32,
@@ -138,7 +138,12 @@ fn fse_bit_cost<const N: usize, const S: usize>(
 }
 
 /// libzstd's `ZSTD_crossEntropyCost`.
-fn cross_entropy_cost(norm: &[i16], accuracy_log: u32, count: &[u32], max: u32) -> usize {
+pub(crate) fn cross_entropy_cost(
+    norm: &[i16],
+    accuracy_log: u32,
+    count: &[u32],
+    max: u32,
+) -> usize {
     let shift = 8 - accuracy_log;
     let mut cost = 0usize;
     for s in 0..=max as usize {

@@ -495,6 +495,8 @@ pub(crate) unsafe fn count_2segments(
     }
 }
 
+/// `prime3bytes`.
+pub(crate) const PRIME3BYTES: u32 = 506832829;
 /// `prime4bytes`.
 pub(crate) const PRIME4BYTES: u32 = 2654435761;
 /// `prime5bytes`.
@@ -505,6 +507,12 @@ pub(crate) const PRIME6BYTES: u64 = 227718039650203;
 pub(crate) const PRIME7BYTES: u64 = 58295818150454627;
 /// `prime8bytes`.
 pub(crate) const PRIME8BYTES: u64 = 0xCF1BBCDCB7A56463;
+
+/// `ZSTD_hash3()` (salt 0).
+#[inline(always)]
+pub(crate) const fn hash3(u: u32, h: u32) -> usize {
+    ((u << (32 - 24)).wrapping_mul(PRIME3BYTES) >> (32 - h)) as usize
+}
 
 /// `ZSTD_hash4()` (salt 0).
 #[inline(always)]
@@ -534,6 +542,17 @@ pub(crate) const fn hash7(u: u64, h: u32) -> usize {
 #[inline(always)]
 pub(crate) const fn hash8(u: u64, h: u32) -> usize {
     (u.wrapping_mul(PRIME8BYTES) >> (64 - h)) as usize
+}
+
+/// `ZSTD_hash3Ptr()`.
+///
+/// # Safety
+/// `p..p + 4` must be readable.
+#[allow(unsafe_code)]
+#[inline(always)]
+pub(crate) unsafe fn hash3_ptr(p: *const u8, h: u32) -> usize {
+    // SAFETY: per the caller.
+    hash3(unsafe { read_le32(p) }, h)
 }
 
 /// `ZSTD_hash4Ptr()`.
