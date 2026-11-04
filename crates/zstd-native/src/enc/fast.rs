@@ -801,6 +801,51 @@ pub(crate) fn build_seq_store(
     true
 }
 
+/// A block compressor (`ZSTD_BlockCompressor_f`): finds the sequences of
+/// `buf[start..end]`, updates the repcodes, returns the number of trailing
+/// literals.
+pub(crate) type BlockCompressor =
+    fn(&mut MatchState, &mut SeqStore, &mut [u32; 3], &[u8], usize, usize) -> usize;
+
+/// `ZSTD_selectBlockCompressor()` with `ZSTD_matchState_dictMode()`: the
+/// block compressor [`build_seq_store`] runs (for LDM, which runs it on
+/// the literals between long matches).
+pub(crate) fn select_block_compressor(ms: &MatchState) -> BlockCompressor {
+    use super::{dfast, lazy, opt};
+    if ms.window.has_ext_dict() {
+        match ms.cparams.strategy {
+            Strategy::Fast => compress_block_fast_ext_dict,
+            Strategy::DFast => dfast::compress_block_double_fast_ext_dict,
+            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2 => {
+                lazy::compress_block_lazy_ext_dict
+            }
+            Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
+                opt::compress_block_opt_ext_dict
+            }
+        }
+    } else if ms.dms {
+        match ms.cparams.strategy {
+            Strategy::Fast => compress_block_fast_dict_match_state,
+            Strategy::DFast => dfast::compress_block_double_fast_dict_match_state,
+            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2 => {
+                lazy::compress_block_lazy_dict_match_state
+            }
+            Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
+                opt::compress_block_opt_dict_match_state
+            }
+        }
+    } else {
+        match ms.cparams.strategy {
+            Strategy::Fast => compress_block_fast,
+            Strategy::DFast => dfast::compress_block_double_fast,
+            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2 => {
+                lazy::compress_block_lazy
+            }
+            Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => opt::compress_block_opt,
+        }
+    }
+}
+
 /// `ZSTD_compressBlock_fast()`: finds the sequences of the block
 /// `buf[start..end]` (no dictionary). The window must have been updated
 /// to cover the block ([`MatchState::update_window`]), and every index from

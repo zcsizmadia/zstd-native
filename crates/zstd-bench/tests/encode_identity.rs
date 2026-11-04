@@ -15,13 +15,6 @@ const LEVELS: &[i32] = &[
 const SLOW_LEVEL: i32 = 17;
 const SLOW_INPUT_MAX: usize = 600_000;
 
-/// libzstd enables long distance matching, which is not ported, for
-/// `btopt` and above with `windowLog >= 27`: level 22 on inputs over
-/// 64 MiB (its window log 27 is cut to the input size below that).
-fn ldm_enabled(n: usize, level: i32) -> bool {
-    level >= 22 && n > 1 << 26
-}
-
 /// `data`, cut to [`SLOW_INPUT_MAX`] bytes for the slow levels.
 fn for_level(data: &[u8], level: i32) -> &[u8] {
     if level >= SLOW_LEVEL {
@@ -32,17 +25,7 @@ fn for_level(data: &[u8], level: i32) -> &[u8] {
 }
 
 fn check(name: &str, data: &[u8], level: i32) {
-    let got = match zstd_native::compress(data, level) {
-        Ok(v) => v,
-        Err(zstd_native::Error::UnsupportedFrameParameter) if ldm_enabled(data.len(), level) => {
-            return;
-        }
-        Err(e) => panic!("{name} L{level}: {e}"),
-    };
-    assert!(
-        !ldm_enabled(data.len(), level),
-        "{name} L{level}: expected UnsupportedFrameParameter"
-    );
+    let got = zstd_native::compress(data, level).unwrap_or_else(|e| panic!("{name} L{level}: {e}"));
     let want = c_compress(data, level);
     if got != want {
         let first = got
@@ -209,23 +192,26 @@ fn block_splitter_identical() {
     assert!(splits >= 30, "only {splits} frames with split blocks");
 }
 
-/// Long distance matching (not ported) is reported, not ignored.
+/// Level 22 on more than 64 MiB: libzstd enables long distance matching
+/// by itself (see `ldm_encode.rs` for more). All zeros and a short period:
+/// repetitions the long distance matcher skips over.
 #[test]
-fn ldm_unsupported() {
-    let big = vec![0u8; (64 << 20) + 1];
+fn ldm_level22() {
+    let mut big = vec![0u8; (64 << 20) + 1];
+    for (i, b) in big[40 << 20..].iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let want = c_compress(&big, 22);
+    assert!(zstd_native::compress(&big, 22).unwrap() == want);
+    assert!(zstd_native::Compressor::new(22).compress(&big).unwrap() == want);
+    let mut dst = vec![0u8; zstd_native::compress_bound(big.len())];
+    let n = zstd_native::compress_to_slice(&big, &mut dst, 22).unwrap();
+    assert!(dst[..n] == want[..]);
     assert_eq!(
-        zstd_native::compress(&big, 22),
-        Err(zstd_native::Error::UnsupportedFrameParameter)
+        zstd_native::compress_to_slice(&big, &mut dst[..100], 22),
+        Err(zstd_native::Error::OutputTooSmall)
     );
-    assert_eq!(
-        zstd_native::Compressor::new(22).compress(&big),
-        Err(zstd_native::Error::UnsupportedFrameParameter)
-    );
-    let mut dst = vec![0u8; 100];
-    assert_eq!(
-        zstd_native::compress_to_slice(&big, &mut dst, 22),
-        Err(zstd_native::Error::UnsupportedFrameParameter)
-    );
+    assert!(zstd_native::decompress(&want).unwrap() == big);
 }
 
 #[test]

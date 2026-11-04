@@ -36,6 +36,11 @@
 //!   `ZSTD_loadDictionaryContent`, `ZSTD_resetCCtx_usingCDict`): loading,
 //!   CDicts with tagged tables, attaching or copying them, the parameters
 //!   with a dictionary
+//! - `ldm`: long distance matching, compress/zstd_ldm.c (gear rolling
+//!   hash, long match generation, `ZSTD_ldm_blockCompress`), which libzstd
+//!   enables by itself for `btopt` and above with a 128 MiB window; the
+//!   optimal parser takes its matches as candidates (`ZSTD_optLdm_*` in
+//!   `opt`)
 #![allow(dead_code)] // filled in step by step (issue #6)
 
 pub(crate) mod bitwriter;
@@ -47,6 +52,7 @@ pub(crate) mod fse_enc;
 pub(crate) mod hist;
 pub(crate) mod huf_enc;
 pub(crate) mod lazy;
+pub(crate) mod ldm;
 pub(crate) mod literals;
 pub(crate) mod opt;
 pub(crate) mod params;
@@ -66,10 +72,9 @@ pub use stream::{CompressProgress, EndOp, StreamEncoder};
 /// output is byte-identical to libzstd 1.5.7's.
 ///
 /// Every level and strategy is implemented, `fast` to `btultra2`, with
-/// libzstd's block splitters. Long distance matching is not: libzstd
-/// enables it by itself at level 22 for inputs over 64 MiB, where this
-/// returns
-/// [`Error::UnsupportedFrameParameter`](crate::Error::UnsupportedFrameParameter).
+/// libzstd's block splitters and its long distance matcher, which it
+/// enables by itself at level 22 for inputs over 64 MiB (a 128 MiB window;
+/// memory use is then libzstd's too, about 700 MiB of tables).
 ///
 /// ```
 /// let data = b"hello hello hello hello hello hello";
@@ -80,11 +85,9 @@ pub use stream::{CompressProgress, EndOp, StreamEncoder};
 ///
 /// # Errors
 ///
-/// [`Error::UnsupportedFrameParameter`](crate::Error::UnsupportedFrameParameter)
-/// when libzstd would use long distance matching (level 22, inputs over
-/// 64 MiB), which is not implemented yet.
+/// None in practice: the output buffer is [`compress_bound`] bytes, always
+/// enough.
 pub fn compress(src: &[u8], level: i32) -> crate::error::Result<alloc::vec::Vec<u8>> {
-    check_level(level, src.len())?;
     with_cached(|fc| compress::compress_with(fc, src, level, true))
 }
 
@@ -96,7 +99,6 @@ pub fn compress(src: &[u8], level: i32) -> crate::error::Result<alloc::vec::Vec<
 /// [`Error::OutputTooSmall`](crate::Error::OutputTooSmall) if `dst` is too
 /// small, or as [`compress`].
 pub fn compress_to_slice(src: &[u8], dst: &mut [u8], level: i32) -> crate::error::Result<usize> {
-    check_level(level, src.len())?;
     with_cached(|fc| compress::compress_to_slice_with(fc, src, dst, level, true))
 }
 
@@ -274,7 +276,6 @@ impl Compressor {
                 false,
             );
         }
-        check_level(self.level, src.len())?;
         compress::compress_with(&mut self.inner, src, self.level, false)
     }
 
@@ -294,19 +295,6 @@ impl Compressor {
                 false,
             );
         }
-        check_level(self.level, src.len())?;
         compress::compress_to_slice_with(&mut self.inner, src, dst, self.level, false)
     }
-}
-
-/// Rejects the parameters that would make libzstd enable a feature this
-/// port doesn't have: long distance matching, which libzstd turns on by
-/// itself (`ZSTD_resolveEnableLdm`) for `btopt` and above with a window
-/// of at least 128 MiB (level 22 on inputs over 64 MiB).
-fn check_level(level: i32, src_size: usize) -> crate::error::Result<()> {
-    let cp = params::one_shot_cparams(level, src_size as u64);
-    if params::ldm_enabled(&cp) {
-        return Err(crate::error::Error::UnsupportedFrameParameter);
-    }
-    Ok(())
 }

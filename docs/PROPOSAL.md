@@ -122,9 +122,7 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
    btultra, btultra2: levels 16-22, down to 11 for small inputs, with
    btultra2's two-pass first block, `enc/opt.rs`) and the post-block
    splitter (`enc/split.rs`, #9), 0.9-1.05x libzstd's speed in first
-   measurements. Long distance matching (auto-enabled by libzstd at
-   level 22 above 64 MiB or for unknown sizes) is reported as
-   `UnsupportedFrameParameter`. Streaming compression (#10, `enc/stream.rs`,
+   measurements. Streaming compression (#10, `enc/stream.rs`,
    `io.rs`): a port of `ZSTD_compressStream2` in buffered mode (input
    ring buffer of window + block, libzstd's end-of-input shortcut, flush
    and end), with the extDict variants of every match finder for the
@@ -144,8 +142,17 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
    dictionaries, one-shot, reused and streaming; on par with libzstd's
    speed in first measurements. Not ported: dedicated dictionary search
    (off by default), prefix dictionaries.
-   Next: speed (#17), multithreading, LDM.
-4. Multithreaded compression, long distance matching.
+   Long distance matching (#24, `enc/ldm.rs`): a port of `zstd_ldm.c`
+   (gear rolling hash, XXH64-bucketed table, `ZSTD_ldm_generateSequences`
+   with its window, `ZSTD_ldm_blockCompress`) and of the optimal parser's
+   LDM candidates (`ZSTD_optLdm_*`), as libzstd enables it by itself
+   (`btopt` and above with `windowLog >= 27`: level 22 above 64 MiB or
+   for unknown sizes), with raw-content dictionaries loaded into its
+   table; byte-identical with libzstd, also forced on at every level
+   (a hidden test hook). Not ported: the public LDM parameters
+   (`ZSTD_c_enableLongDistanceMatching`, `ZSTD_c_ldm*`).
+   Next: speed (#17), multithreading.
+4. Multithreaded compression.
 5. Fuzzing (cargo-fuzz, differential vs libzstd), Miri, CI matrix
    (x86-64/AArch64, Linux/Windows/macOS, 32-bit), AArch64 tuning.
 

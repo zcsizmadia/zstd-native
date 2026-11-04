@@ -46,7 +46,12 @@
 //! Not ported: dedicated dictionary search (`ZSTD_c_enableDedicatedDictSearch`,
 //! off by default), the `ZSTD_c_forceAttachDict` and `ZSTD_c_dictIDFlag`
 //! parameters (their defaults are what this does), prefix dictionaries
-//! (`ZSTD_CCtx_refPrefix`) and LDM tables.
+//! (`ZSTD_CCtx_refPrefix`).
+//!
+//! With long distance matching, a raw-content dictionary loaded into the
+//! context's tables is also loaded into the LDM table (see the `ldm`
+//! module); a zstd-format one, or one attached or copied from a CDict, is
+//! not (as in libzstd).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -199,6 +204,13 @@ impl CDict {
         }
     }
 
+    /// A raw-content dictionary of at least 8 bytes (loaded with
+    /// `ZSTD_loadDictionaryContent` directly, which also loads it into the
+    /// LDM table).
+    pub(crate) fn is_raw_content(&self) -> bool {
+        self.load_start == Some(0)
+    }
+
     /// `cdict->matchState.window` holds content (`cdictLen != 0` in
     /// `ZSTD_resetCCtx_byAttachingCDict`): whether attaching makes sense.
     pub(crate) fn has_window_content(&self) -> bool {
@@ -231,12 +243,15 @@ pub(crate) fn use_cdict_tables(cd: &CDict, pledged_src_size: u64) -> bool {
 /// `level` with the dictionary `cd` (`ZSTD_CCtx_init_compressStream2`:
 /// `ZSTD_getCParamMode`, then `ZSTD_getCParamsFromCCtxParams` with the
 /// dictionary's size and `window_log` as `ZSTD_c_windowLog`, 0 for the
-/// level's).
+/// level's). With `force_ldm` (`ZSTD_c_enableLongDistanceMatching` set),
+/// the window log defaults to `ZSTD_LDM_DEFAULT_WINDOW_LOG` instead of the
+/// level's.
 pub(crate) fn frame_cparams(
     level: i32,
     cd: Option<&CDict>,
     pledged: Option<u64>,
     window_log: u32,
+    force_ldm: bool,
 ) -> CParams {
     let size = pledged.unwrap_or(CONTENTSIZE_UNKNOWN);
     let dict_size = cd.map_or(0, |c| c.content.len() as u64);
@@ -245,6 +260,9 @@ pub(crate) fn frame_cparams(
         _ => CParamMode::NoAttachDict,
     };
     let mut cp = get_cparams_internal(level, size, dict_size, mode);
+    if force_ldm {
+        cp.window_log = super::ldm::LDM_DEFAULT_WINDOW_LOG;
+    }
     if window_log != 0 {
         cp.window_log = window_log; // ZSTD_overrideCParams
     }
@@ -363,7 +381,8 @@ fn indices_are_tagged(cp: &CParams) -> bool {
     matches!(cp.strategy, Strategy::Fast | Strategy::DFast)
 }
 
-/// `ZSTD_loadDictionaryContent()` (no LDM, no `forceWindow`, no
+/// `ZSTD_loadDictionaryContent()` (without its LDM part,
+/// `LdmState::load_dictionary`; no `forceWindow`, no
 /// `deterministicRefPrefix`): makes `buf[start..end]` the first segment of
 /// `ms`'s (fresh) window and fills its tables with it, for a CDict
 /// (`for_cdict`: tagged `fast`/`dfast` tables) or a context.
@@ -709,9 +728,9 @@ mod tests {
             for n in [5_000usize, 20_000, 60_000, src.len()] {
                 let data = &src[..n];
                 let pledged = Some(n as u64);
-                let cp = frame_cparams(cd.level, Some(&cd), pledged, 0);
+                let cp = frame_cparams(cd.level, Some(&cd), pledged, 0, false);
                 let mut slot = None;
-                let fc = FrameCompressor::start_frame(&mut slot, cp, Some(&cd), pledged);
+                let fc = FrameCompressor::start_frame(&mut slot, cp, Some(&cd), pledged, false);
                 let attached = fc.ms.dms;
                 let copied_or_loaded = fc.ms.window.base_in_dict;
                 assert_eq!(attached, should_attach(&cd, n as u64), "L{level} n={n}");

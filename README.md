@@ -19,9 +19,10 @@ Dictionaries work too, zstd-format (as made by `zstd --train`) and raw
 content, loaded into a compressor (`ZSTD_CCtx_loadDictionary`) or
 prepared once (`EncoderDictionary`, libzstd's `ZSTD_CDict`), byte-identical
 with libzstd's attached, copied or reloaded dictionary tables at every
-level, one-shot and streaming. Not yet: long distance matching, which
-libzstd turns on by itself only at level 22 for inputs over 64 MiB or of
-unknown size (`UnsupportedFrameParameter`), and multithreading.
+level, one-shot and streaming. So is long distance matching, which
+libzstd turns on by itself at level 22 for inputs over 64 MiB or of
+unknown size (and with a 128 MiB window from level 16). Not yet:
+multithreading.
 
 ```rust
 let compressed = zstd_native::compress(&data, 1)?; // same bytes as libzstd

@@ -22,7 +22,6 @@ use super::compress::{
     BLOCK_HEADER_SIZE, FrameCompressor, LONGNBSEQ, RLE_MAX_LENGTH, SeqChunk, SeqStats,
     build_sequences_statistics, entropy_compress_seq_store, is_rle,
 };
-use super::fast::build_seq_store;
 use super::fse_enc::FseCTable;
 use super::hist::{hist_count, hist_count_fast};
 use super::huf_enc::{
@@ -543,7 +542,7 @@ impl FrameCompressor {
         last: u32,
     ) -> Result<usize> {
         let mut next_rep = self.rep;
-        if !build_seq_store(&mut self.ms, &mut self.ss, &mut next_rep, src, start, end) {
+        if !self.build_block_seq_store(&mut next_rep, src, start, end)? {
             if self.prev.fse.of_repeat == FseRepeat::Valid {
                 self.prev.fse.of_repeat = FseRepeat::Check;
             }
