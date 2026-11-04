@@ -364,6 +364,8 @@ fn no_dict_generic<const MLS: u32>(
     let window_start = ms.window.pos(ms.window.dict_limit);
     assert!(window_start <= start, "window start is not in the buffer");
     assert!(end.wrapping_sub(ms.window.base) <= u32::MAX as usize);
+    // Room for the sequences stored with `store_seq_unchecked`.
+    ss.reserve(end - start);
 
     let bp = buf.as_ptr();
     let base = bp.wrapping_add(ms.window.base);
@@ -500,7 +502,7 @@ fn no_dict_generic<const MLS: u32>(
                     let r = ip.add(1 + 4).sub(offset_1 as usize);
                     let m = count(ip.add(1 + 4), r, iend) + 4;
                     ip = ip.add(1);
-                    ss.store_seq(
+                    ss.store_seq_unchecked(
                         buf,
                         anchor as usize - bp as usize,
                         ip as usize - anchor as usize,
@@ -575,7 +577,7 @@ fn no_dict_generic<const MLS: u32>(
                     *hash_long.add(hl1) = idx(ip1);
                 }
 
-                ss.store_seq(
+                ss.store_seq_unchecked(
                     buf,
                     anchor as usize - bp as usize,
                     ip as usize - anchor as usize,
@@ -610,7 +612,7 @@ fn no_dict_generic<const MLS: u32>(
                     core::mem::swap(&mut offset_1, &mut offset_2);
                     *hash_small.add(hash_s(ip)) = idx(ip);
                     *hash_long.add(hash_l(ip)) = idx(ip);
-                    ss.store_seq(
+                    ss.store_seq_unchecked(
                         buf,
                         anchor as usize - bp as usize,
                         0,

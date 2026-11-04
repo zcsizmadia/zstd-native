@@ -1252,6 +1252,8 @@ fn no_dict_generic<const MLS: u32, const USE_CMOV: bool>(
     let window_start = ms.window.pos(ms.window.dict_limit);
     assert!(window_start <= start, "window start is not in the buffer");
     assert!(end.wrapping_sub(ms.window.base) <= u32::MAX as usize);
+    // Room for the sequences stored with `store_seq_unchecked`.
+    ss.reserve(end - start);
 
     let step_size = cparams.target_length as usize + (cparams.target_length == 0) as usize + 1;
     let bp = buf.as_ptr();
@@ -1412,7 +1414,7 @@ fn no_dict_generic<const MLS: u32, const USE_CMOV: bool>(
             chk(match0, 0);
             m_length += count(ip0.add(m_length), match0.add(m_length), iend);
 
-            ss.store_seq(
+            ss.store_seq_unchecked(
                 buf,
                 anchor as usize - bp as usize,
                 ip0 as usize - anchor as usize,
@@ -1444,7 +1446,7 @@ fn no_dict_generic<const MLS: u32, const USE_CMOV: bool>(
                         core::mem::swap(&mut rep_offset1, &mut rep_offset2);
                         *ht.add(hash(ip0)) = idx(ip0);
                         ip0 = ip0.add(r_length);
-                        ss.store_seq(
+                        ss.store_seq_unchecked(
                             buf,
                             anchor as usize - bp as usize,
                             0,
