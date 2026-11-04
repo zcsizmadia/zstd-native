@@ -7,10 +7,11 @@ use alloc::vec::Vec;
 
 use super::fast::{MatchState, build_seq_store};
 use super::hist::hist_count_fast;
+use super::huf_enc::HufRepeat;
 use super::literals::{HufCTables, compress_literals, min_gain};
 use super::params::{CParams, Strategy, block_size_max, one_shot_cparams};
 use super::presplit::{FpStats, optimal_block_size};
-use super::seq_store::{REP_START_VALUE, SeqDef, SeqStore, seq_to_codes};
+use super::seq_store::{REP_START_VALUE, SeqDef, SeqStore, max_nb_seq, seq_to_codes};
 use super::sequences::{
     FseCTables, FseRepeat, SET_COMPRESSED, SeqFields, build_ctable, encode_sequences,
     select_encoding_type,
@@ -308,6 +309,30 @@ impl FrameCompressor {
         }
     }
 
+    /// Prepares for a new frame of `src_size` bytes at `level`, reusing the
+    /// buffers (libzstd's `ZSTD_resetCCtx_internal` with a clean match state
+    /// and `ZSTD_reset_compressedBlockState`).
+    pub(crate) fn reset(&mut self, level: i32, src_size: usize) {
+        let cp = one_shot_cparams(level, src_size as u64);
+        let bsm = block_size_max(&cp, src_size as u64);
+        self.cp = cp;
+        self.ms.reset(cp);
+        if self.ss.max_nb_lit < bsm || self.ss.max_nb_seq < max_nb_seq(bsm, cp.min_match) {
+            self.ss = SeqStore::new(bsm, cp.min_match);
+        } else {
+            self.ss.reset();
+        }
+        // Table contents don't matter while the repeat modes say none.
+        for e in [&mut self.prev, &mut self.next] {
+            e.huf.repeat = HufRepeat::None;
+            e.fse.ll_repeat = FseRepeat::None;
+            e.fse.of_repeat = FseRepeat::None;
+            e.fse.ml_repeat = FseRepeat::None;
+        }
+        self.rep = REP_START_VALUE;
+        self.first_block = true;
+    }
+
     /// libzstd's `ZSTD_compressBlock_internal`: 0 = store raw, 1 = RLE
     /// (`dst[0]` holds the byte), else a compressed block's size.
     fn compress_block(
@@ -440,15 +465,31 @@ fn write_frame_header(dst: &mut [u8], cp: &CParams, src_size: u64) -> Result<usi
     Ok(pos)
 }
 
-/// Compresses `src` at `level` (like `ZSTD_compress`) into `dst`.
-pub(crate) fn compress_to_slice_impl(src: &[u8], dst: &mut [u8], level: i32) -> Result<usize> {
-    FrameCompressor::new(level, src.len()).compress(dst, src)
+/// Compresses `src` at `level` into `dst` with `fc` (or a fresh compressor).
+pub(crate) fn compress_to_slice_with(
+    fc: &mut Option<Box<FrameCompressor>>,
+    src: &[u8],
+    dst: &mut [u8],
+    level: i32,
+) -> Result<usize> {
+    let fc = match fc {
+        Some(f) => {
+            f.reset(level, src.len());
+            f
+        }
+        None => fc.insert(Box::new(FrameCompressor::new(level, src.len()))),
+    };
+    fc.compress(dst, src)
 }
 
-/// Compresses `src` at `level` into a new vector.
-pub(crate) fn compress_impl(src: &[u8], level: i32) -> Result<Vec<u8>> {
-    let mut out = alloc::vec![0u8; compress_bound(src.len()) + 18];
-    let n = compress_to_slice_impl(src, &mut out, level)?;
+/// As [`compress_to_slice_with`], into a new vector.
+pub(crate) fn compress_with(
+    fc: &mut Option<Box<FrameCompressor>>,
+    src: &[u8],
+    level: i32,
+) -> Result<Vec<u8>> {
+    let mut out = alloc::vec![0u8; compress_bound(src.len())];
+    let n = compress_to_slice_with(fc, src, &mut out, level)?;
     out.truncate(n);
     Ok(out)
 }
