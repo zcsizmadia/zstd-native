@@ -17,7 +17,22 @@ fn main() {
         .find(|(n, _)| n == ds)
         .expect("dataset")
         .1;
-    let comp = zstd_bench::c_compress(&data, level);
+    // `ZSTD_BENCH_COMP_CACHE=dir` keeps the compressed input on disk, so
+    // repeated A/B runs at high levels don't recompress every time.
+    let comp = match std::env::var("ZSTD_BENCH_COMP_CACHE") {
+        Ok(dir) => {
+            let path = std::path::Path::new(&dir).join(format!("{ds}.L{level}.zst"));
+            match std::fs::read(&path) {
+                Ok(c) => c,
+                Err(_) => {
+                    let c = zstd_bench::c_compress(&data, level);
+                    std::fs::write(&path, &c).expect("write cache");
+                    c
+                }
+            }
+        }
+        Err(_) => zstd_bench::c_compress(&data, level),
+    };
     let mut out = vec![0u8; data.len() + 64];
     let mut n = 0u64;
     let t = Instant::now();

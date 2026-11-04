@@ -621,6 +621,7 @@ fn fast_loop_body(
                         << (ctz & 7);
                 }};
             }
+            align_hot_loop!(0);
             loop {
                 sym!(b0, op0, 0);
                 sym!(b1, op1, 0);
@@ -766,6 +767,7 @@ fn fast_loop_x2_body(
                         << (ctz & 7);
                 }};
             }
+            align_hot_loop!(0);
             for _ in 0..iters {
                 sym!(b0, op0);
                 sym!(b1, op1);

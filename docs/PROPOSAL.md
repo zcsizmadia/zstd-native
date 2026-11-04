@@ -73,6 +73,26 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
   bits (+1-3% on logs and numeric data, -3% on text: the extra branch
   mispredicts), reading offset and match length bits together (-9%: the
   loop's register allocation is fragile; measure every change).
+  Then to 1.05-1.09x (Silesia geometric means, EPYC): a fast loop with
+  the sentinel bit reader of the Huffman loops (`bits::FastBits`: the
+  container kept left-aligned with a 1 bit below the valid bits, so a
+  read is one shift and a reload needs no bounds check, two registers
+  instead of four), run while 16 bytes remain before the stream start
+  (at most two 8-byte reloads per sequence); the checked reader finishes
+  the block. Rejected: decoding literals into the output buffer after the
+  block's room (libzstd's `ZSTD_in_dst`, one write stream instead of
+  two): neutral once code alignment was held constant.
+- **Code alignment**: the hot loops' speed swings 2-5% with their
+  placement mod 64, which the linker decides from the whole binary
+  (issue #19: the criterion and `profile_decode` binaries differed by
+  3%). `align_hot_loop!(pad)` (an `asm!` `.p2align 6` plus `pad` nops in
+  the loop's preheader, as libzstd's `.p2align` before its sequence
+  loop) pins the loop's first instruction relative to the function;
+  `pad` is tuned per loop so the sequence loop starts on a 64-byte
+  boundary (the other three residues measured 2-4% slower) and the
+  Huffman loops too (32 mod 64 measured 2% slower). The exit of the fast
+  sequence loop is a `#[cold]` call so the loop, not its exit, follows
+  the padding. Re-check with `objdump` after changing a loop's entry.
 - **Huffman**: X1 (one symbol per lookup) and X2 (up to two), chosen per
   block with libzstd's `HUF_selectDecoder` timing table. The X2 table is
   derived from the X1 table (cell `i` = X1 at `i`, plus X1 at
@@ -104,11 +124,11 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
 
 ## Roadmap
 
-1. Decoder speed to >= 1.0x libzstd everywhere (Huffman is there; the
-   sequence loop is within 1-2%): a long-offset decoder with
-   prefetching (libzstd's `ZSTD_decompressSequencesLong`) for large
-   windows; literals placed in the output buffer like libzstd's split
-   literal buffer; more measurement on Silesia (`ZSTD_BENCH_CORPUS`).
+1. ~~Decoder speed to >= 1.0x libzstd everywhere~~ (done: Silesia
+   geometric means 1.05x at L1, 1.08x at L3, 1.09x at L9 and L19 on the
+   EPYC host, every file and level above 1.0x except nci L19 at 0.98x).
+   Remaining: nci L19; the per-block table builds (`fse::build_seq_table`
+   and `spread`, `HufTable::read`: ~8% of cycles vs libzstd's ~6%).
 2. ~~Streaming decoder~~ (done: `stream.rs`, `io.rs`; window buffer of
    window + 2 blocks + 64 with the old segment as history after a wrap;
    0.98-1.21x libzstd's streaming decoder). Next: write into the
