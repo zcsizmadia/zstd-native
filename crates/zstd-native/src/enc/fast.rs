@@ -60,8 +60,6 @@ use super::seq_store::{
     REPCODE1_TO_OFFBASE, SeqStore, count, count_2segments, hash4_ptr, hash5_ptr, hash6_ptr,
     hash7_ptr, hash8_ptr, offset_to_offbase, read32,
 };
-use alloc::vec;
-use alloc::vec::Vec;
 
 /// `ZSTD_WINDOW_START_INDEX`: the index of a fresh window's first byte.
 pub(crate) const WINDOW_START_INDEX: u32 = 2;
@@ -365,11 +363,11 @@ pub(crate) struct MatchState {
     /// `nextToUpdate`
     pub(crate) next_to_update: u32,
     /// `hashTable`: `1 << cparams.hash_log` entries.
-    pub(crate) hash_table: Vec<u32>,
+    pub(crate) hash_table: super::table::Table<u32>,
     /// `chainTable`: `1 << cparams.chain_log` entries, none for `fast` and
     /// the row match finder. `dfast` uses it as its short-match hash table,
     /// `btlazy2` as its binary tree.
-    pub(crate) chain_table: Vec<u32>,
+    pub(crate) chain_table: super::table::Table<u32>,
     /// `cParams`
     pub(crate) cparams: CParams,
     /// `forceNonContiguous`
@@ -382,7 +380,7 @@ pub(crate) struct MatchState {
     /// between frames of a reused context, only salted differently. Its
     /// stale content never changes the result (see `lazy::row`), so it is
     /// not cleared here either.
-    pub(crate) tag_table: Vec<u8>,
+    pub(crate) tag_table: super::table::Table<u8>,
     /// `hashCache`: the row hashes of the next positions.
     pub(crate) hash_cache: [u32; super::row::ROW_HASH_CACHE_SIZE],
     /// `rowHashLog`: `hash_log - rowLog`.
@@ -398,7 +396,7 @@ pub(crate) struct MatchState {
     /// parser with `minMatch == 3`, else 0 (no table).
     pub(crate) hash_log3: u32,
     /// `hashTable3`: the optimal parser's 3-byte hash table.
-    pub(crate) hash_table3: Vec<u32>,
+    pub(crate) hash_table3: super::table::Table<u32>,
     /// `opt`: the optimal parser's state (btopt and above), allocated on
     /// first use and kept (like libzstd's workspace).
     pub(crate) opt: Option<alloc::boxed::Box<super::opt::OptState>>,
@@ -434,19 +432,19 @@ impl MatchState {
             window: Window::new(),
             loaded_dict_end: 0,
             next_to_update: 0,
-            hash_table: Vec::new(),
-            chain_table: Vec::new(),
+            hash_table: super::table::Table::new(),
+            chain_table: super::table::Table::new(),
             cparams,
             force_non_contiguous: false,
             use_row_match_finder: false,
-            tag_table: Vec::new(),
+            tag_table: super::table::Table::new(),
             hash_cache: [0; super::row::ROW_HASH_CACHE_SIZE],
             row_hash_log: 0,
             hash_salt: 0,
             hash_salt_entropy: 0,
             lazy_skipping: false,
             hash_log3: 0,
-            hash_table3: Vec::new(),
+            hash_table3: super::table::Table::new(),
             opt: None,
             dict: None,
             dms: false,
@@ -478,24 +476,23 @@ impl MatchState {
         self.lazy_skipping = false;
         self.invalidate();
         let h_size = 1usize << cparams.hash_log;
-        clear_table(&mut self.hash_table, h_size);
+        self.hash_table.reset_zeroed(h_size);
         // ZSTD_allocateChainTable: none for `fast` and the row match finder.
         let c_size = if cparams.strategy == Strategy::Fast || use_row {
             0
         } else {
             1usize << cparams.chain_log
         };
-        clear_table(&mut self.chain_table, c_size);
+        self.chain_table.reset_zeroed(c_size);
         self.use_row_match_finder = use_row;
         if use_row {
             if for_cdict {
-                self.tag_table.clear();
-                self.tag_table.resize(h_size, 0);
+                self.tag_table.reset_zeroed(h_size);
                 self.hash_salt = 0;
             } else {
                 // The tag table is "init once" (see its docs): new bytes are
                 // zeroed, existing ones are kept.
-                self.tag_table.resize(h_size, 0);
+                self.tag_table.resize(h_size);
                 self.advance_hash_salt();
             }
             let row_log = cparams.search_log.clamp(4, 6);
@@ -513,7 +510,7 @@ impl MatchState {
         } else {
             0
         };
-        clear_table(&mut self.hash_table3, h3_size);
+        self.hash_table3.reset_zeroed(h3_size);
         if cparams.strategy >= Strategy::BtOpt && self.opt.is_none() && !for_cdict {
             self.opt = Some(alloc::boxed::Box::new(super::opt::OptState::new()));
         }
@@ -715,15 +712,6 @@ pub(crate) fn write_tagged_index(table: &mut [u32], hash_and_tag: usize, index: 
     let tag = hash_and_tag as u32 & SHORT_CACHE_TAG_MASK;
     debug_assert!(index >> (32 - SHORT_CACHE_TAG_BITS) == 0);
     table[hash] = (index << SHORT_CACHE_TAG_BITS) | tag;
-}
-
-/// Resizes `table` to `size` zeroed entries, reusing its allocation.
-fn clear_table(table: &mut Vec<u32>, size: usize) {
-    if table.len() == size {
-        table.fill(0);
-    } else {
-        *table = vec![0; size];
-    }
 }
 
 /// Safe `ZSTD_hashPtr` on a buffer position (reads `HASH_READ_SIZE` bytes).
@@ -2173,6 +2161,7 @@ pub(super) mod tests {
         MINMATCH, REP_START_VALUE, SeqStore, offbase_is_offset, offbase_to_offset,
     };
     use super::*;
+    use alloc::vec;
     use alloc::vec::Vec;
 
     /// Replays the sequences of `ss` (with repcode history `rep`) onto

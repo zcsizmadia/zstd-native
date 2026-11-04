@@ -45,6 +45,8 @@
 //!   compress/zstdmt_compress.c (jobs compressed by worker threads, the
 //!   overlap between jobs, the serial LDM step) and how
 //!   `ZSTD_compressStream2` drives it with `nbWorkers >= 1`
+//! - `table`: the match finder tables, 64-byte aligned like libzstd's
+//!   workspace tables (`ZSTD_cwksp`)
 #![allow(dead_code)] // filled in step by step (issue #6)
 
 pub(crate) mod bitwriter;
@@ -68,6 +70,7 @@ pub(crate) mod seq_store;
 pub(crate) mod sequences;
 pub(crate) mod split;
 pub(crate) mod stream;
+pub(crate) mod table;
 
 pub use cdict::EncoderDictionary;
 pub use compress::compress_bound;
