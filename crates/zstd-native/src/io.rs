@@ -207,6 +207,56 @@ impl<W: Write> Encoder<W> {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
     }
 
+    /// Ends the frame with a content checksum (see
+    /// [`StreamEncoder::set_checksum`]; the `zstd` crate's
+    /// `Encoder::include_checksum`). Must be called before the first write.
+    ///
+    /// ```
+    /// use std::io::Write;
+    /// let mut enc = zstd_native::Encoder::new(Vec::new(), 3);
+    /// enc.set_checksum(true)?;
+    /// enc.write_all(b"checked, checked, checked")?;
+    /// let compressed = enc.finish()?;
+    /// assert_eq!(zstd_native::decompress(&compressed).unwrap(), b"checked, checked, checked");
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::InvalidInput`] after the first write.
+    pub fn set_checksum(&mut self, on: bool) -> io::Result<()> {
+        self.enc
+            .set_checksum(on)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+    }
+
+    /// Writes the content size into the frame header when it is pledged
+    /// (see [`StreamEncoder::set_content_size_flag`]; the `zstd` crate's
+    /// `Encoder::include_contentsize`). Must be called before the first
+    /// write.
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::InvalidInput`] after the first write.
+    pub fn set_content_size_flag(&mut self, on: bool) -> io::Result<()> {
+        self.enc
+            .set_content_size_flag(on)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+    }
+
+    /// Writes the dictionary's ID into the frame header (see
+    /// [`StreamEncoder::set_dict_id_flag`]; the `zstd` crate's
+    /// `Encoder::include_dictid`). Must be called before the first write.
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::InvalidInput`] after the first write.
+    pub fn set_dict_id_flag(&mut self, on: bool) -> io::Result<()> {
+        self.enc
+            .set_dict_id_flag(on)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+    }
+
     /// Compresses with `n` worker threads (see
     /// [`StreamEncoder::set_workers`]; the `zstd` crate's
     /// `Encoder::multithread`), with libzstd's output for the same worker
