@@ -11,9 +11,28 @@ use super::literals::STRAT_LAZY;
 use crate::error::{Error, Result};
 use crate::fse::{LL_BITS, ML_BITS};
 
-pub(crate) type LlCTable = FseCTable<512, 36>;
+/// The sequence tables: `MaxLL + 1` (36), `MaxOff + 1` (32) and `MaxML + 1` (53)
+/// symbols, with the symbol dimension rounded up to a power of two so
+/// [`FseCState::encode`] masks the symbol instead of bounds-checking it
+/// (every code is in range, so the mask changes nothing).
+pub(crate) type LlCTable = FseCTable<512, 64>;
 pub(crate) type OfCTable = FseCTable<256, 32>;
-pub(crate) type MlCTable = FseCTable<512, 53>;
+pub(crate) type MlCTable = FseCTable<512, 64>;
+
+/// libzstd's `LL_bits` and `ML_bits`, padded to 256 entries so a `u8` code
+/// indexes them without a bounds check (the padding is never read).
+const LL_BITS_256: [u8; 256] = pad256(&LL_BITS);
+const ML_BITS_256: [u8; 256] = pad256(&ML_BITS);
+
+const fn pad256<const N: usize>(t: &[u8; N]) -> [u8; 256] {
+    let mut r = [0u8; 256];
+    let mut i = 0;
+    while i < N {
+        r[i] = t[i];
+        i += 1;
+    }
+    r
+}
 
 /// Table encodings (libzstd's `SymbolEncodingType_e`).
 pub(crate) const SET_BASIC: u32 = 0;
@@ -298,38 +317,43 @@ pub(crate) fn encode_sequences<Q: SeqFields>(
     let n_seq = seqs.len();
     let mut bw = BitWriter::new(dst).ok_or(Error::OutputTooSmall)?;
     let last = n_seq - 1;
+    let (ll_codes, of_codes, ml_codes) =
+        (&ll_codes[..n_seq], &of_codes[..n_seq], &ml_codes[..n_seq]);
     let mut ml_state = FseCState::new2(ml_ct, u32::from(ml_codes[last]));
     let mut of_state = FseCState::new2(of_ct, u32::from(of_codes[last]));
     let mut ll_state = FseCState::new2(ll_ct, u32::from(ll_codes[last]));
     bw.add_bits(
         u64::from(seqs[last].lit_length()),
-        u32::from(LL_BITS[ll_codes[last] as usize]),
+        u32::from(LL_BITS_256[ll_codes[last] as usize]),
     );
     bw.add_bits(
         u64::from(seqs[last].ml_base()),
-        u32::from(ML_BITS[ml_codes[last] as usize]),
+        u32::from(ML_BITS_256[ml_codes[last] as usize]),
     );
     bw.add_bits(u64::from(seqs[last].off_base()), u32::from(of_codes[last]));
     bw.flush();
-    for n in (0..last).rev() {
-        let ll_code = ll_codes[n];
-        let of_code = of_codes[n];
-        let ml_code = ml_codes[n];
-        let ll_bits = u32::from(LL_BITS[ll_code as usize]);
+    // Zipped so the four slices need no per-sequence bounds checks.
+    let rest = seqs[..last]
+        .iter()
+        .zip(&ll_codes[..last])
+        .zip(&of_codes[..last])
+        .zip(&ml_codes[..last]);
+    for (((seq, &ll_code), &of_code), &ml_code) in rest.rev() {
+        let ll_bits = u32::from(LL_BITS_256[ll_code as usize]);
         let of_bits = u32::from(of_code);
-        let ml_bits = u32::from(ML_BITS[ml_code as usize]);
+        let ml_bits = u32::from(ML_BITS_256[ml_code as usize]);
         of_state.encode(&mut bw, of_ct, u32::from(of_code));
         ml_state.encode(&mut bw, ml_ct, u32::from(ml_code));
         ll_state.encode(&mut bw, ll_ct, u32::from(ll_code));
         if of_bits + ml_bits + ll_bits >= 64 - 7 - (9 + 9 + 8) {
             bw.flush();
         }
-        bw.add_bits(u64::from(seqs[n].lit_length()), ll_bits);
-        bw.add_bits(u64::from(seqs[n].ml_base()), ml_bits);
+        bw.add_bits(u64::from(seq.lit_length()), ll_bits);
+        bw.add_bits(u64::from(seq.ml_base()), ml_bits);
         if of_bits + ml_bits + ll_bits > 56 {
             bw.flush();
         }
-        bw.add_bits(u64::from(seqs[n].off_base()), of_bits);
+        bw.add_bits(u64::from(seq.off_base()), of_bits);
         bw.flush();
     }
     ml_state.flush(&mut bw);

@@ -647,6 +647,34 @@ pub(crate) struct FseCState {
     pub state_log: u32,
 }
 
+impl<const STATES: usize, const SYMBOLS: usize> FseCTable<STATES, SYMBOLS> {
+    /// The transform of `symbol`. When `SYMBOLS` is a power of two the
+    /// index is masked instead of bounds-checked: every code the encoders
+    /// produce is below `SYMBOLS`, so the mask changes nothing, and it
+    /// keeps a compare and branch out of the sequence loop.
+    #[inline(always)]
+    fn tt(&self, symbol: u32) -> SymbolTransform {
+        debug_assert!((symbol as usize) < SYMBOLS);
+        if SYMBOLS.is_power_of_two() {
+            self.symbol_tt[symbol as usize & (SYMBOLS - 1)]
+        } else {
+            self.symbol_tt[symbol as usize]
+        }
+    }
+
+    /// The next state at `idx` (same masking as [`tt`](Self::tt): a valid
+    /// table never indexes past its `1 << table_log <= STATES` states).
+    #[inline(always)]
+    fn next_state(&self, idx: usize) -> usize {
+        debug_assert!(idx < STATES);
+        if STATES.is_power_of_two() {
+            usize::from(self.state_table[idx & (STATES - 1)])
+        } else {
+            usize::from(self.state_table[idx])
+        }
+    }
+}
+
 impl FseCState {
     /// libzstd's `FSE_initCState`.
     #[inline(always)]
@@ -662,11 +690,11 @@ impl FseCState {
     #[inline(always)]
     pub(crate) fn new2<const N: usize, const S: usize>(ct: &FseCTable<N, S>, symbol: u32) -> Self {
         let mut st = Self::new(ct);
-        let tt = ct.symbol_tt[symbol as usize];
+        let tt = ct.tt(symbol);
         let nb_bits_out = (tt.delta_nb_bits.wrapping_add(1 << 15)) >> 16;
         let v = (nb_bits_out << 16).wrapping_sub(tt.delta_nb_bits);
         let idx = ((v >> nb_bits_out) as usize).wrapping_add(tt.delta_find_state as isize as usize);
-        st.value = usize::from(ct.state_table[idx]);
+        st.value = ct.next_state(idx);
         st
     }
 
@@ -678,11 +706,11 @@ impl FseCState {
         ct: &FseCTable<N, S>,
         symbol: u32,
     ) {
-        let tt = ct.symbol_tt[symbol as usize];
+        let tt = ct.tt(symbol);
         let nb_bits_out = (self.value.wrapping_add(tt.delta_nb_bits as usize) >> 16) as u32;
         bw.add_bits(self.value as u64, nb_bits_out);
         let idx = (self.value >> nb_bits_out).wrapping_add(tt.delta_find_state as isize as usize);
-        self.value = usize::from(ct.state_table[idx]);
+        self.value = ct.next_state(idx);
     }
 
     /// libzstd's `FSE_flushCState`: writes the final state.

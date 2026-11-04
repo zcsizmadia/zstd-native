@@ -20,8 +20,7 @@ use super::params::{
 };
 use super::presplit::{FpStats, optimal_block_size};
 use super::seq_store::{
-    LongLengthType, MAX_LL, MAX_ML, REP_START_VALUE, STREAM_ACCUMULATOR_MIN, SeqDef, SeqStore,
-    highbit32, ll_code, max_nb_seq, ml_code,
+    LongLengthType, MAX_LL, MAX_ML, REP_START_VALUE, SeqDef, SeqStore, fill_codes, max_nb_seq,
 };
 use super::sequences::{
     FseCTables, FseRepeat, SET_COMPRESSED, SeqFields, build_ctable, encode_sequences,
@@ -129,21 +128,12 @@ impl SeqChunk {
 /// targets).
 pub(crate) fn chunk_to_codes(ss: &mut SeqStore, ch: &SeqChunk) -> bool {
     let (s, e) = (ch.seq_start, ch.seq_end);
-    let mut long_offsets = false;
-    let seqs = &ss.sequences[s..e];
-    let ll = &mut ss.ll_code[s..e];
-    let of = &mut ss.of_code[s..e];
-    let ml = &mut ss.ml_code[s..e];
-    for (u, q) in seqs.iter().enumerate() {
-        let of_code = highbit32(q.off_base);
-        ll[u] = ll_code(u32::from(q.lit_length)) as u8;
-        of[u] = of_code as u8;
-        ml[u] = ml_code(u32::from(q.ml_base)) as u8;
-        debug_assert!(!(usize::BITS == 64 && of_code >= STREAM_ACCUMULATOR_MIN));
-        if usize::BITS == 32 && of_code >= STREAM_ACCUMULATOR_MIN {
-            long_offsets = true;
-        }
-    }
+    let long_offsets = fill_codes(
+        &ss.sequences[s..e],
+        &mut ss.ll_code[s..e],
+        &mut ss.of_code[s..e],
+        &mut ss.ml_code[s..e],
+    );
     // The long length may be just past a partition (libzstd writes its code
     // there too; it is the right code for that sequence).
     let p = s + ch.long_length_pos as usize;

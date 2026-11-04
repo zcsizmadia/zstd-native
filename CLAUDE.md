@@ -39,9 +39,10 @@ On this Windows machine, cargo is in `~/.cargo/bin` (not on PATH in Bash).
   reader), `huf.rs` fast loops, `huf_asm.rs` (asm! port of libzstd's
   Huffman loops), `block.rs` sequence execution and copies, the encoder's
   match finders and `enc/search_asm.rs` (asm! search loops of `fast` and
-  `dfast`),
-  and the output writes in `decoder.rs`. New `unsafe` needs a benchmark
-  showing the gain.
+  `dfast`), the encoder's bit writers (`enc/bitwriter.rs`, `enc/huf_enc.rs`:
+  8-byte flushes) and its run-time dispatch to `#[target_feature]` loops
+  (`enc/seq_store.rs`), and the output writes in `decoder.rs`. New `unsafe`
+  needs a benchmark showing the gain.
 - CPU-specific code goes behind run-time detection (`cpu.rs`), compiled
   with `#[target_feature]` (BMI2 today), with the generic version selected
   by the `portable` feature for testing.
