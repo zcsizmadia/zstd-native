@@ -158,9 +158,33 @@ impl<'a> BitReader<'a> {
         self.reload_slow()
     }
 
+    /// [`reload`](Self::reload) with the slow path inlined, for short
+    /// streams (Huffman weights) where it is the common case.
+    #[inline(always)]
+    pub(crate) fn reload_short(&mut self) -> Status {
+        if self.consumed > 64 {
+            return Status::Overflow;
+        }
+        if self.ip as usize - self.start as usize >= 8 {
+            // SAFETY: as in `reload`.
+            unsafe {
+                self.ip = self.ip.sub((self.consumed >> 3) as usize);
+                self.consumed &= 7;
+                self.container = u64::from_le(self.ip.cast::<u64>().read_unaligned());
+            }
+            return Status::Unfinished;
+        }
+        self.reload_slow_body()
+    }
+
     #[cold]
     #[inline(never)]
     fn reload_slow(&mut self) -> Status {
+        self.reload_slow_body()
+    }
+
+    #[inline(always)]
+    fn reload_slow_body(&mut self) -> Status {
         let pos = self.ip as usize - self.start as usize;
         if pos == 0 {
             return if self.consumed < 64 {

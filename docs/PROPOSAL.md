@@ -81,6 +81,17 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
   exactly the same inputs. (libzstd's fast path skips that end check.)
 - **CPU features**: hot loops are compiled generic and with BMI2
   (`#[target_feature]`), picked at run time; `portable` forces generic.
+- **Small inputs** (per-frame setup; `examples/small_frames.rs`,
+  `examples/huf_read.rs`): Huffman tree reads were 1.7x libzstd's cost.
+  Fixed by building the X1 table from SSE2 per-weight symbol masks (counts
+  by popcount, order by set bits) instead of a histogram and a counting
+  sort, whose read-modify-write chains on equal weights serialized
+  through store-to-load forwarding (portable fallback: 4 interleaved
+  quarters); an inlined slow-path reload for short streams (weights,
+  stream tails); FSE table builds without bounds checks and with LZCNT;
+  and a per-thread cached decoder for the one-call functions (a fresh
+  decoder zeroes ~40 KB of tables). 1.25-1.5x libzstd at 100 bytes,
+  1.0-1.1x at 1-16 KB.
 - **Huffman asm** (`huf_asm.rs`): libzstd's `huf_decompress_amd64.S` X1
   and X2 loops ported to `asm!` (same registers and instructions), run in
   bounded chunks computed by the same Rust code as the Rust loops. Which

@@ -74,16 +74,49 @@ impl HufTable {
             osize = fse::decompress_weights(&src[1..1 + isize], &mut weights)?;
         }
 
-        let mut rank = [0u32; HUF_TABLELOG_MAX as usize + 1];
+        #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+        let log = self.build_from_masks(&mut weights, osize)?;
+        #[cfg(not(all(target_arch = "x86_64", not(feature = "portable"))))]
+        let log = self.build_sorted(&mut weights, osize)?;
+        self.log = log;
+        self.x2_ready = false;
+        Ok(isize + 1)
+    }
+
+    /// Validates the weights, completes them with the implied last one and
+    /// fills the X1 table, from a counting sort (portable version). Returns
+    /// the table log.
+    #[cfg_attr(
+        all(target_arch = "x86_64", not(feature = "portable")),
+        allow(dead_code)
+    )]
+    fn build_sorted(&mut self, weights: &mut [u8; 256], osize: usize) -> Result<u32> {
+        // Validate and count (libzstd's HUF_readStats). The symbols are split
+        // in 4 contiguous quarters with their own counters, visited
+        // interleaved: runs of equal weights (common: all the zero-weight
+        // control characters) would otherwise serialize on one counter
+        // through store-to-load forwarding, here and in the sort below.
+        let q = (osize + 1).div_ceil(4);
+        let mut rq = [[0u32; 16]; 4];
         let mut total = 0u32;
-        for &w in &weights[..osize] {
-            if u32::from(w) > HUF_TABLELOG_MAX {
-                return Err(Error::Corrupted);
+        let mut bad = 0u8;
+        for i in 0..q {
+            for (k, r) in rq.iter_mut().enumerate() {
+                let s = k * q + i;
+                if s < osize {
+                    let w = weights[s];
+                    bad |= w;
+                    r[(w & 15) as usize] += 1;
+                    total += (1 << (w & 15)) >> 1;
+                }
             }
-            rank[w as usize] += 1;
-            total += (1 << w) >> 1;
         }
-        if total == 0 {
+        let mut rank = [0u32; 16];
+        for (w, r) in rank.iter_mut().enumerate() {
+            *r = rq[0][w] + rq[1][w] + rq[2][w] + rq[3][w];
+        }
+        // Weights over 15 show in `bad`, 13 to 15 in the top counters.
+        if bad > 15 || rank[13] + rank[14] + rank[15] != 0 || total == 0 {
             return Err(Error::Corrupted);
         }
         let table_log = 32 - total.leading_zeros(); // highbit + 1
@@ -97,59 +130,195 @@ impl HufTable {
         let last = rest.trailing_zeros() + 1;
         weights[osize] = last as u8;
         rank[last as usize] += 1;
+        rq[osize / q][last as usize] += 1;
         if rank[1] < 2 || rank[1] & 1 != 0 {
             return Err(Error::Corrupted);
         }
         let nb_symbols = osize + 1;
 
-        // Scale up to the fast table log (HUF_rescaleStats).
-        let mut log = table_log;
-        if log < FAST_TABLELOG {
-            let scale = FAST_TABLELOG - log;
-            for w in &mut weights[..nb_symbols] {
-                if *w != 0 {
-                    *w += scale as u8;
-                }
-            }
-            for r in (1..=FAST_TABLELOG as usize).rev() {
-                rank[r] = if r > scale as usize {
-                    rank[r - scale as usize]
-                } else {
-                    0
-                };
-            }
-            log = FAST_TABLELOG;
-        }
+        // The table has at least FAST_TABLELOG bits (libzstd's
+        // HUF_rescaleStats): a weight-w code is still `table_log + 1 - w`
+        // bits long and fills `1 << (w - 1 + scale)` cells; the weights
+        // themselves don't change.
+        let log = table_log.max(FAST_TABLELOG);
+        let scale = log - table_log;
 
-        // Symbols sorted by weight, then by value; fill in canonical order.
-        let mut start = [0u32; HUF_TABLELOG_MAX as usize + 2];
+        // Symbols sorted by weight, then by value (counting sort).
+        let mut start = [0u32; 16];
         let mut next = 0u32;
-        for w in 0..=log as usize {
+        for w in 0..=table_log as usize {
             start[w] = next;
             next += rank[w];
         }
-        let mut sorted = [0u8; 256];
-        for (s, &w) in weights[..nb_symbols].iter().enumerate() {
-            sorted[start[w as usize] as usize] = s as u8;
-            start[w as usize] += 1;
+        // Quarter k starts after quarters 0..k within each weight, so the
+        // order stays by weight, then symbol.
+        let mut st = [[0u32; 16]; 4];
+        for w in 0..=table_log as usize {
+            let mut p = start[w];
+            for k in 0..4 {
+                st[k][w] = p;
+                p += rq[k][w];
+            }
         }
+        let mut sorted = [0u8; 256];
+        for i in 0..q {
+            for (k, sk) in st.iter_mut().enumerate() {
+                let s = k * q + i;
+                if s < nb_symbols {
+                    let p = &mut sk[(weights[s] & 15) as usize];
+                    sorted[(*p & 255) as usize] = s as u8;
+                    *p += 1;
+                }
+            }
+        }
+
+        // Fill weight by weight, so the run length is constant in each inner
+        // loop and short runs don't go through a variable-length fill
+        // (libzstd's switch on the length).
         let mut pos = 0usize;
         let mut idx = rank[0] as usize;
-        for w in 1..=log {
+        let dt = &mut self.dt;
+        for w in 1..=table_log {
             let count = rank[w as usize] as usize;
-            let len = 1usize << (w - 1);
-            let nb_bits = (log + 1 - w) as u16;
-            for &s in &sorted[idx..idx + count] {
-                let e = (u16::from(s) << 8) | nb_bits;
-                self.dt[pos..pos + len].fill(e);
-                pos += len;
+            let len = 1usize << (w - 1 + scale);
+            let nb_bits = (table_log + 1 - w) as u16;
+            let syms = &sorted[idx..idx + count];
+            match len {
+                1 => {
+                    for (d, &s) in dt[pos..pos + count].iter_mut().zip(syms) {
+                        *d = (u16::from(s) << 8) | nb_bits;
+                    }
+                }
+                2 => {
+                    for (d, &s) in dt[pos..pos + 2 * count]
+                        .as_chunks_mut::<2>()
+                        .0
+                        .iter_mut()
+                        .zip(syms)
+                    {
+                        let e = (u16::from(s) << 8) | nb_bits;
+                        d.copy_from_slice(&[e; 2]);
+                    }
+                }
+                _ => {
+                    for (d, &s) in dt[pos..pos + len * count].chunks_exact_mut(len).zip(syms) {
+                        let e4 = [(u16::from(s) << 8) | nb_bits; 4];
+                        for q in d.as_chunks_mut::<4>().0 {
+                            q.copy_from_slice(&e4);
+                        }
+                    }
+                }
             }
+            pos += len * count;
             idx += count;
         }
         debug_assert_eq!(pos, 1 << log);
-        self.log = log;
-        self.x2_ready = false;
-        Ok(isize + 1)
+        Ok(log)
+    }
+
+    /// [`build_sorted`](Self::build_sorted) with SSE2 (baseline on x86-64):
+    /// a 256-bit mask of the symbols of each weight, from 16-byte compares,
+    /// gives the counts (popcounts) and the sorted order (set bits in
+    /// order) without the memory read-modify-write chains of a histogram
+    /// and a counting sort.
+    #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+    fn build_from_masks(&mut self, weights: &mut [u8; 256], osize: usize) -> Result<u32> {
+        use core::arch::x86_64::{
+            __m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8,
+        };
+        // masks[w][j]: bit i set when weights[64 j + i] == w, for w <= 12.
+        let mut masks = [[0u64; 4]; HUF_TABLELOG_MAX as usize + 1];
+        let chunks = osize.div_ceil(16);
+        for c in 0..chunks {
+            // SAFETY: SSE2 is part of x86-64; `weights` has 256 bytes and
+            // c < 16, so the 16-byte load is in bounds.
+            #[allow(unsafe_code)]
+            let v = unsafe { _mm_loadu_si128(weights.as_ptr().add(16 * c).cast::<__m128i>()) };
+            for (w, m) in masks.iter_mut().enumerate() {
+                // SAFETY: SSE2 is part of x86-64.
+                #[allow(unsafe_code)]
+                let bits =
+                    unsafe { _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(w as i8))) } as u16;
+                m[c / 4] |= u64::from(bits) << (16 * (c % 4));
+            }
+        }
+        // Only symbols before `osize` count (the rest of `weights` is 0).
+        let valid = |j: usize| -> u64 {
+            let lo = 64 * j;
+            if osize >= lo + 64 {
+                !0
+            } else if osize <= lo {
+                0
+            } else {
+                (1u64 << (osize - lo)) - 1
+            }
+        };
+        let mut rank = [0u32; 16];
+        let mut counted = 0u32;
+        let mut total = 0u32;
+        for (w, m) in masks.iter_mut().enumerate() {
+            for (j, word) in m.iter_mut().enumerate() {
+                *word &= valid(j);
+            }
+            let n: u32 = m.iter().map(|x| x.count_ones()).sum();
+            rank[w] = n;
+            counted += n;
+            // A weight-w symbol adds 2^(w-1); weight 0 adds nothing.
+            total += if w == 0 { 0 } else { n << (w - 1) };
+        }
+        // A weight over 12 isn't in any mask.
+        if counted != osize as u32 || total == 0 {
+            return Err(Error::Corrupted);
+        }
+        let table_log = 32 - total.leading_zeros(); // highbit + 1
+        if table_log > HUF_TABLELOG_MAX {
+            return Err(Error::Corrupted);
+        }
+        let rest = (1u32 << table_log) - total;
+        if !rest.is_power_of_two() {
+            return Err(Error::Corrupted);
+        }
+        let last = rest.trailing_zeros() + 1;
+        weights[osize] = last as u8;
+        rank[last as usize] += 1;
+        masks[last as usize][osize / 64] |= 1 << (osize % 64);
+        if rank[1] < 2 || rank[1] & 1 != 0 {
+            return Err(Error::Corrupted);
+        }
+        let log = table_log.max(FAST_TABLELOG);
+        let scale = log - table_log;
+
+        let dt = &mut self.dt;
+        let mut pos = 0usize;
+        for w in 1..=table_log {
+            let len = 1usize << (w - 1 + scale);
+            let nb_bits = (table_log + 1 - w) as u16;
+            let count = rank[w as usize] as usize;
+            let run = &mut dt[pos..pos + len * count];
+            let mut k = 0;
+            for (j, &word) in masks[w as usize].iter().enumerate() {
+                let mut m = word;
+                while m != 0 {
+                    let s = 64 * j + m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    let e = ((s as u16) << 8) | nb_bits;
+                    let d = &mut run[k..k + len];
+                    match len {
+                        1 => d[0] = e,
+                        2 => d.copy_from_slice(&[e; 2]),
+                        _ => {
+                            for q in d.as_chunks_mut::<4>().0 {
+                                q.copy_from_slice(&[e; 4]);
+                            }
+                        }
+                    }
+                    k += len;
+                }
+            }
+            pos += len * count;
+        }
+        debug_assert_eq!(pos, 1 << log);
+        Ok(log)
     }
     /// Builds the double-symbol table: each entry decodes the first symbol
     /// and, when its code fits in the remaining bits of the 11-bit window,
@@ -249,7 +418,7 @@ fn decode_stream(out: &mut [u8], br: &mut BitReader<'_>, t: &HufTable) {
     let mut p = 0;
     let end = out.len();
     if end > 3 {
-        while (br.reload() == Status::Unfinished) & (p < end - 3) {
+        while (br.reload_short() == Status::Unfinished) & (p < end - 3) {
             out[p] = decode_symbol(br, dt, log);
             out[p + 1] = decode_symbol(br, dt, log);
             out[p + 2] = decode_symbol(br, dt, log);
@@ -257,7 +426,7 @@ fn decode_stream(out: &mut [u8], br: &mut BitReader<'_>, t: &HufTable) {
             p += 4;
         }
     } else {
-        br.reload();
+        br.reload_short();
     }
     while p < end {
         out[p] = decode_symbol(br, dt, log);
@@ -680,5 +849,90 @@ fn fast_loop_asm(
             st.op = a.op.map(|p| p as usize - outp as usize);
             st.bits = a.bits;
         }
+    }
+}
+
+/// Benchmark hook: the Huffman tree description of the first compressed
+/// literals section in `frame` (a single-frame zstd input), if any.
+#[doc(hidden)]
+pub fn first_tree_description(frame: &[u8]) -> Option<&[u8]> {
+    let fh = crate::frame::FrameHeader::parse(frame).ok()?;
+    let mut ip = fh.header_size;
+    loop {
+        let b = frame.get(ip..ip + 3)?;
+        let bh = u32::from_le_bytes([b[0], b[1], b[2], 0]);
+        ip += 3;
+        let (last, btype, bsize) = (bh & 1 != 0, (bh >> 1) & 3, (bh >> 3) as usize);
+        if btype == 2 {
+            let blk = frame.get(ip..ip + bsize)?;
+            if blk[0] & 3 == 2 {
+                let lh = [3, 3, 4, 5][((blk[0] >> 2) & 3) as usize];
+                return blk.get(lh..);
+            }
+        }
+        ip += if btype == 1 { 1 } else { bsize };
+        if last {
+            return None;
+        }
+    }
+}
+
+/// Benchmark hook: reads the tree description `n` times, returns a checksum.
+#[doc(hidden)]
+pub fn bench_read(desc: &[u8], n: usize) -> usize {
+    let mut t = HufTable::new();
+    let mut acc = 0;
+    for _ in 0..n {
+        acc += t.read(core::hint::black_box(desc)).unwrap_or(0);
+        acc += t.dt[acc & 2047] as usize;
+    }
+    acc
+}
+
+#[cfg(all(test, target_arch = "x86_64", not(feature = "portable")))]
+mod tests {
+    use super::*;
+
+    /// The SSE2 mask build and the portable sort build agree exactly, on
+    /// valid and invalid weights.
+    #[test]
+    fn mask_build_matches_sorted_build() {
+        let mut r = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        let mut valid = 0;
+        for case in 0..20_000 {
+            let osize = 1 + (next() % 255) as usize;
+            let mut w = [0u8; 256];
+            // Mostly small weights; sometimes a bad one.
+            let maxw = 1 + (next() % 12) as u8;
+            for x in w[..osize].iter_mut() {
+                *x = if next() % 3 == 0 {
+                    0
+                } else {
+                    (next() % u64::from(maxw)) as u8 + 1
+                };
+            }
+            if case % 50 == 0 {
+                w[(next() as usize) % osize] = 13 + (next() % 200) as u8;
+            }
+            // Make about half the cases valid: fix the total up to a power
+            // of two minus a power of two by construction is hard, so just
+            // compare whatever comes out.
+            let (mut a, mut b) = (HufTable::new(), HufTable::new());
+            let (mut wa, mut wb) = (w, w);
+            let ra = a.build_sorted(&mut wa, osize);
+            let rb = b.build_from_masks(&mut wb, osize);
+            assert_eq!(ra, rb, "case {case}");
+            if let Ok(log) = ra {
+                valid += 1;
+                assert_eq!(&a.dt[..1 << log], &b.dt[..1 << log], "case {case}");
+            }
+        }
+        assert!(valid > 100, "only {valid} valid cases");
     }
 }

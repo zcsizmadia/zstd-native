@@ -310,7 +310,7 @@ fn reserve(v: &mut Vec<u8>, out: &mut Output, extra: usize) -> Result<()> {
 ///
 /// Any [`Error`] for corrupt, truncated or unsupported input.
 pub fn decompress(src: &[u8]) -> Result<Vec<u8>> {
-    Decompressor::new().decompress(src)
+    with_cached(|d| d.decompress(src))
 }
 
 /// Decompresses every frame in `src` into `dst`, returning the size.
@@ -320,7 +320,30 @@ pub fn decompress(src: &[u8]) -> Result<Vec<u8>> {
 /// [`Error::OutputTooSmall`] if `dst` is too small, or any other [`Error`]
 /// for corrupt, truncated or unsupported input.
 pub fn decompress_to_slice(src: &[u8], dst: &mut [u8]) -> Result<usize> {
-    Decompressor::new().decompress_to_slice(src, dst)
+    with_cached(|d| d.decompress_to_slice(src, dst))
+}
+
+/// Runs `f` with a per-thread cached [`Decompressor`] (with `std`), so the
+/// one-call functions don't allocate and zero the decoder's ~40 KB of
+/// tables on every call: that dominated small inputs.
+#[cfg(feature = "std")]
+fn with_cached<T>(f: impl FnOnce(&mut Decompressor) -> T) -> T {
+    use core::cell::Cell;
+    std::thread_local! {
+        static CACHED: Cell<Option<Box<Decompressor>>> = const { Cell::new(None) };
+    }
+    // Take it out while in use (re-entrancy and panics just make a new one).
+    let mut d = CACHED
+        .with(Cell::take)
+        .unwrap_or_else(|| Box::new(Decompressor::new()));
+    let r = f(&mut d);
+    CACHED.with(|c| c.set(Some(d)));
+    r
+}
+
+#[cfg(not(feature = "std"))]
+fn with_cached<T>(f: impl FnOnce(&mut Decompressor) -> T) -> T {
+    f(&mut Decompressor::new())
 }
 
 /// The decompressed size stored in the header of the first frame, or

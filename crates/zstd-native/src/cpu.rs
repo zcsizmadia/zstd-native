@@ -93,8 +93,17 @@ pub fn set_asm(mode: Option<bool>) {
 
 /// AMD or Hygon CPU (CPUID vendor string), where the Rust Huffman loops
 /// beat the asm ones.
+/// Cached `amd()`: 0 = not checked yet, 1 = AMD/Hygon, 2 = other.
+#[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+static VENDOR: AtomicU8 = AtomicU8::new(0);
+
 #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
 fn amd() -> bool {
+    match VENDOR.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
     // SAFETY: CPUID leaf 0 exists on every x86-64 CPU.
     #[allow(unsafe_code, unused_unsafe)]
     let r = unsafe { core::arch::x86_64::__cpuid(0) };
@@ -103,7 +112,9 @@ fn amd() -> bool {
         r.edx.to_le_bytes(),
         r.ecx.to_le_bytes(),
     );
-    vendor == (*b"Auth", *b"enti", *b"cAMD") || vendor == (*b"Hygo", *b"nGen", *b"uine")
+    let amd = vendor == (*b"Auth", *b"enti", *b"cAMD") || vendor == (*b"Hygo", *b"nGen", *b"uine");
+    VENDOR.store(if amd { 1 } else { 2 }, Ordering::Relaxed);
+    amd
 }
 
 #[cfg(not(all(target_arch = "x86_64", not(feature = "portable"))))]
