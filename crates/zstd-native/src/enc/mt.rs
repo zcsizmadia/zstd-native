@@ -43,7 +43,7 @@
 use std::any::Any;
 use std::boxed::Box;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -209,10 +209,10 @@ impl Slot {
 struct Buffers {
     inputs: Mutex<Vec<Vec<u8>>>,
     outputs: Mutex<Vec<Vec<u8>>>,
+    /// Buffers kept at most, of each kind: enough for a full job table
+    /// (set per frame), so that steady-state compression allocates nothing.
+    max_spare: AtomicUsize,
 }
-
-/// Buffers kept at most, of each kind.
-const MAX_SPARE_BUFFERS: usize = 8;
 
 impl Buffers {
     /// An empty input buffer of at least `capacity` bytes.
@@ -233,10 +233,20 @@ impl Buffers {
             .unwrap_or_else(|| vec![0u8; size])
     }
 
-    fn put(list: &Mutex<Vec<Vec<u8>>>, b: Vec<u8>) {
+    fn put(&self, list: &Mutex<Vec<Vec<u8>>>, b: Vec<u8>) {
         let mut l = lock(list);
-        if l.len() < MAX_SPARE_BUFFERS {
+        if l.len() < self.max_spare.load(Ordering::Relaxed) {
             l.push(b);
+        }
+    }
+
+    /// Takes back a job's input buffer when `data` is its last reference:
+    /// the job's and the next job's prefix share it, and whichever of the
+    /// worker and the calling thread lets go of it last recycles it
+    /// (`Arc::into_inner` hands it to exactly one of them).
+    fn put_shared_input(&self, data: Arc<Vec<u8>>) {
+        if let Some(b) = Arc::into_inner(data) {
+            self.put(&self.inputs, b);
         }
     }
 }
@@ -423,10 +433,8 @@ fn execute(fc: &mut Option<Box<FrameCompressor>>, job: Job) {
     } = job;
     ensure_serial_finished(&frame, id);
     // the input buffer, unless the next job's prefix is still to be taken
-    // from it
-    if let Ok(b) = Arc::try_unwrap(data) {
-        Buffers::put(&frame.bufs.inputs, b);
-    }
+    // from it (then the calling thread recycles it)
+    frame.bufs.put_shared_input(data);
     slot.set(outcome);
 }
 
@@ -656,6 +664,10 @@ impl MtCtx {
         self.pledged = pledged;
         // ZSTDMT_createJobsTable(nbWorkers + 2)
         self.max_jobs = 1 << ((workers as u32 + 2).ilog2() + 1);
+        // a buffer per job of the table, plus the one being filled
+        self.bufs
+            .max_spare
+            .store(self.max_jobs + 1, Ordering::Relaxed);
         self.generation += 1;
         let serial = if ldm {
             let s = self.serial.get_or_insert_with(|| {
@@ -844,8 +856,11 @@ impl MtCtx {
             .map_or(u64::MAX, |p| p.saturating_sub(self.consumed));
         let size = (self.target as u64).min(rest.max(1)) as usize;
         let mut b = self.bufs.input(prefix + size);
-        if let Some((data, start, len)) = &self.prev {
-            b.extend_from_slice(&data[*start..*start + *len]);
+        // the prefix is copied: the previous job's buffer is no longer
+        // needed here
+        if let Some((data, start, len)) = self.prev.take() {
+            b.extend_from_slice(&data[start..start + len]);
+            self.bufs.put_shared_input(data);
         }
         self.in_buf = Some(b);
         self.in_prefix = prefix;
@@ -965,7 +980,8 @@ impl MtCtx {
             }
             // job fully written out: free its position (and buffer)
             self.flushing = false;
-            Buffers::put(&self.bufs.outputs, core::mem::take(&mut self.out));
+            self.bufs
+                .put(&self.bufs.outputs, core::mem::take(&mut self.out));
             self.jobs.pop_front();
             self.post_ready();
         }
