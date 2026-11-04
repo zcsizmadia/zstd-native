@@ -843,9 +843,12 @@ pub(crate) fn huf_optimal_table_log(
 /// bits; the "fast" add ORs the whole element (the low bits are then noise
 /// that the callers keep out of the flushed bits, as in libzstd).
 ///
-/// Invariant: `ptr <= end` and `end + 8 == dst.len()` (as
-/// `BitWriter`); every flush clamps, so writes stay in
-/// bounds even where libzstd relies on the caller's size bound.
+/// Invariant: `ptr <= end` and `end + 8 == dst.len()` (as `BitWriter`).
+/// A clamping flush keeps it whatever is added; the unclamped flush of
+/// the fast loops relies on the caller's size bound: `dst` holds
+/// `src.len() * table_log` bits plus 8 bytes and no code is longer than
+/// `table_log` bits, so `ptr`, which is the number of whole bytes added,
+/// never passes `end`.
 struct HufCStream<'a> {
     container: [u64; 2],
     bit_pos: [u64; 2],
@@ -904,10 +907,12 @@ impl<'a> HufCStream<'a> {
         debug_assert!((self.bit_pos[0] & 0xFF) <= 64);
     }
 
-    /// libzstd's `HUF_flushBits` (the safe and fast variants: both clamp).
+    /// libzstd's `HUF_flushBits`: `CLAMP` is its safe variant; without it
+    /// (`kFastFlush`) the caller guarantees the stream fits, see
+    /// [`huf_compress1x_using_ctable`].
     #[inline(always)]
     #[allow(unsafe_code)]
-    fn flush_bits(&mut self) {
+    fn flush_bits<const CLAMP: bool>(&mut self) {
         // The upper bits of bit_pos are noise.
         let nb_bits = (self.bit_pos[0] & 0xFF) as u32;
         let nb_bytes = (nb_bits >> 3) as usize;
@@ -920,7 +925,8 @@ impl<'a> HufCStream<'a> {
         debug_assert!(nb_bits <= 64);
         debug_assert!(self.ptr <= self.end && self.end + 8 == self.dst.len());
         // SAFETY: `ptr <= end == dst.len() - 8` (struct invariant, kept by
-        // the clamp below), so the 8 bytes at `ptr` are inside `dst`.
+        // the clamp below or by the caller's size bound, see the struct
+        // doc), so the 8 bytes at `ptr` are inside `dst`.
         unsafe {
             self.dst
                 .as_mut_ptr()
@@ -929,8 +935,12 @@ impl<'a> HufCStream<'a> {
                 .write_unaligned(bits.to_le());
         }
         self.ptr += nb_bytes;
-        if self.ptr > self.end {
-            self.ptr = self.end;
+        if CLAMP {
+            if self.ptr > self.end {
+                self.ptr = self.end;
+            }
+        } else {
+            debug_assert!(self.ptr <= self.end);
         }
     }
 
@@ -938,7 +948,7 @@ impl<'a> HufCStream<'a> {
     #[inline(always)]
     fn close(mut self) -> usize {
         self.add_bits::<0>(END_MARK, false);
-        self.flush_bits();
+        self.flush_bits::<true>();
         let nb_bits = self.bit_pos[0] & 0xFF;
         if self.ptr >= self.end {
             return 0; // overflow
@@ -951,7 +961,7 @@ impl<'a> HufCStream<'a> {
 /// dropped: both flushes clamp here). Encodes `src` backward, `UNROLL`
 /// symbols per container fill.
 #[inline(always)]
-fn compress1x_loop<const UNROLL: usize, const LAST_FAST: bool>(
+fn compress1x_loop<const UNROLL: usize, const LAST_FAST: bool, const CLAMP: bool>(
     bc: &mut HufCStream<'_>,
     src: &[u8],
     ct: &[u64; 256],
@@ -964,7 +974,7 @@ fn compress1x_loop<const UNROLL: usize, const LAST_FAST: bool>(
             n -= 1;
             bc.add_bits::<0>(ct[src[n] as usize], false);
         }
-        bc.flush_bits();
+        bc.flush_bits::<CLAMP>();
     }
     debug_assert!(n.is_multiple_of(UNROLL));
 
@@ -974,7 +984,7 @@ fn compress1x_loop<const UNROLL: usize, const LAST_FAST: bool>(
             bc.add_bits::<0>(ct[src[n - u] as usize], true);
         }
         bc.add_bits::<0>(ct[src[n - UNROLL] as usize], LAST_FAST);
-        bc.flush_bits();
+        bc.flush_bits::<CLAMP>();
         n -= UNROLL;
     }
     debug_assert!(n.is_multiple_of(2 * UNROLL));
@@ -985,7 +995,7 @@ fn compress1x_loop<const UNROLL: usize, const LAST_FAST: bool>(
             bc.add_bits::<0>(ct[chunk[2 * UNROLL - u] as usize], true);
         }
         bc.add_bits::<0>(ct[chunk[UNROLL] as usize], LAST_FAST);
-        bc.flush_bits();
+        bc.flush_bits::<CLAMP>();
         // UNROLL symbols into container 1 (no dependency on container 0).
         bc.zero_index1();
         for u in 1..UNROLL {
@@ -993,7 +1003,7 @@ fn compress1x_loop<const UNROLL: usize, const LAST_FAST: bool>(
         }
         bc.add_bits::<1>(ct[chunk[0] as usize], LAST_FAST);
         bc.merge_index1();
-        bc.flush_bits();
+        bc.flush_bits::<CLAMP>();
     }
 }
 
@@ -1005,6 +1015,9 @@ fn tight_compress_bound(src_size: usize, table_log: u32) -> usize {
 
 /// libzstd's `HUF_compress1X_usingCTable`: one stream. Returns the size, or
 /// 0 if it didn't fit (or `dst` is under 9 bytes).
+///
+/// No BMI2 variant (libzstd has one): on Zen 3 it saves instructions but
+/// not cycles, measured on x-ray, dickens, mozilla and xml.
 pub(crate) fn huf_compress1x_using_ctable(dst: &mut [u8], src: &[u8], ct: &HufCTable) -> usize {
     let table_log = ct.table_log;
     let dst_size = dst.len();
@@ -1015,17 +1028,24 @@ pub(crate) fn huf_compress1x_using_ctable(dst: &mut [u8], src: &[u8], ct: &HufCT
         return 0;
     };
     let elts = &ct.elts;
-    if dst_size < tight_compress_bound(src.len(), table_log) || table_log > 11 {
-        compress1x_loop::<4, false>(&mut bc, src, elts);
+    // True if no code is longer than `table_log` bits (every table built or
+    // read here satisfies it; checked anyway, as the unclamped flushes of
+    // the fast loops rely on it).
+    let codes_fit = elts.iter().all(|&e| get_nb_bits(e) <= table_log);
+    if dst_size < tight_compress_bound(src.len(), table_log) || table_log > 11 || !codes_fit {
+        compress1x_loop::<4, false, true>(&mut bc, src, elts);
     } else {
-        // libzstd's 64-bit choices.
+        // libzstd's 64-bit choices, with its `kFastFlush`: the output has
+        // room for `src.len() * table_log` bits (`tight_compress_bound`)
+        // and every code is at most `table_log` bits (`codes_fit`), so no
+        // flush can pass `end` and the clamp is skipped.
         match table_log {
-            11 => compress1x_loop::<5, false>(&mut bc, src, elts),
-            10 => compress1x_loop::<5, true>(&mut bc, src, elts),
-            9 => compress1x_loop::<6, false>(&mut bc, src, elts),
-            8 => compress1x_loop::<7, false>(&mut bc, src, elts),
-            7 => compress1x_loop::<8, false>(&mut bc, src, elts),
-            _ => compress1x_loop::<9, true>(&mut bc, src, elts),
+            11 => compress1x_loop::<5, false, false>(&mut bc, src, elts),
+            10 => compress1x_loop::<5, true, false>(&mut bc, src, elts),
+            9 => compress1x_loop::<6, false, false>(&mut bc, src, elts),
+            8 => compress1x_loop::<7, false, false>(&mut bc, src, elts),
+            7 => compress1x_loop::<8, false, false>(&mut bc, src, elts),
+            _ => compress1x_loop::<9, true, false>(&mut bc, src, elts),
         }
     }
     bc.close()
