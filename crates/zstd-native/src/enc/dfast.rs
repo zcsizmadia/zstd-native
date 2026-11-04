@@ -6,13 +6,13 @@
 
 use super::fast::{
     DmsView, ExtWindow, HASH_READ_SIZE, K_SEARCH_STRENGTH, MatchState, SHORT_CACHE_TAG_BITS,
-    TableLoadMethod, compare_packed_tags, hash_mls, index_overlap_check, prefetch_l1,
-    write_tagged_index,
+    TableLoadMethod, compare_packed_tags, hash_mls, hash_prime, hash_with, index_overlap_check,
+    prefetch_l1, write_tagged_index,
 };
 use super::params::Strategy;
 use super::seq_store::{
-    REPCODE1_TO_OFFBASE, SeqStore, count, count_2segments, hash_at, hash8_ptr, offset_to_offbase,
-    read_le64, read32,
+    PRIME8BYTES, REPCODE1_TO_OFFBASE, SeqStore, count, count_2segments, hash_at, hash8_ptr,
+    offset_to_offbase, read_le64, read32,
 };
 
 /// `ZSTD_fillDoubleHashTableForCDict()`: as [`fill_double_hash_table`],
@@ -91,7 +91,7 @@ pub(crate) fn fill_double_hash_table(
 /// [`compress_block_fast`](super::fast::compress_block_fast). Picks the
 /// `ZSTD_compressBlock_doubleFast_noDict_<mls>` variant like libzstd
 /// (3 and other values use 4).
-#[inline(never)]
+#[inline(always)]
 pub(crate) fn compress_block_double_fast(
     ms: &mut MatchState,
     ss: &mut SeqStore,
@@ -106,6 +106,228 @@ pub(crate) fn compress_block_double_fast(
         6 => no_dict_generic::<6>(ms, ss, rep, buf, start, end),
         7 => no_dict_generic::<7>(ms, ss, rep, buf, start, end),
         _ => no_dict_generic::<4>(ms, ss, rep, buf, start, end),
+    }
+}
+
+/// Loop invariants of the noDict position search ([`search`]), laid out
+/// for the asm loop (`search_asm::dfast_search` reads it by field offset).
+#[repr(C)]
+pub(super) struct Search {
+    /// Return once the next position is at or past `lim`
+    /// ([`EXIT_LIMIT`]).
+    pub(super) lim: usize,
+    pub(super) step: usize,
+    /// Short hash: `(read64(p) * prime_s) >> shift_s` (see
+    /// [`hash_prime`]).
+    pub(super) prime_s: u64,
+    /// Long hash: `(read64(p) * prime_l) >> shift_l` (`ZSTD_hash8Ptr`).
+    pub(super) prime_l: u64,
+    pub(super) base: *const u8,
+    pub(super) hash_long: *mut u32,
+    pub(super) hash_small: *mut u32,
+    /// `prefixLowestIndex`.
+    pub(super) low: u64,
+    /// `1 - offset_1` (wrapping): the repcode candidate of `ip + 1` is at
+    /// `ip + rep_disp`.
+    pub(super) rep_disp: usize,
+    /// `64 - chainLog`.
+    pub(super) shift_s: u64,
+    /// `64 - hashLog`.
+    pub(super) shift_l: u64,
+    /// Readable window `[lowest, iend)`, for debug assertions.
+    pub(super) lowest: *const u8,
+    pub(super) iend: *const u8,
+}
+
+/// Position search state, in and out of [`search`].
+#[repr(C)]
+pub(super) struct Cursor {
+    pub(super) ip: *const u8,
+    pub(super) ip1: *const u8,
+    /// In: `hl0` (the long hash of `ip`). Out: `hl1` (of `ip1`), except at
+    /// [`EXIT_REP`].
+    pub(super) hl: usize,
+    /// In: `idxl0` (the long candidate of `ip`). Out: `idxl0` at
+    /// [`EXIT_REP`] / [`EXIT_LONG`], `idxl1` (of `ip1`) at [`EXIT_SHORT`] /
+    /// [`EXIT_LIMIT`].
+    pub(super) idxl: u64,
+    /// Out: `idxs0` (the short candidate of `ip`).
+    pub(super) idxs: u64,
+}
+
+/// [`search`] found a repcode match at `ip + 1`.
+pub(super) const EXIT_REP: u32 = 0;
+/// [`search`] found a long (8-byte) match at `ip`.
+pub(super) const EXIT_LONG: u32 = 1;
+/// [`search`] found a short (4-byte) match at `ip`.
+pub(super) const EXIT_SHORT: u32 = 2;
+/// No match at `ip`, and the next position (`ip1`, now `c.ip`, with its
+/// `hl`/`idxl` in `c`) is at or past `lim`: the caller updates the step and
+/// limits, sets `c.ip1` and continues.
+pub(super) const EXIT_LIMIT: u32 = 3;
+/// [`search_rust`] searched its `ITERS` positions without a match or
+/// limit (cursor at the next position).
+const EXIT_PAUSE: u32 = 4;
+
+/// [`search_rust`], or its `asm!` version on x86-64 with BMI2 (`use_asm`;
+/// the asm loop has no `offset_1 == 0` case, `s.rep_disp` is then unused).
+///
+/// # Safety
+/// As [`search_rust`].
+#[allow(unsafe_code)]
+#[inline(always)]
+unsafe fn search<const MLS: u32>(s: &Search, c: &mut Cursor, offset_1: u32, use_asm: bool) -> u32 {
+    #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+    if use_asm && offset_1 != 0 {
+        debug_assert!(s.rep_disp == 1usize.wrapping_sub(offset_1 as usize));
+        // The first positions in Rust: matches are often found right away
+        // (text), where entering the asm costs more than it saves.
+        // SAFETY: per the caller.
+        let exit = unsafe { search_rust::<MLS, 4>(s, c, offset_1) };
+        if exit != EXIT_PAUSE {
+            return exit;
+        }
+        // SAFETY: per the caller; `use_asm` is only set with BMI2.
+        return unsafe { super::search_asm::dfast_search(s, c) };
+    }
+    let _ = use_asm;
+    // SAFETY: per the caller.
+    unsafe { search_rust::<MLS, 0>(s, c, offset_1) }
+}
+
+/// The inner loop of `ZSTD_compressBlock_doubleFast_noDict_generic`
+/// (positions `ip`, `ip1 = ip + step`, ...): inserts each position in both
+/// tables, checks the repcode at `ip + 1`, then the long and the short
+/// candidates at `ip`, until one matches or the next position reaches
+/// `lim`. Returns the `EXIT_*` code with `c` describing the position (see
+/// [`Cursor`]).
+///
+/// # Safety
+/// The invariants of `no_dict_generic`: `ip < ip1 <= iend - 8`, and
+/// `ip + step <= iend - 8` for every position `ip < lim`; the index of
+/// `ip` is at least `s.low`; `ip + 1 - offset_1` is readable; the tables
+/// have `1 << h_bits` entries.
+#[allow(unsafe_code)]
+#[inline(always)]
+unsafe fn search_rust<const MLS: u32, const ITERS: usize>(
+    s: &Search,
+    c: &mut Cursor,
+    offset_1: u32,
+) -> u32 {
+    // ~random data, unlikely to match: read instead of the table candidate
+    // when that is invalid, to avoid an unpredictable branch.
+    static DUMMY: [u8; 10] = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0xe2, 0xb4];
+    let chk = |p: *const u8, n: usize| {
+        debug_assert!(
+            (p as usize) >= (s.lowest as usize) && (p as usize) + n <= (s.iend as usize),
+            "read out of the window"
+        );
+    };
+    let mut ip = c.ip;
+    let mut ip1 = c.ip1;
+    let mut hl0 = c.hl;
+    let mut idxl0 = c.idxl as u32;
+    let mut iters = 0usize;
+    let (step, lim, low) = (s.step, s.lim, s.low as u32);
+    // SAFETY: per the function contract; candidates are only read when
+    // their index is at least `s.low`.
+    unsafe {
+        loop {
+            chk(ip, HASH_READ_SIZE);
+            chk(ip1, HASH_READ_SIZE);
+            let curr = (ip as usize).wrapping_sub(s.base as usize) as u32;
+            debug_assert!(curr >= low);
+            let hs0 = hash_with(ip, hash_prime::<MLS>(), s.shift_s);
+            let idxs0 = *s.hash_small.add(hs0);
+
+            // update hash tables
+            *s.hash_long.add(hl0) = curr;
+            *s.hash_small.add(hs0) = curr;
+
+            // check noDict repcode (`ip + 1 - 0` is readable, so the bytes
+            // are compared first: one branch per position)
+            let r = ip.wrapping_add(1).wrapping_sub(offset_1 as usize);
+            chk(r, 4);
+            if (read32(r) ^ read32(ip.add(1))) | u32::from(offset_1 == 0) == 0 {
+                *c = Cursor {
+                    ip,
+                    ip1,
+                    hl: hl0,
+                    idxl: u64::from(idxl0),
+                    idxs: u64::from(idxs0),
+                };
+                return EXIT_REP;
+            }
+
+            let hl1 = hash_with(ip1, PRIME8BYTES, s.shift_l);
+
+            // check prefix long match (the branchless select is libzstd's
+            // ZSTD_selectAddr)
+            let matchl0 = s.base.wrapping_add(idxl0 as usize);
+            let l0_valid = idxl0 >= low;
+            let matchl0_safe = core::hint::select_unpredictable(l0_valid, matchl0, DUMMY.as_ptr());
+            if l0_valid {
+                chk(matchl0_safe, 8);
+            }
+            if read_le64(matchl0_safe) == read_le64(ip) && l0_valid {
+                *c = Cursor {
+                    ip,
+                    ip1,
+                    hl: hl1,
+                    idxl: u64::from(idxl0),
+                    idxs: u64::from(idxs0),
+                };
+                return EXIT_LONG;
+            }
+
+            let idxl1 = *s.hash_long.add(hl1);
+
+            // check prefix short match
+            let matchs0 = s.base.wrapping_add(idxs0 as usize);
+            let s0_valid = idxs0 >= low;
+            let matchs0_safe = core::hint::select_unpredictable(s0_valid, matchs0, DUMMY.as_ptr());
+            if s0_valid {
+                chk(matchs0_safe, 4);
+            }
+            if read32(matchs0_safe) == read32(ip) && s0_valid {
+                *c = Cursor {
+                    ip,
+                    ip1,
+                    hl: hl1,
+                    idxl: u64::from(idxl1),
+                    idxs: u64::from(idxs0),
+                };
+                return EXIT_SHORT;
+            }
+
+            ip = ip1;
+            ip1 = ip1.wrapping_add(step);
+            hl0 = hl1;
+            idxl0 = idxl1;
+            if ip as usize >= lim {
+                *c = Cursor {
+                    ip,
+                    ip1,
+                    hl: hl0,
+                    idxl: u64::from(idxl0),
+                    idxs: u64::from(idxs0),
+                };
+                return EXIT_LIMIT;
+            }
+            if ITERS != 0 {
+                iters += 1;
+                if iters == ITERS {
+                    *c = Cursor {
+                        ip,
+                        ip1,
+                        hl: hl0,
+                        idxl: u64::from(idxl0),
+                        idxs: 0,
+                    };
+                    return EXIT_PAUSE;
+                }
+            }
+        }
     }
 }
 
@@ -127,9 +349,6 @@ fn no_dict_generic<const MLS: u32>(
     start: usize,
     end: usize,
 ) -> usize {
-    // ~random data, unlikely to match: read instead of the table candidate
-    // when that is invalid, to avoid an unpredictable branch.
-    static DUMMY: [u8; 10] = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0xe2, 0xb4];
     // how many positions to search before increasing step size
     const K_STEP_INCR: usize = 1 << K_SEARCH_STRENGTH;
 
@@ -145,6 +364,8 @@ fn no_dict_generic<const MLS: u32>(
     let window_start = ms.window.pos(ms.window.dict_limit);
     assert!(window_start <= start, "window start is not in the buffer");
     assert!(end.wrapping_sub(ms.window.base) <= u32::MAX as usize);
+    // Room for the sequences stored with `store_seq_unchecked`.
+    ss.reserve(end - start);
 
     let bp = buf.as_ptr();
     let base = bp.wrapping_add(ms.window.base);
@@ -204,6 +425,23 @@ fn no_dict_generic<const MLS: u32>(
             hash_mls::<MLS>(p, h_bits_s)
         };
 
+        let use_asm = crate::cpu::Features::detect().bmi2;
+        let mut s = Search {
+            lim: 0,
+            step: 1,
+            prime_s: hash_prime::<MLS>(),
+            prime_l: PRIME8BYTES,
+            base,
+            hash_long,
+            hash_small,
+            low: u64::from(prefix_lowest_index),
+            rep_disp: 0,
+            shift_s: u64::from(64 - h_bits_s),
+            shift_l: u64::from(64 - h_bits_l),
+            lowest,
+            iend,
+        };
+
         // Outer loop: one iteration per match found and stored.
         'outer: loop {
             let mut step = 1usize;
@@ -213,38 +451,58 @@ fn no_dict_generic<const MLS: u32>(
             if ip1 > ilimit {
                 break 'outer;
             }
+            // One limit for the two end-of-position tests (`ip1 >=
+            // nextStep`, and `ip1 + step > ilimit` after advancing): while
+            // `ip1 < lim` neither fires.
+            s.lim = (next_step as usize).min((ilimit as usize + 1).wrapping_sub(step));
+            s.step = step;
+            s.rep_disp = 1usize.wrapping_sub(offset_1 as usize);
 
-            let mut hl0 = hash_l(ip);
-            let mut idxl0 = *hash_long.add(hl0);
-            let mut matchl0 = base.wrapping_add(idxl0 as usize);
-            let mut hl1 = 0usize;
-            let mut curr: u32;
+            let hl0 = hash_l(ip);
+            let mut cur = Cursor {
+                ip,
+                ip1,
+                hl: hl0,
+                idxl: u64::from(*hash_long.add(hl0)),
+                idxs: 0,
+            };
+            let hl1: usize;
+            let curr: u32;
 
-            // Inner loop: one iteration per search / position. Yields
-            // `Some((offset, mLength))` for a match to store (with `ip`
-            // moved to its start), `None` for a stored repcode match.
+            // Inner loop: the position search, until it finds a candidate
+            // (or a step / limit check is due). Yields `Some((offset,
+            // mLength))` for a match to store (with `ip` moved to its
+            // start), `None` for a stored repcode match.
             let found: Option<(u32, usize)>;
             let m_length: usize;
             loop {
-                let hs0 = hash_s(ip);
-                let idxs0 = *hash_small.add(hs0);
+                let exit = search::<MLS>(&s, &mut cur, offset_1, use_asm);
+                if exit == EXIT_LIMIT {
+                    ip1 = cur.ip;
+                    if ip1 >= next_step {
+                        prefetch_l1(ip1.wrapping_add(64));
+                        prefetch_l1(ip1.wrapping_add(128));
+                        step += 1;
+                        next_step = next_step.wrapping_add(K_STEP_INCR);
+                    }
+                    if ip1.wrapping_add(step) > ilimit {
+                        break 'outer;
+                    }
+                    s.lim = (next_step as usize).min((ilimit as usize + 1).wrapping_sub(step));
+                    s.step = step;
+                    // `cur` is at ip1 already
+                    cur.ip1 = ip1.wrapping_add(step);
+                    continue;
+                }
+                ip = cur.ip;
+                ip1 = cur.ip1;
                 curr = idx(ip);
-                let mut matchs0 = base.wrapping_add(idxs0 as usize);
-
-                // update hash tables
-                *hash_long.add(hl0) = curr;
-                *hash_small.add(hs0) = curr;
-
-                // check noDict repcode
-                if offset_1 > 0 && {
-                    let r = ip.wrapping_add(1).wrapping_sub(offset_1 as usize);
-                    chk(r, 4);
-                    read32(r) == read32(ip.add(1))
-                } {
+                hl1 = cur.hl;
+                if exit == EXIT_REP {
                     let r = ip.add(1 + 4).sub(offset_1 as usize);
                     let m = count(ip.add(1 + 4), r, iend) + 4;
                     ip = ip.add(1);
-                    ss.store_seq(
+                    ss.store_seq_unchecked(
                         buf,
                         anchor as usize - bp as usize,
                         ip as usize - anchor as usize,
@@ -254,20 +512,9 @@ fn no_dict_generic<const MLS: u32>(
                     );
                     found = None;
                     m_length = m;
-                    break;
-                }
-
-                hl1 = hash_l(ip1);
-
-                // check prefix long match (the branchless select is
-                // libzstd's ZSTD_selectAddr)
-                let l0_valid = idxl0 >= prefix_lowest_index;
-                let matchl0_safe =
-                    core::hint::select_unpredictable(l0_valid, matchl0, DUMMY.as_ptr());
-                if l0_valid {
-                    chk(matchl0_safe, 8);
-                }
-                if read_le64(matchl0_safe) == read_le64(ip) && l0_valid {
+                } else if exit == EXIT_LONG {
+                    let mut matchl0 = base.wrapping_add(cur.idxl as usize);
+                    chk(matchl0, 8);
                     let mut m = count(ip.add(8), matchl0.add(8), iend) + 8;
                     let offset = (ip as usize - matchl0 as usize) as u32;
                     // catch up
@@ -280,22 +527,13 @@ fn no_dict_generic<const MLS: u32>(
                     }
                     found = Some((offset, m));
                     m_length = m;
-                    break;
-                }
-
-                let idxl1 = *hash_long.add(hl1);
-                let matchl1 = base.wrapping_add(idxl1 as usize);
-
-                // check prefix short match
-                let s0_valid = idxs0 >= prefix_lowest_index;
-                let matchs0_safe =
-                    core::hint::select_unpredictable(s0_valid, matchs0, DUMMY.as_ptr());
-                if s0_valid {
-                    chk(matchs0_safe, 4);
-                }
-                if read32(matchs0_safe) == read32(ip) && s0_valid {
+                } else {
                     // _search_next_long: short match found, check for a
                     // longer one
+                    let idxl1 = cur.idxl as u32;
+                    let matchl1 = base.wrapping_add(idxl1 as usize);
+                    let mut matchs0 = base.wrapping_add(cur.idxs as usize);
+                    chk(matchs0, 4);
                     let mut m = count(ip.add(4), matchs0.add(4), iend) + 4;
                     let mut offset = (ip as usize - matchs0 as usize) as u32;
 
@@ -324,25 +562,8 @@ fn no_dict_generic<const MLS: u32>(
                     }
                     found = Some((offset, m));
                     m_length = m;
-                    break;
                 }
-
-                if ip1 >= next_step {
-                    prefetch_l1(ip1.wrapping_add(64));
-                    prefetch_l1(ip1.wrapping_add(128));
-                    step += 1;
-                    next_step = next_step.wrapping_add(K_STEP_INCR);
-                }
-                ip = ip1;
-                ip1 = ip1.wrapping_add(step);
-
-                hl0 = hl1;
-                idxl0 = idxl1;
-                matchl0 = matchl1;
-
-                if ip1 > ilimit {
-                    break 'outer;
-                }
+                break;
             }
 
             if let Some((offset, m)) = found {
@@ -356,7 +577,7 @@ fn no_dict_generic<const MLS: u32>(
                     *hash_long.add(hl1) = idx(ip1);
                 }
 
-                ss.store_seq(
+                ss.store_seq_unchecked(
                     buf,
                     anchor as usize - bp as usize,
                     ip as usize - anchor as usize,
@@ -391,7 +612,7 @@ fn no_dict_generic<const MLS: u32>(
                     core::mem::swap(&mut offset_1, &mut offset_2);
                     *hash_small.add(hash_s(ip)) = idx(ip);
                     *hash_long.add(hash_l(ip)) = idx(ip);
-                    ss.store_seq(
+                    ss.store_seq_unchecked(
                         buf,
                         anchor as usize - bp as usize,
                         0,
@@ -429,7 +650,7 @@ fn no_dict_generic<const MLS: u32>(
 /// `ZSTD_compressBlock_doubleFast_extDict()`: as
 /// [`compress_block_double_fast`], for a window with an extDict segment
 /// (see [`compress_block_fast_ext_dict`](super::fast::compress_block_fast_ext_dict)).
-#[inline(never)]
+#[inline(always)]
 pub(crate) fn compress_block_double_fast_ext_dict(
     ms: &mut MatchState,
     ss: &mut SeqStore,
@@ -699,7 +920,7 @@ fn ext_dict_generic<const MLS: u32>(
 /// `ZSTD_compressBlock_doubleFast_dictMatchState()`: as
 /// [`compress_block_double_fast`], with an attached dictionary
 /// ([`MatchState::dms`]) whose tagged tables are searched too.
-#[inline(never)]
+#[inline(always)]
 pub(crate) fn compress_block_double_fast_dict_match_state(
     ms: &mut MatchState,
     ss: &mut SeqStore,

@@ -66,6 +66,8 @@ pub(crate) mod opt;
 pub(crate) mod params;
 pub(crate) mod presplit;
 pub(crate) mod row;
+#[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+pub(crate) mod search_asm;
 pub(crate) mod seq_store;
 pub(crate) mod sequences;
 pub(crate) mod split;

@@ -241,6 +241,82 @@ impl SeqStore {
         self.nb_seq = n + 1;
     }
 
+    /// Asserts the room for the sequences a match finder can store from
+    /// the `len` input bytes of a block range: at most `len` literals and
+    /// `len / 4` sequences (every match is at least 4 bytes long). After
+    /// this, [`store_seq_unchecked`](Self::store_seq_unchecked) can store
+    /// such sequences without per-sequence checks.
+    #[inline]
+    pub(crate) fn reserve(&self, len: usize) {
+        assert!(self.max_nb_seq <= self.sequences.len());
+        assert!(self.nb_seq + len / 4 <= self.max_nb_seq);
+        assert!(self.max_nb_lit + WILDCOPY_OVERLENGTH <= self.lit_buf.len());
+        assert!(self.lit_len + len <= self.max_nb_lit);
+    }
+
+    /// [`store_seq`](Self::store_seq) without its checks, for the
+    /// `fast`/`dfast` hot loops (libzstd's `ZSTD_storeSeq` has none).
+    ///
+    /// # Safety
+    /// `lit_start + lit_length <= lit_limit <= src.len()`, and the
+    /// sequence is one of those [`reserve`](Self::reserve)d: the match is
+    /// at least 4 bytes long and, with the earlier ones of the range, takes
+    /// its literals and match from the reserved range.
+    #[allow(unsafe_code)]
+    #[inline(always)]
+    pub(crate) unsafe fn store_seq_unchecked(
+        &mut self,
+        src: &[u8],
+        lit_start: usize,
+        lit_length: usize,
+        lit_limit: usize,
+        off_base: u32,
+        match_length: usize,
+    ) {
+        debug_assert!(lit_start + lit_length <= lit_limit && lit_limit <= src.len());
+        debug_assert!(self.lit_len + lit_length <= self.max_nb_lit);
+        debug_assert!(self.nb_seq < self.max_nb_seq && self.max_nb_seq <= self.sequences.len());
+        debug_assert!(match_length >= 4);
+        // SAFETY: as in `store_seq`, with its asserts guaranteed by the
+        // caller (`reserve`).
+        unsafe {
+            let ip = src.as_ptr().add(lit_start);
+            let op = self.lit_buf.as_mut_ptr().add(self.lit_len);
+            if lit_start + lit_length + WILDCOPY_OVERLENGTH <= lit_limit {
+                ptr::copy_nonoverlapping(ip, op, 16);
+                let mut i = 16;
+                while i < lit_length {
+                    ptr::copy_nonoverlapping(ip.add(i), op.add(i), 16);
+                    i += 16;
+                }
+            } else {
+                ptr::copy_nonoverlapping(ip, op, lit_length);
+            }
+        }
+        self.lit_len += lit_length;
+        let n = self.nb_seq;
+        if lit_length > 0xFFFF {
+            debug_assert!(self.long_length_type == LongLengthType::None);
+            self.long_length_type = LongLengthType::LiteralLength;
+            self.long_length_pos = n as u32;
+        }
+        let ml_base = match_length - MINMATCH as usize;
+        if ml_base > 0xFFFF {
+            debug_assert!(self.long_length_type == LongLengthType::None);
+            self.long_length_type = LongLengthType::MatchLength;
+            self.long_length_pos = n as u32;
+        }
+        // SAFETY: `n < max_nb_seq <= sequences.len()` (caller, `reserve`).
+        unsafe {
+            *self.sequences.as_mut_ptr().add(n) = SeqDef {
+                off_base,
+                lit_length: lit_length as u16,
+                ml_base: ml_base as u16,
+            };
+        }
+        self.nb_seq = n + 1;
+    }
+
     /// `ZSTD_storeSeq()`: copies `src[lit_start..lit_start + lit_length]`
     /// to the literal buffer and stores the sequence. Like libzstd it may
     /// read up to `WILDCOPY_OVERLENGTH` bytes past the literals as long as
