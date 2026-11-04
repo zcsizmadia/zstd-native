@@ -1,0 +1,21 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directories: ["/", "/fuzz"]
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    ignore:
+      # Its tags are Rust versions (@1.89 would "update" to unreleased ones);
+      # the toolchain is passed as an input and the action pinned by hand.
+      - dependency-name: dtolnay/rust-toolchain
+    groups:
+      actions:
+        patterns: ["*"]
