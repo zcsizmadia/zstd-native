@@ -1,6 +1,6 @@
 use core::fmt;
 
-/// Errors returned by the decoder.
+/// Errors returned by the decoder and the encoder.
 ///
 /// Corrupt input never panics or reads out of bounds; it returns one of
 /// these.
@@ -27,6 +27,12 @@ pub enum Error {
     OutputTooSmall,
     /// The decompressed size is larger than this platform can hold in memory.
     OutputTooLarge,
+    /// The compressor got a different amount of input than the pledged
+    /// source size.
+    SrcSizeWrong,
+    /// The operation is not possible at this stage of a stream (for example,
+    /// setting the pledged source size in the middle of a frame).
+    StageWrong,
 }
 
 impl fmt::Display for Error {
@@ -42,6 +48,8 @@ impl fmt::Display for Error {
             Error::InvalidDictionary => "invalid dictionary",
             Error::OutputTooSmall => "output buffer is too small",
             Error::OutputTooLarge => "decompressed size is too large",
+            Error::SrcSizeWrong => "input size differs from the pledged source size",
+            Error::StageWrong => "operation not possible at this stage of the stream",
         })
     }
 }

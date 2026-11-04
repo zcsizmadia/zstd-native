@@ -1,8 +1,11 @@
-//! `std::io` adapters.
+//! `std::io` adapters: [`Decoder`] (`Read`) and [`Encoder`] (`Write`).
 
-use std::io::{self, BufRead, BufReader, Read};
+use std::boxed::Box;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::vec;
 
 use crate::dict::Dictionary;
+use crate::enc::{EndOp, StreamEncoder};
 use crate::error::Error;
 use crate::stream::StreamDecoder;
 
@@ -109,5 +112,126 @@ impl<R: BufRead> Read for Decoder<R> {
                 };
             }
         }
+    }
+}
+
+/// The output buffer size of [`Encoder`]: libzstd's `ZSTD_CStreamOutSize()`
+/// (a full block's compressed bound, a block header and a checksum).
+const ENCODER_BUF_SIZE: usize = crate::compress_bound(128 << 10) + 3 + 4;
+
+/// Compresses into a writer (`std::io::Write`), like the `zstd` crate's
+/// `Encoder`: one zstd frame, ended by [`finish`](Encoder::finish). The
+/// output is byte-identical to libzstd 1.5.7's streaming compressor's
+/// (`ZSTD_compressStream2`) for the same level, writes and flushes.
+///
+/// ```
+/// use std::io::Write;
+/// let mut enc = zstd_native::Encoder::new(Vec::new(), 3);
+/// enc.write_all(b"hello hello hello hello")?;
+/// let compressed = enc.finish()?;
+/// assert_eq!(zstd_native::decompress(&compressed).unwrap(), b"hello hello hello hello");
+/// # Ok::<(), std::io::Error>(())
+/// ```
+///
+/// [`flush`](Write::flush) compresses the data written so far and writes
+/// it out (`ZSTD_e_flush`), without ending the frame. Dropping the encoder
+/// without calling [`finish`](Encoder::finish) leaves the frame
+/// incomplete. Errors are [`io::ErrorKind::InvalidInput`] for a pledged
+/// size that doesn't match, [`io::ErrorKind::InvalidData`] for the others
+/// (the source is an [`Error`]).
+#[derive(Debug)]
+pub struct Encoder<W: Write> {
+    writer: W,
+    enc: StreamEncoder,
+    buf: Box<[u8]>,
+}
+
+impl<W: Write> Encoder<W> {
+    /// Compresses at `level` (see [`compress`](crate::compress)) into `writer`.
+    pub fn new(writer: W, level: i32) -> Self {
+        Encoder {
+            writer,
+            enc: StreamEncoder::new(level),
+            buf: vec![0u8; ENCODER_BUF_SIZE].into_boxed_slice(),
+        }
+    }
+
+    /// Declares the size of the data to be written (see
+    /// [`StreamEncoder::set_pledged_src_size`]): the frame header then
+    /// holds it. Must be called before the first write.
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::InvalidInput`] after the first write.
+    pub fn set_pledged_src_size(&mut self, size: Option<u64>) -> io::Result<()> {
+        self.enc
+            .set_pledged_src_size(size)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+    }
+
+    /// The underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.writer
+    }
+
+    /// The underlying writer, mutably (writing to it directly corrupts the
+    /// compressed stream).
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.writer
+    }
+
+    /// Ends the frame (`ZSTD_e_end`), writes out everything and returns the
+    /// writer.
+    ///
+    /// # Errors
+    ///
+    /// As the writer's, or as [`StreamEncoder::compress`].
+    pub fn finish(mut self) -> io::Result<W> {
+        self.run(EndOp::End)?;
+        self.writer.flush()?;
+        Ok(self.writer)
+    }
+
+    /// Runs `op` (flush or end) with no more input until it completes.
+    fn run(&mut self, op: EndOp) -> io::Result<()> {
+        loop {
+            let p = self.enc.compress(&[], &mut self.buf, op).map_err(enc_err)?;
+            self.writer.write_all(&self.buf[..p.written])?;
+            if p.remaining == 0 {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Maps a compression error to an I/O error.
+fn enc_err(e: Error) -> io::Error {
+    let kind = match e {
+        Error::SrcSizeWrong | Error::StageWrong => io::ErrorKind::InvalidInput,
+        _ => io::ErrorKind::InvalidData,
+    };
+    io::Error::new(kind, e)
+}
+
+impl<W: Write> Write for Encoder<W> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let p = self
+                .enc
+                .compress(data, &mut self.buf, EndOp::Continue)
+                .map_err(enc_err)?;
+            self.writer.write_all(&self.buf[..p.written])?;
+            if p.read > 0 {
+                return Ok(p.read);
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.run(EndOp::Flush)?;
+        self.writer.flush()
     }
 }

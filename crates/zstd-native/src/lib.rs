@@ -1,5 +1,6 @@
-//! Pure Rust Zstandard (zstd, RFC 8878) decompression, built to match or
-//! beat C libzstd 1.5.7 in speed. No C code, `no_std` + `alloc` capable.
+//! Pure Rust Zstandard (zstd, RFC 8878) decompression and compression,
+//! built to match or beat C libzstd 1.5.7 in speed. No C code, `no_std` +
+//! `alloc` capable.
 //!
 //! # One-shot
 //!
@@ -26,6 +27,22 @@
 //! let mut text = String::new();
 //! zstd_native::Decoder::new(compressed).read_to_string(&mut text)?;
 //! # assert_eq!(text, "hello");
+//! # Ok::<(), std::io::Error>(())
+//! ```
+//!
+//! # Compression
+//!
+//! [`compress`] (and [`Compressor`], [`compress_to_slice`]) produce the
+//! same bytes as libzstd 1.5.7 at every level. [`Encoder`] compresses into
+//! any `std::io::Write`; [`StreamEncoder`] is the push API underneath
+//! (libzstd's `ZSTD_compressStream2`, byte-identical for the same calls).
+//!
+//! ```
+//! use std::io::Write;
+//! let mut enc = zstd_native::Encoder::new(Vec::new(), 3);
+//! enc.write_all(b"hello, hello, hello")?;
+//! let compressed = enc.finish()?;
+//! assert_eq!(zstd_native::decompress(&compressed).unwrap(), b"hello, hello, hello");
 //! # Ok::<(), std::io::Error>(())
 //! ```
 //!
@@ -62,11 +79,13 @@ mod xxhash;
 
 pub use decoder::{Decompressor, content_size, decompress, decompress_to_slice};
 pub use dict::Dictionary;
-pub use enc::{Compressor, compress, compress_bound, compress_to_slice};
+pub use enc::{
+    CompressProgress, Compressor, EndOp, StreamEncoder, compress, compress_bound, compress_to_slice,
+};
 pub use error::Error;
 pub use frame::FrameHeader;
 #[cfg(feature = "std")]
-pub use io::Decoder;
+pub use io::{Decoder, Encoder};
 pub use stream::{Progress, StreamDecoder};
 pub use xxhash::xxh64;
 

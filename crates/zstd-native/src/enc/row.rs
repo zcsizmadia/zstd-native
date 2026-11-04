@@ -1,7 +1,7 @@
 //! The row-based match finder of the greedy, lazy and lazy2 strategies
 //! (`windowLog > 14`): a port of libzstd 1.5.7's "(SIMD) Row-based
 //! matchfinder" (`compress/zstd_lazy.c`, `ZSTD_RowFindBestMatch` and
-//! helpers), no-dictionary path. The parser is in [`lazy`](super::lazy).
+//! helpers), noDict and extDict paths. The parser is in [`lazy`](super::lazy).
 //!
 //! The hash table is split into rows of `1 << rowLog` indices (`rowLog =
 //! clamp(searchLog, 4, 6)`); a position's salted hash
@@ -290,7 +290,7 @@ unsafe fn match_bits_swar<const ROW_LOG: u32>(tag_row: *const u8, tag: u8) -> u6
     !matches
 }
 
-/// `ZSTD_RowFindBestMatch()` (noDict): the longest match at `ip` among
+/// `ZSTD_RowFindBestMatch()` (noDict, or extDict with `EXT`): the longest match at `ip` among
 /// the row candidates whose tag matches (at most `1 << min(searchLog,
 /// rowLog)`). Inserts the positions up to `ip` included (only `ip` in lazy
 /// skipping mode) and collects the hash in `hashSaltEntropy`. Returns the
@@ -302,7 +302,7 @@ unsafe fn match_bits_swar<const ROW_LOG: u32>(tag_row: *const u8, tag: u8) -> u6
 /// `nextToUpdate`.
 #[allow(unsafe_code)]
 #[inline(never)]
-pub(super) unsafe fn row_find_best_match<const MLS: u32, const ROW_LOG: u32>(
+pub(super) unsafe fn row_find_best_match<const MLS: u32, const ROW_LOG: u32, const EXT: bool>(
     s: &mut Searcher,
     ip: *const u8,
     ilimit: *const u8,
@@ -358,7 +358,11 @@ pub(super) unsafe fn row_find_best_match<const MLS: u32, const ROW_LOG: u32>(
             if match_index < low_limit {
                 break;
             }
-            prefetch_l1(s.pos(match_index));
+            if EXT {
+                prefetch_l1(s.ext_pos(match_index));
+            } else {
+                prefetch_l1(s.pos(match_index));
+            }
             match_buffer[num_matches] = match_index;
             num_matches += 1;
             nb_attempts -= 1;
@@ -378,11 +382,20 @@ pub(super) unsafe fn row_find_best_match<const MLS: u32, const ROW_LOG: u32>(
         for &match_index in &match_buffer[..num_matches] {
             let mut current_ml = 0;
             debug_assert!(match_index < curr && match_index >= low_limit);
-            let m = s.pos(match_index);
-            s.chk(m.wrapping_add(ml - 3), 4);
-            // read 4B starting from (match + ml + 1 - sizeof(U32))
-            if read32(m.add(ml - 3)) == read32(ip.add(ml - 3)) {
-                current_ml = count(ip, m, ilimit);
+            if !EXT || match_index >= s.dict_limit {
+                let m = s.pos(match_index);
+                s.chk(m.wrapping_add(ml - 3), 4);
+                // read 4B starting from (match + ml + 1 - sizeof(U32))
+                if read32(m.add(ml - 3)) == read32(ip.add(ml - 3)) {
+                    current_ml = count(ip, m, ilimit);
+                }
+            } else {
+                let m = s.dict_base.wrapping_add(match_index as usize);
+                s.chk(m, 4);
+                // assumption: matchIndex <= dictLimit - 4 (by table construction)
+                if read32(m) == read32(ip) {
+                    current_ml = s.count_ext(ip.add(4), m.add(4), ilimit) + 4;
+                }
             }
             // Save best solution
             if current_ml > ml {

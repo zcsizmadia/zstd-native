@@ -121,8 +121,13 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
    btultra2's two-pass first block, `enc/opt.rs`) and the post-block
    splitter (`enc/split.rs`, #9), 0.9-1.05x libzstd's speed in first
    measurements. Long distance matching (auto-enabled by libzstd at
-   level 22 above 64 MiB) is reported as `UnsupportedFrameParameter`.
-   Next: speed (#17), streaming/dictionaries/multithreading (#10), LDM.
+   level 22 above 64 MiB or for unknown sizes) is reported as
+   `UnsupportedFrameParameter`. Streaming compression (#10, `enc/stream.rs`,
+   `io.rs`): a port of `ZSTD_compressStream2` in buffered mode (input
+   ring buffer of window + block, libzstd's end-of-input shortcut, flush
+   and end), with the extDict variants of every match finder for the
+   wrapped ring; byte-identical with libzstd for the same calls.
+   Next: speed (#17), dictionaries, multithreading, LDM.
 4. Multithreaded compression, dictionaries for the encoder, long distance
    matching.
 5. Fuzzing (cargo-fuzz, differential vs libzstd), Miri, CI matrix

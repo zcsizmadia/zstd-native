@@ -14,16 +14,21 @@
 //!   (compress/zstd_compress_internal.h)
 //! - `params`: compression levels and parameter adjustment (clevels.h,
 //!   `ZSTD_getCParams_internal`, `ZSTD_adjustCParams_internal`)
-//! - `fast`: compress/zstd_fast.c
-//! - `dfast`: compress/zstd_double_fast.c
+//! - `fast`: compress/zstd_fast.c (noDict and extDict variants; the window)
+//! - `dfast`: compress/zstd_double_fast.c (noDict and extDict)
 //! - `lazy`: compress/zstd_lazy.c (greedy, lazy, lazy2, btlazy2: parser,
-//!   hash chain and binary tree)
+//!   hash chain and binary tree; noDict and extDict)
 //! - `row`: compress/zstd_lazy.c (the row-based match finder)
 //! - `opt`: compress/zstd_opt.c (btopt, btultra, btultra2: price model,
-//!   binary tree match finder, optimal parser)
+//!   binary tree match finder, optimal parser; noDict and extDict)
 //! - `presplit`: compress/zstd_preSplit.c
 //! - `split`: the post-block splitter from compress/zstd_compress.c
 //!   (`ZSTD_compressBlock_splitBlock`)
+//! - `stream`: streaming compression from compress/zstd_compress.c
+//!   (`ZSTD_compressStream2`, `ZSTD_compressStream_generic` in buffered
+//!   mode, `ZSTD_CCtx_init_compressStream2`); the input ring buffer makes
+//!   the window non-contiguous, which the match finders' extDict variants
+//!   handle
 #![allow(dead_code)] // filled in step by step (issue #6)
 
 pub(crate) mod bitwriter;
@@ -42,8 +47,10 @@ pub(crate) mod row;
 pub(crate) mod seq_store;
 pub(crate) mod sequences;
 pub(crate) mod split;
+pub(crate) mod stream;
 
 pub use compress::compress_bound;
+pub use stream::{CompressProgress, EndOp, StreamEncoder};
 
 /// Compresses `src` into one zstd frame at `level` (1 to 22, negative for
 /// faster; 0 means the default, 3), like libzstd's `ZSTD_compress`: the

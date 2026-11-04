@@ -9,13 +9,15 @@ types, dictionaries, checksums, concatenated and skippable frames, tested
 against libzstd.
 
 The encoder is in progress: its output is byte-identical to libzstd's for
-the same input and level. All levels work (negative and 1 to 22: every
-strategy from `fast` to `btultra2`, with libzstd's block splitters), at
-about 0.9-0.96x libzstd's speed for `fast`/`dfast`, on par for the lazy
+the same input and level, one-shot and streaming (`std::io::Write` and a
+`no_std` push API matching `ZSTD_compressStream2` call for call, flushes
+included). All levels work (negative and 1 to 22: every strategy from
+`fast` to `btultra2`, with libzstd's block splitters), at about
+0.9-0.96x libzstd's speed for `fast`/`dfast`, on par for the lazy
 strategies and 0.9-1.05x for the optimal parser (first measurements).
 Not yet: long distance matching, which libzstd turns on by itself only
-at level 22 for inputs over 64 MiB (`UnsupportedFrameParameter`),
-streaming compression, dictionaries and multithreading (issue #10).
+at level 22 for inputs over 64 MiB or of unknown size
+(`UnsupportedFrameParameter`), dictionaries and multithreading.
 
 ```rust
 let compressed = zstd_native::compress(&data, 1)?; // same bytes as libzstd
@@ -28,6 +30,12 @@ let n = d.decompress_to_slice(&compressed, &mut buffer)?;
 // Streaming from any reader:
 let mut out = Vec::new();
 std::io::copy(&mut zstd_native::Decoder::new(file), &mut out)?;
+
+// Streaming compression into any writer (same bytes as libzstd's
+// ZSTD_compressStream2 for the same writes and flushes):
+let mut enc = zstd_native::Encoder::new(Vec::new(), 3);
+std::io::copy(&mut file, &mut enc)?;
+let compressed = enc.finish()?;
 ```
 
 ## Speed
