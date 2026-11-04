@@ -67,6 +67,8 @@ struct Frame {
     window_log: u32,
     ldm: bool,
     pledged: Option<u64>,
+    /// `ZSTD_c_checksumFlag`
+    checksum: bool,
     ops: Vec<(usize, EndOp)>,
     out_size: usize,
 }
@@ -80,6 +82,7 @@ impl Frame {
             window_log,
             ldm,
             pledged: None,
+            checksum: false,
             ops: vec![(n, EndOp::End)],
             out_size: zstd_native::compress_bound(n),
         }
@@ -116,6 +119,7 @@ impl Frame {
             window_log,
             ldm,
             pledged: None,
+            checksum: false,
             ops,
             out_size: 1 << 16,
         }
@@ -174,6 +178,8 @@ fn run_c(frames: &[Frame], data: &[u8], dict: Dict<'_>) -> Vec<Vec<u8>> {
             .unwrap();
         cctx.set_parameter(CParameter::WindowLog(f.window_log))
             .unwrap();
+        cctx.set_parameter(CParameter::ChecksumFlag(f.checksum))
+            .unwrap();
         if f.pledged.is_some() {
             cctx.set_pledged_src_size(f.pledged).unwrap();
         }
@@ -215,6 +221,7 @@ fn run_native(frames: &[Frame], data: &[u8], dict: Dict<'_>) -> Vec<Vec<u8>> {
         enc.set_level(f.level);
         enc.set_long_distance_matching(f.ldm);
         enc.set_window_log(f.window_log);
+        enc.set_checksum(f.checksum).unwrap();
         if f.pledged.is_some() {
             enc.set_pledged_src_size(f.pledged).unwrap();
         }
@@ -471,4 +478,37 @@ fn auto_level22_one_shot_large() {
         zstd::bulk::compress(&data[..1000], 22).unwrap()
     );
     assert!(c.compress(&data).unwrap() == want);
+}
+
+/// With the content checksum (`ZSTD_c_checksumFlag`): one-shot, streaming
+/// with flushes and wraps, a reused context, a dictionary.
+#[test]
+fn forced_with_checksum() {
+    let data = input(3 << 20, 1 << 20, 10);
+    let with = |mut f: Frame| {
+        f.checksum = true;
+        f
+    };
+    for level in [1, 3, 5, 7, 12, 16, 19, 22] {
+        let n = if level >= 16 { 1 << 20 } else { 3 << 20 };
+        let f = with(Frame::one_shot(level, 20, true, n));
+        check("checksum", &[f], &data, Dict::None);
+        let f = with(Frame::streamed_flushing(level, 19, true, n, 70_000, 4));
+        check("checksum stream", &[f], &data, Dict::None);
+    }
+    let mut pledged = with(Frame::streamed(6, 20, true, 1 << 20, 100_000));
+    pledged.pledged = Some(1 << 20);
+    let frames = [
+        with(Frame::one_shot(19, 20, true, 700_000)),
+        Frame::one_shot(3, 0, false, 200_000),
+        pledged,
+        with(Frame::one_shot(5, 21, true, 0)),
+    ];
+    check("checksum reused", &frames, &data, Dict::None);
+    let dict = data[100_000..150_000].to_vec();
+    let f = with(Frame::streamed(16, 19, true, 600_000, 100_000));
+    check("checksum dict", &[f], &data, Dict::Prepared(&dict, 16));
+    // level 22 with an unknown size (LDM on by itself)
+    let f = with(Frame::streamed(22, 0, false, 1 << 20, 300_000));
+    check("checksum L22", &[f], &data, Dict::None);
 }

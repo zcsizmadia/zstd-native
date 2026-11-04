@@ -31,6 +31,7 @@ use crate::fse::{
     LL_DEFAULT_NORM, MAX_LL as FSE_MAX_LL, MAX_ML as FSE_MAX_ML, MAX_OFF as FSE_MAX_OFF,
     ML_DEFAULT_NORM, OF_DEFAULT_NORM,
 };
+use crate::xxhash::Xxh64;
 
 pub(super) const BLOCK_HEADER_SIZE: usize = 3;
 const MIN_CBLOCK_SIZE: usize = 2;
@@ -411,6 +412,31 @@ pub(crate) enum FrameStage {
     Ending,
 }
 
+/// The frame parameters (libzstd's `ZSTD_frameParameters`): what the frame
+/// header declares and whether the frame ends with a content checksum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameParams {
+    /// `ZSTD_c_contentSizeFlag`: the header holds the content size when it
+    /// is known (default on).
+    pub(crate) content_size: bool,
+    /// `ZSTD_c_checksumFlag`: the frame ends with the low 32 bits of the
+    /// content's XXH64 (default off).
+    pub(crate) checksum: bool,
+    /// `ZSTD_c_dictIDFlag`: the header holds the dictionary's ID, if any
+    /// (default on).
+    pub(crate) dict_id: bool,
+}
+
+impl Default for FrameParams {
+    fn default() -> Self {
+        FrameParams {
+            content_size: true,
+            checksum: false,
+            dict_id: true,
+        }
+    }
+}
+
 /// Compression state for one frame at a time (libzstd's `ZSTD_CCtx`
 /// without the streaming buffers, see [`StreamEncoder`](super::stream::StreamEncoder)).
 pub(crate) struct FrameCompressor {
@@ -450,6 +476,11 @@ pub(crate) struct FrameCompressor {
     pub(super) ext: RawSeqStore,
     /// Scratch space for [`build_seq_store_ext`].
     ext_view: Vec<RawSeq>,
+    /// `appliedParams.fParams`, see [`set_frame_params`](Self::set_frame_params).
+    fparams: FrameParams,
+    /// `xxhState`: the XXH64 of the frame's content, with
+    /// [`FrameParams::checksum`].
+    xxh: Xxh64,
 }
 
 impl FrameCompressor {
@@ -482,6 +513,8 @@ impl FrameCompressor {
             dict_id: 0,
             ext: RawSeqStore::default(),
             ext_view: Vec::new(),
+            fparams: FrameParams::default(),
+            xxh: Xxh64::new(),
         }
     }
 
@@ -567,6 +600,16 @@ impl FrameCompressor {
         self.ext.seq.clear();
         self.ext.pos = 0;
         self.ext.pos_in_sequence = 0;
+        self.fparams = FrameParams::default();
+        self.xxh = Xxh64::new();
+    }
+
+    /// Sets the frame parameters of the frame just started (the defaults
+    /// after a reset or [`start_frame`](Self::start_frame)), before its
+    /// header is written.
+    pub(crate) fn set_frame_params(&mut self, fp: FrameParams) {
+        debug_assert!(self.stage == FrameStage::Init && self.consumed == 0);
+        self.fparams = fp;
     }
 
     /// Starts a frame of `pledged` bytes (`None`: unknown) with the frame
@@ -901,11 +944,14 @@ impl FrameCompressor {
     ) -> Result<usize> {
         let mut fh_size = 0;
         if self.stage == FrameStage::Init {
-            fh_size = write_frame_header(dst, &self.cp, self.pledged, self.dict_id)?;
+            fh_size = write_frame_header(dst, &self.cp, self.pledged, self.dict_id, self.fparams)?;
             self.stage = FrameStage::Ongoing;
         }
         if start == end {
             return Ok(fh_size);
+        }
+        if self.fparams.checksum {
+            self.xxh.update(&buf[start..end]);
         }
         self.ms.update_window(start, end - start);
         if self.ldm_on {
@@ -946,6 +992,14 @@ impl FrameCompressor {
             dst[op..op + 3].copy_from_slice(&1u32.to_le_bytes()[..3]);
             op += BLOCK_HEADER_SIZE;
         }
+        if self.fparams.checksum {
+            // the low 32 bits of the content's XXH64
+            if dst.len() - op < 4 {
+                return Err(Error::OutputTooSmall);
+            }
+            dst[op..op + 4].copy_from_slice(&(self.xxh.digest() as u32).to_le_bytes());
+            op += 4;
+        }
         self.stage = FrameStage::Init;
         if self.pledged.is_some_and(|p| self.consumed != p) {
             return Err(Error::SrcSizeWrong);
@@ -960,20 +1014,23 @@ impl FrameCompressor {
     }
 }
 
-/// libzstd's `ZSTD_writeFrameHeader` (no checksum): with the content size
-/// when `pledged` holds it, and the dictionary ID unless it is 0.
+/// libzstd's `ZSTD_writeFrameHeader`: with the content size when `pledged`
+/// holds it (and `fp` asks for it), the dictionary ID unless it is 0 (or
+/// `fp` leaves it out), and the checksum flag of `fp`.
 fn write_frame_header(
     dst: &mut [u8],
     cp: &CParams,
     pledged: Option<u64>,
     dict_id: u32,
+    fp: FrameParams,
 ) -> Result<usize> {
     if dst.len() < 18 {
         return Err(Error::OutputTooSmall);
     }
+    let dict_id = if fp.dict_id { dict_id } else { 0 };
     let window_size = 1u64 << cp.window_log;
     let src_size = pledged.unwrap_or(0);
-    let content_size_flag = pledged.is_some();
+    let content_size_flag = fp.content_size && pledged.is_some();
     let single = content_size_flag && window_size >= src_size;
     let wlog_byte = ((cp.window_log - 10) << 3) as u8;
     let fcs_code = if content_size_flag {
@@ -986,7 +1043,10 @@ fn write_frame_header(
     dst[..4].copy_from_slice(&crate::frame::MAGIC.to_le_bytes());
     let dict_id_size_code =
         u8::from(dict_id > 0) + u8::from(dict_id >= 256) + u8::from(dict_id >= 65536);
-    dst[4] = dict_id_size_code + (u8::from(single) << 5) + (fcs_code << 6);
+    dst[4] = dict_id_size_code
+        + (u8::from(fp.checksum) << 2)
+        + (u8::from(single) << 5)
+        + (fcs_code << 6);
     let mut pos = 5;
     if !single {
         dst[pos] = wlog_byte;
@@ -1041,6 +1101,7 @@ pub(crate) fn compress_to_slice_with(
     dst: &mut [u8],
     level: i32,
     fresh: bool,
+    fp: FrameParams,
 ) -> Result<usize> {
     let fc = match fc {
         Some(f) => {
@@ -1052,6 +1113,7 @@ pub(crate) fn compress_to_slice_with(
         }
         None => fc.insert(Box::new(FrameCompressor::new(level, src.len()))),
     };
+    fc.set_frame_params(fp);
     fc.compress(dst, src)
 }
 
@@ -1061,9 +1123,10 @@ pub(crate) fn compress_with(
     src: &[u8],
     level: i32,
     fresh: bool,
+    fp: FrameParams,
 ) -> Result<Vec<u8>> {
     let mut out = alloc::vec![0u8; compress_bound(src.len())];
-    let n = compress_to_slice_with(fc, src, &mut out, level, fresh)?;
+    let n = compress_to_slice_with(fc, src, &mut out, level, fresh, fp)?;
     out.truncate(n);
     Ok(out)
 }
@@ -1078,6 +1141,7 @@ pub(crate) fn compress_dict_to_slice_with(
     dst: &mut [u8],
     level: i32,
     fresh: bool,
+    fp: FrameParams,
 ) -> Result<usize> {
     let (cd, level) = dict.for_frame(level)?;
     let pledged = Some(src.len() as u64);
@@ -1086,7 +1150,9 @@ pub(crate) fn compress_dict_to_slice_with(
         f.ms.clear_hash_salt();
     }
     let ldm = ldm_enabled(&frame_cp);
-    FrameCompressor::start_frame(fc, frame_cp, cd.as_ref(), pledged, ldm).compress(dst, src)
+    let fc = FrameCompressor::start_frame(fc, frame_cp, cd.as_ref(), pledged, ldm);
+    fc.set_frame_params(fp);
+    fc.compress(dst, src)
 }
 
 /// As [`compress_dict_to_slice_with`], into a new vector.
@@ -1096,9 +1162,10 @@ pub(crate) fn compress_dict_with(
     src: &[u8],
     level: i32,
     fresh: bool,
+    fp: FrameParams,
 ) -> Result<Vec<u8>> {
     let mut out = alloc::vec![0u8; compress_bound(src.len())];
-    let n = compress_dict_to_slice_with(fc, dict, src, &mut out, level, fresh)?;
+    let n = compress_dict_to_slice_with(fc, dict, src, &mut out, level, fresh, fp)?;
     out.truncate(n);
     Ok(out)
 }

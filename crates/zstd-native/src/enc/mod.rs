@@ -75,6 +75,7 @@ pub(crate) mod stream;
 pub(crate) mod table;
 
 pub use cdict::EncoderDictionary;
+use compress::FrameParams;
 pub use compress::compress_bound;
 pub use stream::{CompressProgress, EndOp, StreamEncoder};
 
@@ -99,7 +100,7 @@ pub use stream::{CompressProgress, EndOp, StreamEncoder};
 /// None in practice: the output buffer is [`compress_bound`] bytes, always
 /// enough.
 pub fn compress(src: &[u8], level: i32) -> crate::error::Result<alloc::vec::Vec<u8>> {
-    with_cached(|fc| compress::compress_with(fc, src, level, true))
+    with_cached(|fc| compress::compress_with(fc, src, level, true, FrameParams::default()))
 }
 
 /// Compresses into `dst`, returning the compressed size; `dst` of
@@ -110,7 +111,9 @@ pub fn compress(src: &[u8], level: i32) -> crate::error::Result<alloc::vec::Vec<
 /// [`Error::OutputTooSmall`](crate::Error::OutputTooSmall) if `dst` is too
 /// small, or as [`compress`].
 pub fn compress_to_slice(src: &[u8], dst: &mut [u8], level: i32) -> crate::error::Result<usize> {
-    with_cached(|fc| compress::compress_to_slice_with(fc, src, dst, level, true))
+    with_cached(|fc| {
+        compress::compress_to_slice_with(fc, src, dst, level, true, FrameParams::default())
+    })
 }
 
 /// Compresses `src` into one zstd frame at `level` with the dictionary
@@ -139,7 +142,9 @@ pub fn compress_with_dictionary(
     level: i32,
 ) -> crate::error::Result<alloc::vec::Vec<u8>> {
     let mut slot = cdict::DictSlot::local(dict)?;
-    with_cached(|fc| compress::compress_dict_with(fc, &mut slot, src, level, true))
+    with_cached(|fc| {
+        compress::compress_dict_with(fc, &mut slot, src, level, true, FrameParams::default())
+    })
 }
 
 type Cached = Option<alloc::boxed::Box<compress::FrameCompressor>>;
@@ -197,6 +202,7 @@ pub struct Compressor {
     level: i32,
     inner: Cached,
     dict: cdict::DictSlot,
+    fparams: FrameParams,
     #[cfg(feature = "std")]
     mt_params: mt::MtParams,
     #[cfg(feature = "std")]
@@ -206,7 +212,9 @@ pub struct Compressor {
 impl core::fmt::Debug for Compressor {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let mut d = f.debug_struct("Compressor");
-        d.field("level", &self.level).field("dict", &self.dict);
+        d.field("level", &self.level)
+            .field("dict", &self.dict)
+            .field("checksum", &self.fparams.checksum);
         #[cfg(feature = "std")]
         d.field("workers", &self.mt_params.workers);
         d.finish_non_exhaustive()
@@ -220,11 +228,45 @@ impl Compressor {
             level,
             inner: None,
             dict: cdict::DictSlot::None,
+            fparams: FrameParams::default(),
             #[cfg(feature = "std")]
             mt_params: mt::MtParams::default(),
             #[cfg(feature = "std")]
             mt: None,
         }
+    }
+
+    /// Ends each frame with a content checksum (libzstd's
+    /// `ZSTD_c_checksumFlag`; off by default): the low 32 bits of the
+    /// XXH64 of the frame's content, which decoders verify. It costs 4
+    /// bytes per frame and the time to hash the input.
+    ///
+    /// ```
+    /// let mut c = zstd_native::Compressor::new(3);
+    /// c.set_checksum(true);
+    /// let a = c.compress(b"checked, checked, checked")?;
+    /// assert_eq!(zstd_native::decompress(&a)?, b"checked, checked, checked");
+    /// # Ok::<(), zstd_native::Error>(())
+    /// ```
+    pub fn set_checksum(&mut self, on: bool) {
+        self.fparams.checksum = on;
+    }
+
+    /// Writes the content size into the frame header (libzstd's
+    /// `ZSTD_c_contentSizeFlag`; on by default). Off, the header leaves it
+    /// out (decoders then cannot tell the size before decoding); the
+    /// compressed blocks are the same.
+    pub fn set_content_size_flag(&mut self, on: bool) {
+        self.fparams.content_size = on;
+    }
+
+    /// Writes the dictionary's ID into the frame header, when a
+    /// dictionary with an ID is used (libzstd's `ZSTD_c_dictIDFlag`; on by
+    /// default). Off, the header leaves it out (decoders then cannot check
+    /// that they have the right dictionary); the compressed blocks are the
+    /// same.
+    pub fn set_dict_id_flag(&mut self, on: bool) {
+        self.fparams.dict_id = on;
     }
 
     /// Compresses with `n` worker threads (libzstd's `ZSTD_c_nbWorkers`; at
@@ -307,7 +349,7 @@ impl Compressor {
             let m = self
                 .mt
                 .get_or_insert_with(|| alloc::boxed::Box::new(mt::MtCtx::new()));
-            m.init_frame(&self.mt_params, cp, ldm, cd, pledged)?;
+            m.init_frame(&self.mt_params, cp, ldm, cd, pledged, self.fparams)?;
             match dst {
                 Some(d) => {
                     let p = m.compress(src, d, EndOp::End)?;
@@ -402,9 +444,10 @@ impl Compressor {
                 src,
                 self.level,
                 false,
+                self.fparams,
             );
         }
-        compress::compress_with(&mut self.inner, src, self.level, false)
+        compress::compress_with(&mut self.inner, src, self.level, false, self.fparams)
     }
 
     /// Compresses `src` as one frame into `dst` (see [`compress_to_slice`]).
@@ -425,8 +468,9 @@ impl Compressor {
                 dst,
                 self.level,
                 false,
+                self.fparams,
             );
         }
-        compress::compress_to_slice_with(&mut self.inner, src, dst, self.level, false)
+        compress::compress_to_slice_with(&mut self.inner, src, dst, self.level, false, self.fparams)
     }
 }

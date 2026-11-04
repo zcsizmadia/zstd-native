@@ -2,7 +2,7 @@
 //! the same input and level.
 
 use zstd::zstd_safe::{CParameter, ParamSwitch};
-use zstd_bench::{Rng, c_compress, datasets, source_corpus};
+use zstd_bench::{Rng, c_compress, datasets, random_corpus, source_corpus};
 
 const LEVELS: &[i32] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, -1, -3, -7,
@@ -323,4 +323,115 @@ fn reused_context_identical() {
             compare(&format!("switching, L{level}"), k, data.len(), got, want);
         }
     }
+}
+
+/// The frame parameters tested: (checksum, content size, dictionary ID).
+const FLAGS: &[(bool, bool, bool)] = &[
+    (true, true, true),
+    (true, false, true),
+    (false, false, true),
+];
+
+/// A reused `zstd_native::Compressor` and a reused libzstd context with
+/// the frame parameters `flags`.
+fn compressors(
+    level: i32,
+    flags: (bool, bool, bool),
+) -> (zstd_native::Compressor, zstd::bulk::Compressor<'static>) {
+    let (checksum, content_size, dict_id) = flags;
+    let mut native = zstd_native::Compressor::new(level);
+    native.set_checksum(checksum);
+    native.set_content_size_flag(content_size);
+    native.set_dict_id_flag(dict_id);
+    let mut c = zstd::bulk::Compressor::new(level).unwrap();
+    c.set_parameter(CParameter::ChecksumFlag(checksum)).unwrap();
+    c.set_parameter(CParameter::ContentSizeFlag(content_size))
+        .unwrap();
+    c.set_parameter(CParameter::DictIdFlag(dict_id)).unwrap();
+    (native, c)
+}
+
+/// With the content checksum (`ZSTD_c_checksumFlag`) and without the
+/// content size in the header (`ZSTD_c_contentSizeFlag`): a few levels per
+/// strategy, sizes from empty to several blocks, reused contexts, into a
+/// vector and into slices (exactly large enough, and one byte short).
+#[test]
+fn frame_flags_identical() {
+    let src = source_corpus();
+    let random = random_corpus(300_000);
+    let sizes = [
+        0usize, 1, 31, 32, 33, 255, 256, 1000, 70_000, 131_072, 400_000, 1_100_000,
+    ];
+    for (k, &flags) in FLAGS.iter().enumerate() {
+        // every strategy with the checksum, fewer levels for the others
+        let levels: &[i32] = if k == 0 {
+            &[
+                -5, -1, 1, 2, 3, 4, 5, 6, 7, 9, 12, 13, 15, 16, 17, 18, 19, 22,
+            ]
+        } else {
+            &[-1, 1, 3, 5, 13, 16, 19]
+        };
+        for &level in levels {
+            let (mut native, mut c) = compressors(level, flags);
+            for (i, &n) in sizes.iter().enumerate() {
+                // (the slow levels without the largest sizes)
+                if level >= SLOW_LEVEL && n > SLOW_INPUT_MAX {
+                    continue;
+                }
+                let data = &src[i * 1000..i * 1000 + n];
+                for data in [data, &random[..data.len().min(random.len())]] {
+                    let what = format!("{flags:?} L{level} n={}", data.len());
+                    let want = c.compress(data).unwrap();
+                    let got = native
+                        .compress(data)
+                        .unwrap_or_else(|e| panic!("{what}: {e}"));
+                    assert!(
+                        got == want,
+                        "{what}: output differs from libzstd (sizes {} vs {})",
+                        got.len(),
+                        want.len()
+                    );
+                    assert!(
+                        zstd_native::decompress(&got).unwrap() == data,
+                        "{what}: round trip"
+                    );
+                    // (the checksum fits in `compress_bound`)
+                    let mut buf = vec![0u8; zstd_native::compress_bound(data.len())];
+                    let k = native.compress_to_slice(data, &mut buf).unwrap();
+                    assert!(buf[..k] == want[..], "{what}: into a slice");
+                    assert!(
+                        native
+                            .compress_to_slice(data, &mut buf[..want.len() - 1])
+                            .is_err(),
+                        "{what}: one byte short"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The checksum covers the content: the decoder rejects a frame whose
+/// checksum or content was altered, and the checksum is libzstd's.
+#[test]
+fn checksum_is_verified() {
+    let data = source_corpus();
+    let data = &data[..200_000];
+    let mut native = zstd_native::Compressor::new(3);
+    native.set_checksum(true);
+    let f = native.compress(data).unwrap();
+    let h = zstd_native::FrameHeader::parse(&f).unwrap();
+    assert!(h.has_checksum);
+    let n = f.len();
+    assert_eq!(
+        u32::from_le_bytes(f[n - 4..].try_into().unwrap()),
+        zstd_native::xxh64(data) as u32
+    );
+    let mut bad = f.clone();
+    bad[n - 1] ^= 1;
+    assert!(zstd_native::decompress(&bad).is_err());
+    assert!(zstd::bulk::decompress(&bad, data.len()).is_err());
+    // without the flag (the default), no checksum
+    let f = zstd_native::Compressor::new(3).compress(data).unwrap();
+    assert!(!zstd_native::FrameHeader::parse(&f).unwrap().has_checksum);
 }
