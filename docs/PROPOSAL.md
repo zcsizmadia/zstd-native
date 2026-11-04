@@ -193,8 +193,9 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
    libzstd's speed with 4-8 workers in first measurements (Windows
    laptop), single-threaded speed unchanged. Not ported: `ZSTD_c_rsyncable`,
    checksums (the encoder writes none yet).
-5. Fuzzing (cargo-fuzz, differential vs libzstd), Miri, CI matrix
-   (x86-64/AArch64, Linux/Windows/macOS, 32-bit), AArch64 tuning.
+5. ~~Fuzzing~~ (done, #13: cargo-fuzz targets differential against
+   libzstd, see [Fuzzing](#fuzzing)), Miri, CI matrix (x86-64/AArch64,
+   Linux/Windows/macOS, 32-bit), AArch64 tuning.
 
 ## Benchmarks
 
@@ -202,3 +203,42 @@ Authoritative numbers come from the EPYC host (AMD EPYC 7543, Zen 3,
 AVX2/BMI2), one pinned core (`taskset -c 8`), `cargo bench -p zstd-bench
 --bench decode`. Datasets: the zstd C sources (text), synthetic logs,
 numeric binary, random; add Silesia with `ZSTD_BENCH_CORPUS`.
+
+## Fuzzing
+
+`fuzz/` holds cargo-fuzz targets (libFuzzer, nightly only; its own
+workspace, so the stable CI only checks that it compiles). Every target
+compares zstd-native with C libzstd 1.5.7 (the `zstd` crate), and each
+input picks its parameters with `arbitrary`:
+
+| Target | Input | Checks |
+|---|---|---|
+| `decode` | arbitrary bytes | never panics; the asm and Rust Huffman loops, the slice and the `Vec` APIs agree; whatever zstd-native accepts, libzstd accepts with the same output |
+| `stream_decode` | arbitrary bytes, input pieces, output sizes, a dictionary from arbitrary bytes (raw, trained, or trained and mutated), a window limit | as `decode` for `StreamDecoder` against `ZSTD_decompressStream`, plus the one-shot and `std::io::Read` decoders |
+| `decode_valid` | arbitrary data and parameters (level -7 to 22, checksum, content size, window log, long distance matching, dictionary, flush points) compressed by libzstd | every zstd-native decoding API returns the data exactly, with input and output pieces of arbitrary sizes |
+| `compress` | arbitrary data and parameters (level, window log, long distance matching, workers, job size, overlap, loaded or prepared dictionaries from arbitrary bytes), one-shot with a reused context or a streaming script of input pieces, flushes, frame ends and output sizes | byte-identical with libzstd for the same calls; both libraries decode it back |
+
+The Huffman `asm!` loops are forced on and off per input
+(`__private::set_asm`); the generic code paths need a build with
+`--features portable`. Decoding arbitrary bytes caps the output at 8 MiB
+(an RLE block expands 3 bytes to 128 KiB); the optimal parser gets at
+most 48 KiB of data per input.
+
+```sh
+cargo install cargo-fuzz
+cd fuzz
+cargo +nightly run --release --bin seeds -- corpus   # seed frames for decode and stream_decode
+cargo +nightly fuzz run decode -- -max_len=65536 -timeout=30
+cargo +nightly fuzz run compress --features portable -- -max_len=131072 -timeout=30
+cargo +nightly fuzz run compress -- -fork=8 -ignore_crashes=1 -max_len=131072 -timeout=30
+cargo +nightly fuzz cmin decode                      # minimise the corpus
+```
+
+Crashes land in `fuzz/artifacts/<target>/`; `cargo fuzz fmt <target>
+<file>` prints the `arbitrary` structure of an input, `cargo fuzz tmin`
+minimises it. With AddressSanitizer (the default), build libzstd without
+use-after-scope checks (`CFLAGS="-fsanitize=address
+-fno-sanitize-address-use-after-scope"`): clang 14 poisons a constant
+local table in `zstd_opt.c` that it promoted to a global, a false
+positive. Every bug the fuzzers find gets a regression test in
+`crates/zstd-bench/tests/`.
