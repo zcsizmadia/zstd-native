@@ -69,7 +69,15 @@ jobs:
               | test(~fse_enc::tests::compress_using_ctable_decodes)
               | test(~opt::tests::weights)
               | test(~presplit::tests::optimal_size)
-              | test(~mt::tests::jobs_run_in_the_calling_thread_without_workers))'
+              | test(~mt::tests::jobs_run_in_the_calling_thread_without_workers)
+              | test(~hist::tests::matches_reference)
+              | test(~lazy::tests::salt_advances)
+              | test(~lazy::tests::stale_tags)
+              | test(~ldm::tests::round_trip_forced)
+              | test(~opt::tests::long_matches)
+              | test(~presplit::tests::split_points_are_valid)
+              | test(~presplit::tests::split_points_match_libzstd)
+              | test(~fse::build_tests::fast_build_matches_reference))'
           fi
           filter=$(echo "$filter" | tr -s '\n ' '  ')
           cargo miri nextest run -p zstd-native --lib --features portable \
