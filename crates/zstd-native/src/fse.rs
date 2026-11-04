@@ -2,6 +2,7 @@
 //! sequence (literal length / match length / offset) tables.
 
 use crate::bits::{BitReader, Status};
+use crate::cpu::Features;
 use crate::error::{Error, Result};
 
 pub(crate) const FSE_MIN_TABLELOG: u32 = 5;
@@ -192,10 +193,10 @@ pub(crate) fn decompress_weights(src: &[u8], out: &mut [u8; 256]) -> Result<usiz
 
     let mut br = BitReader::new(&src[hsize..])?;
     let mut s1 = br.read(table_log) as usize;
-    br.reload();
+    br.reload_short();
     let mut s2 = br.read(table_log) as usize;
-    br.reload();
-    if br.reload() == Status::Overflow {
+    br.reload_short();
+    if br.reload_short() == Status::Overflow {
         return Err(Error::Corrupted);
     }
     let dec = |state: &mut usize, br: &mut BitReader<'_>| -> u8 {
@@ -206,7 +207,7 @@ pub(crate) fn decompress_weights(src: &[u8], out: &mut [u8; 256]) -> Result<usiz
     const OMAX: usize = 255;
     let mut n = 0usize;
     // libzstd's loop, kept as is: where it stops decides the weight count.
-    while (br.reload() == Status::Unfinished) & (n < OMAX - 3) {
+    while (br.reload_short() == Status::Unfinished) & (n < OMAX - 3) {
         out[n] = dec(&mut s1, &mut br);
         out[n + 1] = dec(&mut s2, &mut br);
         out[n + 2] = dec(&mut s1, &mut br);
@@ -219,7 +220,7 @@ pub(crate) fn decompress_weights(src: &[u8], out: &mut [u8; 256]) -> Result<usiz
         }
         out[n] = dec(&mut s1, &mut br);
         n += 1;
-        if br.reload() == Status::Overflow {
+        if br.reload_short() == Status::Overflow {
             out[n] = dec(&mut s2, &mut br);
             n += 1;
             break;
@@ -229,7 +230,7 @@ pub(crate) fn decompress_weights(src: &[u8], out: &mut [u8; 256]) -> Result<usiz
         }
         out[n] = dec(&mut s2, &mut br);
         n += 1;
-        if br.reload() == Status::Overflow {
+        if br.reload_short() == Status::Overflow {
             out[n] = dec(&mut s1, &mut br);
             n += 1;
             break;
@@ -345,7 +346,47 @@ pub(crate) const fn build_seq_table(
 /// Run-time version of [`build_seq_table`] with libzstd's fast spread for
 /// tables without low-probability (-1) symbols: lay the symbols down in
 /// order 8 bytes at a time, then walk the positions with no inner loop.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_seq_table_fast(
+    dt: &mut [SeqSymbol],
+    norm: &[i16],
+    max_sv1: usize,
+    table_log: u32,
+    base: &[u32],
+    bits: &[u8],
+    state_offset: u16,
+    cpu: Features,
+) {
+    #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+    if cpu.bmi2 {
+        // SAFETY: the caller detected BMI2 (and BMI1/LZCNT) on this CPU.
+        #[allow(unsafe_code)]
+        unsafe {
+            build_fast_bmi2(dt, norm, max_sv1, table_log, base, bits, state_offset)
+        };
+        return;
+    }
+    let _ = cpu;
+    build_fast_body(dt, norm, max_sv1, table_log, base, bits, state_offset);
+}
+
+/// With LZCNT for the per-cell `highbit`.
+#[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+fn build_fast_bmi2(
+    dt: &mut [SeqSymbol],
+    norm: &[i16],
+    max_sv1: usize,
+    table_log: u32,
+    base: &[u32],
+    bits: &[u8],
+    state_offset: u16,
+) {
+    build_fast_body(dt, norm, max_sv1, table_log, base, bits, state_offset);
+}
+
+#[inline(always)]
+fn build_fast_body(
     dt: &mut [SeqSymbol],
     norm: &[i16],
     max_sv1: usize,
@@ -385,20 +426,26 @@ pub(crate) fn build_seq_table_fast(
         cells[(position + step) & mask] = spread[s + 1];
         position = (position + 2 * step) & mask;
     }
-    let mut next = [0u16; MAX_ML + 1];
-    for (nx, &n) in next.iter_mut().zip(norm) {
-        *nx = n as u16;
+    // 64-entry local tables indexed with `s & 63` (every code is under 53):
+    // no bounds checks in the per-cell loop.
+    let mut next = [0u16; 64];
+    let mut sym_base = [0u32; 64];
+    let mut sym_bits = [0u8; 64];
+    for (s, &n) in norm.iter().enumerate() {
+        next[s] = n as u16;
+        sym_base[s] = base[s];
+        sym_bits[s] = bits[s];
     }
-    for (u, d) in dt[..table_size].iter_mut().enumerate() {
-        let s = cells[u] as usize;
+    for (&c, d) in cells[..table_size].iter().zip(dt[..table_size].iter_mut()) {
+        let s = (c & 63) as usize;
         let ns = u32::from(next[s]);
         next[s] += 1;
         let nb = table_log - highbit32(ns);
         *d = SeqSymbol {
             next_state: ((ns << nb) - table_size as u32) as u16 + state_offset,
-            nb_add_bits: bits[s],
+            nb_add_bits: sym_bits[s],
             nb_bits: nb as u8,
-            base: base[s],
+            base: sym_base[s],
         };
     }
 }
@@ -507,7 +554,14 @@ impl SeqTables {
     }
 
     /// Builds `kind`'s table from normalized counts.
-    pub(crate) fn build(&mut self, kind: CodeKind, norm: &[i16], max_sv1: usize, log: u32) {
+    pub(crate) fn build(
+        &mut self,
+        kind: CodeKind,
+        norm: &[i16],
+        max_sv1: usize,
+        log: u32,
+        cpu: Features,
+    ) {
         let region = &mut self.cells[kind.region..kind.region + (1 << kind.max_log)];
         build_seq_table_fast(
             region,
@@ -517,6 +571,7 @@ impl SeqTables {
             kind.base,
             kind.bits,
             kind.region as u16,
+            cpu,
         );
         self.log[kind.index] = log;
     }
@@ -529,6 +584,7 @@ impl SeqTables {
         kind: CodeKind,
         src: &[u8],
         repeat_ok: bool,
+        cpu: Features,
     ) -> Result<usize> {
         match mode {
             // Predefined
@@ -559,7 +615,7 @@ impl SeqTables {
                 if log > kind.max_log {
                     return Err(Error::Corrupted);
                 }
-                self.build(kind, &norm, max_sym + 1, log);
+                self.build(kind, &norm, max_sym + 1, log, cpu);
                 Ok(used)
             }
             // Repeat: the region still holds the previous table.
@@ -650,7 +706,16 @@ mod build_tests {
             let mut a = [ZERO; 512];
             let mut b = [ZERO; 512];
             build_seq_table(&mut a, &norm, max_sv1, log, &ML_BASE, &ML_BITS, 7);
-            build_seq_table_fast(&mut b, &norm, max_sv1, log, &ML_BASE, &ML_BITS, 7);
+            build_seq_table_fast(
+                &mut b,
+                &norm,
+                max_sv1,
+                log,
+                &ML_BASE,
+                &ML_BITS,
+                7,
+                Features::detect(),
+            );
             for u in 0..1 << log {
                 assert_eq!(
                     (a[u].next_state, a[u].nb_bits, a[u].base, a[u].nb_add_bits),

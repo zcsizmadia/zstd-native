@@ -314,9 +314,10 @@ impl BlockDecoder {
         ip += 1;
         let fse_ok = self.ent.fse_ok;
         let t = &mut self.ent.seq;
-        ip += t.read(modes >> 6, LL_KIND, &src[ip..], fse_ok)?;
-        ip += t.read((modes >> 4) & 3, OF_KIND, &src[ip..], fse_ok)?;
-        ip += t.read((modes >> 2) & 3, ML_KIND, &src[ip..], fse_ok)?;
+        let cpu = self.cpu;
+        ip += t.read(modes >> 6, LL_KIND, &src[ip..], fse_ok, cpu)?;
+        ip += t.read((modes >> 4) & 3, OF_KIND, &src[ip..], fse_ok, cpu)?;
+        ip += t.read((modes >> 2) & 3, ML_KIND, &src[ip..], fse_ok, cpu)?;
         Ok((nb_seq, ip))
     }
 }

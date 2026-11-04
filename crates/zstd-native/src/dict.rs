@@ -56,7 +56,13 @@ impl Dictionary {
             if log > kind.max_log {
                 return Err(Error::InvalidDictionary);
             }
-            ent.seq.build(kind, &norm, max_sym + 1, log);
+            ent.seq.build(
+                kind,
+                &norm,
+                max_sym + 1,
+                log,
+                crate::cpu::Features::detect(),
+            );
             p += used;
         }
         ent.fse_ok = true;

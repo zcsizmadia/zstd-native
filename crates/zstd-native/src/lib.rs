@@ -36,7 +36,7 @@ mod dict;
 mod error;
 mod frame;
 mod fse;
-mod huf;
+pub(crate) mod huf;
 #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
 mod huf_asm;
 mod xxhash;
@@ -50,4 +50,7 @@ pub use xxhash::xxh64;
 #[doc(hidden)]
 pub mod __private {
     pub use crate::cpu::{selected_paths, set_asm};
+    pub use crate::huf::{
+        bench_read as huf_bench_read, first_tree_description as huf_first_tree_description,
+    };
 }
