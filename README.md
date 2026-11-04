@@ -9,10 +9,12 @@ types, dictionaries, checksums, concatenated and skippable frames, tested
 against libzstd.
 
 The encoder is in progress: its output is byte-identical to libzstd's for
-the same input and level. Levels 1-3 (3 is the default),
-level 4 (except for inputs up to 16 KB or of 128-256 KB) and the
-negative levels (the `fast` and `dfast` strategies) work today, at about
-0.9-0.96x libzstd's speed; the other strategies follow (issues #8-#10).
+the same input and level. The negative levels and levels 1 to 15 work
+today (the `fast`, `dfast`, `greedy`, `lazy`, `lazy2` and `btlazy2`
+strategies; up to level 12 for inputs of 256 KB or less, 10 up to
+16 KB), at about 0.9-0.96x libzstd's speed for `fast`/`dfast` and on par
+for the lazy strategies (first measurements); the optimal parser
+(`btopt` and above) follows (issues #9-#10).
 
 ```rust
 let compressed = zstd_native::compress(&data, 1)?; // same bytes as libzstd

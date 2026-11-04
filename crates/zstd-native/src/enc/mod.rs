@@ -16,6 +16,9 @@
 //!   `ZSTD_getCParams_internal`, `ZSTD_adjustCParams_internal`)
 //! - `fast`: compress/zstd_fast.c
 //! - `dfast`: compress/zstd_double_fast.c
+//! - `lazy`: compress/zstd_lazy.c (greedy, lazy, lazy2, btlazy2: parser,
+//!   hash chain and binary tree)
+//! - `row`: compress/zstd_lazy.c (the row-based match finder)
 //! - `presplit`: compress/zstd_preSplit.c
 #![allow(dead_code)] // filled in step by step (issue #6)
 
@@ -26,9 +29,11 @@ pub(crate) mod fast;
 pub(crate) mod fse_enc;
 pub(crate) mod hist;
 pub(crate) mod huf_enc;
+pub(crate) mod lazy;
 pub(crate) mod literals;
 pub(crate) mod params;
 pub(crate) mod presplit;
+pub(crate) mod row;
 pub(crate) mod seq_store;
 pub(crate) mod sequences;
 
@@ -38,9 +43,9 @@ pub use compress::compress_bound;
 /// faster; 0 means the default, 3), like libzstd's `ZSTD_compress`: the
 /// output is byte-identical to libzstd 1.5.7's.
 ///
-/// Work in progress (issue #6): only the `fast` and `dfast` strategies
-/// (levels 1-3 and negative, and 4 except for inputs up to 16 KB or of
-/// 128-256 KB) are implemented so far; other levels return
+/// Work in progress (issue #6): the strategies up to `btlazy2` are
+/// implemented (levels up to 15 for inputs over 256 KB, 12 for 16-256 KB,
+/// 10 up to 16 KB); higher levels (`btopt` and above) return
 /// [`Error::UnsupportedFrameParameter`](crate::Error::UnsupportedFrameParameter).
 ///
 /// ```
@@ -56,7 +61,7 @@ pub use compress::compress_bound;
 /// for levels not implemented yet.
 pub fn compress(src: &[u8], level: i32) -> crate::error::Result<alloc::vec::Vec<u8>> {
     check_level(level, src.len())?;
-    with_cached(|fc| compress::compress_with(fc, src, level))
+    with_cached(|fc| compress::compress_with(fc, src, level, true))
 }
 
 /// Compresses into `dst`, returning the compressed size; `dst` of
@@ -68,7 +73,7 @@ pub fn compress(src: &[u8], level: i32) -> crate::error::Result<alloc::vec::Vec<
 /// small, or as [`compress`].
 pub fn compress_to_slice(src: &[u8], dst: &mut [u8], level: i32) -> crate::error::Result<usize> {
     check_level(level, src.len())?;
-    with_cached(|fc| compress::compress_to_slice_with(fc, src, dst, level))
+    with_cached(|fc| compress::compress_to_slice_with(fc, src, dst, level, true))
 }
 
 type Cached = Option<alloc::boxed::Box<compress::FrameCompressor>>;
@@ -134,7 +139,7 @@ impl Compressor {
     /// As [`compress`].
     pub fn compress(&mut self, src: &[u8]) -> crate::error::Result<alloc::vec::Vec<u8>> {
         check_level(self.level, src.len())?;
-        compress::compress_with(&mut self.inner, src, self.level)
+        compress::compress_with(&mut self.inner, src, self.level, false)
     }
 
     /// Compresses `src` as one frame into `dst` (see [`compress_to_slice`]).
@@ -144,16 +149,13 @@ impl Compressor {
     /// As [`compress_to_slice`].
     pub fn compress_to_slice(&mut self, src: &[u8], dst: &mut [u8]) -> crate::error::Result<usize> {
         check_level(self.level, src.len())?;
-        compress::compress_to_slice_with(&mut self.inner, src, dst, self.level)
+        compress::compress_to_slice_with(&mut self.inner, src, dst, self.level, false)
     }
 }
 
 fn check_level(level: i32, src_size: usize) -> crate::error::Result<()> {
     let cp = params::one_shot_cparams(level, src_size as u64);
-    if !matches!(
-        cp.strategy,
-        params::Strategy::Fast | params::Strategy::DFast
-    ) {
+    if cp.strategy > params::Strategy::BtLazy2 {
         return Err(crate::error::Error::UnsupportedFrameParameter);
     }
     Ok(())

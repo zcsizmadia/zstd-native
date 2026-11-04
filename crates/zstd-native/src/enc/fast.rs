@@ -32,7 +32,9 @@
 //!    store, runs [`compress_block_fast`] with `rep` = the previous block's
 //!    repcodes, stores the last literals).
 
-use super::params::{CParams, Strategy, cycle_log};
+use super::params::{
+    CParams, ParamSwitch, Strategy, cycle_log, resolve_row_match_finder_mode, row_match_finder_used,
+};
 use super::seq_store::{
     REPCODE1_TO_OFFBASE, SeqStore, count, hash4_ptr, hash5_ptr, hash6_ptr, hash7_ptr, hash8_ptr,
     offset_to_offbase, read32,
@@ -274,6 +276,32 @@ pub(crate) fn reduce_table(table: &mut [u32], reducer_value: u32) {
     }
 }
 
+/// `ZSTD_reduceTable_btlazy2()`: as [`reduce_table`], but keeps
+/// `ZSTD_DUBT_UNSORTED_MARK`.
+pub(crate) fn reduce_table_btlazy2(table: &mut [u32], reducer_value: u32) {
+    use super::lazy::DUBT_UNSORTED_MARK;
+    let reducer_threshold = reducer_value + WINDOW_START_INDEX;
+    for v in table {
+        *v = if *v == DUBT_UNSORTED_MARK {
+            DUBT_UNSORTED_MARK
+        } else if *v < reducer_threshold {
+            0
+        } else {
+            *v - reducer_value
+        };
+    }
+}
+
+/// `ZSTD_bitmix()`: mixes the bits of a 64-bit value (from XXH3's rrmxmx).
+fn bitmix(mut val: u64, len: u64) -> u64 {
+    const K: u64 = 0x9FB2_1C65_1E98_DF25;
+    val ^= val.rotate_right(49) ^ val.rotate_right(24);
+    val = val.wrapping_mul(K);
+    val ^= (val >> 35).wrapping_add(len);
+    val = val.wrapping_mul(K);
+    val ^ (val >> 28)
+}
+
 /// `ZSTD_dictTableLoadMethod_e`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TableLoadMethod {
@@ -284,7 +312,7 @@ pub(crate) enum TableLoadMethod {
     Full,
 }
 
-/// The parts of `ZSTD_MatchState_t` the `fast` strategy uses.
+/// `ZSTD_MatchState_t` without the dictionary and optimal-parser parts.
 #[derive(Debug)]
 pub(crate) struct MatchState {
     /// `window`
@@ -295,13 +323,34 @@ pub(crate) struct MatchState {
     pub(crate) next_to_update: u32,
     /// `hashTable`: `1 << cparams.hash_log` entries.
     pub(crate) hash_table: Vec<u32>,
-    /// `chainTable`: `1 << cparams.chain_log` entries, none for `fast`.
-    /// `dfast` uses it as its short-match hash table.
+    /// `chainTable`: `1 << cparams.chain_log` entries, none for `fast` and
+    /// the row match finder. `dfast` uses it as its short-match hash table,
+    /// `btlazy2` as its binary tree.
     pub(crate) chain_table: Vec<u32>,
     /// `cParams`
     pub(crate) cparams: CParams,
     /// `forceNonContiguous`
     pub(crate) force_non_contiguous: bool,
+    /// Whether the row-based match finder is used (libzstd's resolved
+    /// `useRowMatchFinder`: greedy to lazy2 with `windowLog > 14`).
+    pub(crate) use_row_match_finder: bool,
+    /// `tagTable`: the row match finder's tags, `1 << hash_log` bytes when
+    /// it is used. libzstd allocates it "init once": it is not cleared
+    /// between frames of a reused context, only salted differently. Its
+    /// stale content never changes the result (see `lazy::row`), so it is
+    /// not cleared here either.
+    pub(crate) tag_table: Vec<u8>,
+    /// `hashCache`: the row hashes of the next positions.
+    pub(crate) hash_cache: [u32; super::row::ROW_HASH_CACHE_SIZE],
+    /// `rowHashLog`: `hash_log - rowLog`.
+    pub(crate) row_hash_log: u32,
+    /// `hashSalt`: salts the row hashes; advanced on every reset that uses
+    /// the row match finder.
+    pub(crate) hash_salt: u64,
+    /// `hashSaltEntropy`: sum of the row hashes searched, for the next salt.
+    pub(crate) hash_salt_entropy: u32,
+    /// `lazySkipping`
+    pub(crate) lazy_skipping: bool,
 }
 
 impl MatchState {
@@ -316,6 +365,13 @@ impl MatchState {
             chain_table: Vec::new(),
             cparams,
             force_non_contiguous: false,
+            use_row_match_finder: false,
+            tag_table: Vec::new(),
+            hash_cache: [0; super::row::ROW_HASH_CACHE_SIZE],
+            row_hash_log: 0,
+            hash_salt: 0,
+            hash_salt_entropy: 0,
+            lazy_skipping: false,
         };
         ms.reset(cparams);
         ms
@@ -324,21 +380,51 @@ impl MatchState {
     /// `ZSTD_reset_matchState()` with `ZSTDirp_reset` (indices restart at
     /// `ZSTD_WINDOW_START_INDEX`) and `ZSTDcrp_makeClean` (the hash table is
     /// zeroed), for the CCtx. libzstd's `ZSTDirp_continue` (reusing a
-    /// context) only shifts the indices; for this strategy it produces the
-    /// same sequences, so this port always resets.
+    /// context) only shifts the indices; the match finders only compare
+    /// indices with each other (the tables are cleared), so it produces the
+    /// same sequences and this port always resets. With the row match
+    /// finder, the hash salt advances (`ZSTD_advanceHashSalt`).
     pub(crate) fn reset(&mut self, cparams: CParams) {
         self.window = Window::new();
+        self.lazy_skipping = false;
         self.invalidate();
-        clear_table(&mut self.hash_table, 1usize << cparams.hash_log);
-        // ZSTD_allocateChainTable: none for `fast`.
-        let c_size = if cparams.strategy == Strategy::Fast {
+        let h_size = 1usize << cparams.hash_log;
+        clear_table(&mut self.hash_table, h_size);
+        let use_row = row_match_finder_used(
+            cparams.strategy,
+            resolve_row_match_finder_mode(ParamSwitch::Auto, &cparams),
+        );
+        // ZSTD_allocateChainTable: none for `fast` and the row match finder.
+        let c_size = if cparams.strategy == Strategy::Fast || use_row {
             0
         } else {
             1usize << cparams.chain_log
         };
         clear_table(&mut self.chain_table, c_size);
+        self.use_row_match_finder = use_row;
+        if use_row {
+            // The tag table is "init once" (see its docs): new bytes are
+            // zeroed, existing ones are kept.
+            self.tag_table.resize(h_size, 0);
+            self.advance_hash_salt();
+            let row_log = cparams.search_log.clamp(4, 6);
+            debug_assert!(cparams.hash_log >= row_log);
+            self.row_hash_log = cparams.hash_log - row_log;
+        }
         self.cparams = cparams;
         self.force_non_contiguous = false;
+    }
+
+    /// `ZSTD_advanceHashSalt()`: mixes the collected entropy into the salt.
+    fn advance_hash_salt(&mut self) {
+        self.hash_salt = bitmix(self.hash_salt, 8) ^ bitmix(u64::from(self.hash_salt_entropy), 4);
+    }
+
+    /// Forgets the hash salt history, as for a newly created libzstd
+    /// context (`hashSalt` and `hashSaltEntropy` start at 0).
+    pub(crate) fn clear_hash_salt(&mut self) {
+        self.hash_salt = 0;
+        self.hash_salt_entropy = 0;
     }
 
     /// `ZSTD_invalidateMatchState()`.
@@ -398,14 +484,14 @@ impl MatchState {
         let max_dist = 1u32 << self.cparams.window_log;
         if self.window.need_overflow_correction(iend) {
             let correction = self.window.correct_overflow(cycle_log, max_dist, ip);
-            // ZSTD_reduceIndex for `fast` and `dfast` (btlazy2's chain
-            // table needs ZSTD_reduceTable_btlazy2).
-            debug_assert!(matches!(
-                self.cparams.strategy,
-                Strategy::Fast | Strategy::DFast
-            ));
+            // ZSTD_reduceIndex (the chain table is empty when not
+            // allocated; the row match finder's tags hold no indices).
             reduce_table(&mut self.hash_table, correction);
-            reduce_table(&mut self.chain_table, correction);
+            if self.cparams.strategy == Strategy::BtLazy2 {
+                reduce_table_btlazy2(&mut self.chain_table, correction);
+            } else {
+                reduce_table(&mut self.chain_table, correction);
+            }
             self.next_to_update = self.next_to_update.saturating_sub(correction);
             self.loaded_dict_end = 0;
         }
@@ -497,8 +583,14 @@ pub(crate) fn build_seq_store(
         ms.next_to_update = curr - 192u32.min(curr - ms.next_to_update - 384);
     }
     let last_ll_size = match ms.cparams.strategy {
+        Strategy::Fast => compress_block_fast(ms, ss, rep, buf, start, end),
         Strategy::DFast => super::dfast::compress_block_double_fast(ms, ss, rep, buf, start, end),
-        _ => compress_block_fast(ms, ss, rep, buf, start, end),
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2 => {
+            super::lazy::compress_block_lazy(ms, ss, rep, buf, start, end)
+        }
+        Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
+            unimplemented!("strategy {:?} (issue #9)", ms.cparams.strategy)
+        }
     };
     ss.store_last_literals(&buf[end - last_ll_size..end]);
     true

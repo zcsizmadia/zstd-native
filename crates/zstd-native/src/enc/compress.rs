@@ -465,15 +465,23 @@ fn write_frame_header(dst: &mut [u8], cp: &CParams, src_size: u64) -> Result<usi
     Ok(pos)
 }
 
-/// Compresses `src` at `level` into `dst` with `fc` (or a fresh compressor).
+/// Compresses `src` at `level` into `dst` with `fc` (or a new compressor).
+/// With `fresh`, a reused `fc` behaves like a new one, as libzstd's
+/// one-shot `ZSTD_compress` (a new context per call); otherwise like a
+/// reused libzstd context, whose row match finder hash salt changes from
+/// frame to frame.
 pub(crate) fn compress_to_slice_with(
     fc: &mut Option<Box<FrameCompressor>>,
     src: &[u8],
     dst: &mut [u8],
     level: i32,
+    fresh: bool,
 ) -> Result<usize> {
     let fc = match fc {
         Some(f) => {
+            if fresh {
+                f.ms.clear_hash_salt();
+            }
             f.reset(level, src.len());
             f
         }
@@ -487,9 +495,10 @@ pub(crate) fn compress_with(
     fc: &mut Option<Box<FrameCompressor>>,
     src: &[u8],
     level: i32,
+    fresh: bool,
 ) -> Result<Vec<u8>> {
     let mut out = alloc::vec![0u8; compress_bound(src.len())];
-    let n = compress_to_slice_with(fc, src, &mut out, level)?;
+    let n = compress_to_slice_with(fc, src, &mut out, level, fresh)?;
     out.truncate(n);
     Ok(out)
 }
