@@ -48,6 +48,7 @@ mod block;
 mod cpu;
 mod decoder;
 mod dict;
+mod enc;
 mod error;
 mod frame;
 mod fse;
@@ -61,6 +62,7 @@ mod xxhash;
 
 pub use decoder::{Decompressor, content_size, decompress, decompress_to_slice};
 pub use dict::Dictionary;
+pub use enc::{compress, compress_bound, compress_to_slice};
 pub use error::Error;
 pub use frame::FrameHeader;
 #[cfg(feature = "std")]

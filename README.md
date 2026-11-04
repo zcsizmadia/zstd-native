@@ -6,9 +6,15 @@ to match or beat C libzstd 1.5.7 in speed. No C code, `no_std` + `alloc`.
 **Status: early development.** The decoder is complete: one-shot and
 streaming (`std::io::Read` and a `no_std` push API), all frame and block
 types, dictionaries, checksums, concatenated and skippable frames, tested
-against libzstd. The encoder is next (see [docs/PROPOSAL.md](docs/PROPOSAL.md)).
+against libzstd.
+
+The encoder is in progress: its output is byte-identical to libzstd's for
+the same input and level. Levels 1-2 and the negative levels (the `fast`
+strategy) work today, at about 0.9-0.95x libzstd's speed; the other
+strategies follow (issues #7-#10).
 
 ```rust
+let compressed = zstd_native::compress(&data, 1)?; // same bytes as libzstd
 let data = zstd_native::decompress(&compressed)?;
 
 // Reuse tables and buffers across calls, optionally with a dictionary:

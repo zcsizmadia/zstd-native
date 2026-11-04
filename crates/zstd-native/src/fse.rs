@@ -299,15 +299,15 @@ pub(crate) const OF_BITS: [u8; MAX_OFF + 1] = {
     t
 };
 
-const LL_DEFAULT_NORM: [i16; MAX_LL + 1] = [
+pub(crate) const LL_DEFAULT_NORM: [i16; MAX_LL + 1] = [
     4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
     -1, -1, -1, -1,
 ];
-const ML_DEFAULT_NORM: [i16; MAX_ML + 1] = [
+pub(crate) const ML_DEFAULT_NORM: [i16; MAX_ML + 1] = [
     1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1,
 ];
-const OF_DEFAULT_NORM: [i16; 29] = [
+pub(crate) const OF_DEFAULT_NORM: [i16; 29] = [
     1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
 ];
 
