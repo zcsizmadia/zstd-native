@@ -1,6 +1,7 @@
 //! The optimal parser (btopt, btultra and btultra2: levels 16-22 for
 //! inputs over 256 KB, down to 11 for small ones): a port of libzstd
-//! 1.5.7's `compress/zstd_opt.c`, no-dictionary paths.
+//! 1.5.7's `compress/zstd_opt.c` (noDict, extDict and dictMatchState
+//! paths).
 //!
 //! - Price model: `ZSTD_rescaleFreqs`, `ZSTD_setBasePrices`,
 //!   `ZSTD_updateStats`, `ZSTD_rawLiteralsCost`, `ZSTD_litLengthPrice`,
@@ -23,10 +24,13 @@
 //! Like libzstd's templates, the parser is monomorphized on `mls`
 //! (`minMatch` bounded to 3..=6) and `optLevel`.
 //!
-//! Not ported (dictionary-only): `ZSTD_rescaleFreqs`' seeding from the
-//! previous block's entropy tables, which libzstd only does when those
-//! tables are valid (`HUF_repeat_valid`), i.e. from a dictionary; the
-//! dictMatchState match finders; LDM candidates (`ZSTD_optLdm_*`).
+//! With a dictionary whose literals table covers every byte value
+//! (`HUF_repeat_valid`), the first block's statistics are seeded from the
+//! dictionary's entropy tables ([`DictCosts`]). With an attached dictionary
+//! (`DMS`), the match finder also checks the repcodes into it and searches
+//! its (sorted, read-only) binary tree with the compares left; btultra2
+//! uses btultra's dictMatchState variant, as in libzstd. Not ported: LDM
+//! candidates (`ZSTD_optLdm_*`).
 //!
 //! With an extDict (a stream whose input buffer wrapped), the match finder
 //! runs with `EXT`: candidates below `dictLimit` are read from the extDict
@@ -45,8 +49,10 @@
 //! (`iend`); hashing reads 8 bytes at positions at most `iend - 8`.
 //! Debug builds check every read with `chk`.
 
-use super::fast::{ExtWindow, MatchState, hash_mls, index_overlap_check};
+use super::compress::EntropyTables;
+use super::fast::{DmsView, ExtWindow, HASH_READ_SIZE, MatchState, hash_mls, index_overlap_check};
 use super::hist::hist_count_simple;
+use super::huf_enc::HufRepeat;
 use super::params::{BLOCKSIZE_MAX, Strategy};
 use super::seq_store::{
     MAX_LL, MAX_ML, MAX_OFF, MINMATCH, REP_NUM, SeqStore, count, count_2segments, hash3_ptr,
@@ -99,6 +105,62 @@ struct Optimal {
     rep: [u32; 3],
 }
 
+/// The statistics `ZSTD_rescaleFreqs` seeds the first block of a frame
+/// with when the previous block's entropy tables come from a dictionary
+/// (`symbolCosts->huf.repeatMode == HUF_repeat_valid`): each symbol's
+/// frequency is `1 << (scaleLog - bitCost)` (1 for a cost of 0), from the
+/// Huffman code lengths (scale 2K) and the FSE tables' `FSE_getMaxNbBits`
+/// (scale 1K).
+#[derive(Clone, Debug)]
+pub(crate) struct DictCosts {
+    lit_freq: [u32; MAX_LIT + 1],
+    lit_length_freq: [u32; MAX_LL as usize + 1],
+    match_length_freq: [u32; MAX_ML as usize + 1],
+    off_code_freq: [u32; MAX_OFF as usize + 1],
+}
+
+impl DictCosts {
+    /// The seed from `e`, the entropy tables a frame starts with; `None`
+    /// unless its Huffman table is `HUF_repeat_valid` (only a zstd-format
+    /// dictionary with a weight for every byte makes it so at a frame
+    /// start).
+    pub(crate) fn new(e: &EntropyTables) -> Option<alloc::boxed::Box<DictCosts>> {
+        if e.huf.repeat != HufRepeat::Valid {
+            return None;
+        }
+        // `1 << (scaleLog - bitCost)`: libzstd asserts `bitCost <= scaleLog`
+        // (shift counts wrap like on x86 otherwise)
+        let freq = |bit_cost: u32, scale_log: u32| {
+            if bit_cost != 0 {
+                1u32.wrapping_shl(scale_log.wrapping_sub(bit_cost))
+            } else {
+                1 // minimum to calculate cost
+            }
+        };
+        let mut c = alloc::boxed::Box::new(DictCosts {
+            lit_freq: [0; MAX_LIT + 1],
+            lit_length_freq: [0; MAX_LL as usize + 1],
+            match_length_freq: [0; MAX_ML as usize + 1],
+            off_code_freq: [0; MAX_OFF as usize + 1],
+        });
+        // literals from the Huffman table, scaled to 2K
+        for (lit, f) in c.lit_freq.iter_mut().enumerate() {
+            *f = freq(e.huf.table.nb_bits(lit as u32), 11);
+        }
+        // sequence symbols from the FSE tables, scaled to 1K
+        for (ll, f) in c.lit_length_freq.iter_mut().enumerate() {
+            *f = freq(e.fse.ll.max_nb_bits(ll as u32), 10);
+        }
+        for (ml, f) in c.match_length_freq.iter_mut().enumerate() {
+            *f = freq(e.fse.ml.max_nb_bits(ml as u32), 10);
+        }
+        for (of, f) in c.off_code_freq.iter_mut().enumerate() {
+            *f = freq(e.fse.of.max_nb_bits(of as u32), 10);
+        }
+        Some(c)
+    }
+}
+
 /// `ZSTD_match_t`.
 #[derive(Clone, Copy, Debug, Default)]
 struct Match {
@@ -136,6 +198,10 @@ pub(crate) struct OptState {
     price_table: Vec<Optimal>,
     /// `matchTable`
     match_table: Vec<Match>,
+    /// The first block's seed from the frame's initial entropy tables
+    /// (`symbolCosts`), when they come from a dictionary; set when a frame
+    /// starts.
+    pub(crate) dict_costs: Option<alloc::boxed::Box<DictCosts>>,
 }
 
 impl core::fmt::Debug for OptState {
@@ -166,6 +232,7 @@ impl OptState {
             },
             price_table: vec![Optimal::default(); OPT_SIZE],
             match_table: vec![Match::default(); OPT_SIZE],
+            dict_costs: None,
         }
     }
 }
@@ -238,11 +305,12 @@ impl OptStats {
         self.off_code_sum_base_price = weight::<OPT_LEVEL>(self.off_code_sum);
     }
 
-    /// `ZSTD_rescaleFreqs()` without a dictionary: on the first block of a
-    /// frame (`litLengthSum == 0`), literal statistics from the raw block
-    /// and baseline statistics for the sequence symbols; afterwards, the
-    /// accumulated statistics scaled down.
-    fn rescale_freqs<const OPT_LEVEL: u32>(&mut self, src: &[u8]) {
+    /// `ZSTD_rescaleFreqs()`: on the first block of a frame
+    /// (`litLengthSum == 0`), the statistics from a dictionary's entropy
+    /// tables (`dict`, see [`DictCosts`]), or else literal statistics from
+    /// the raw block and baseline statistics for the sequence symbols;
+    /// afterwards, the accumulated statistics scaled down.
+    fn rescale_freqs<const OPT_LEVEL: u32>(&mut self, src: &[u8], dict: Option<&DictCosts>) {
         self.price_type = PriceType::Dynamic;
         if self.lit_length_sum == 0 {
             // first block: init
@@ -250,11 +318,24 @@ impl OptStats {
                 // heuristic: use pre-defined stats for too small inputs
                 self.price_type = PriceType::Predef;
             }
-            // (libzstd seeds the statistics from the previous block's
-            // entropy tables when they are `HUF_repeat_valid`, which only a
-            // dictionary makes them at a frame start.)
+            if let Some(d) = dict {
+                // huffman stats covering the full value set: table presumed
+                // generated by dictionary
+                self.price_type = PriceType::Dynamic;
+                self.lit_freq = d.lit_freq;
+                self.lit_sum = d.lit_freq.iter().sum();
+                self.lit_length_freq = d.lit_length_freq;
+                self.lit_length_sum = d.lit_length_freq.iter().sum();
+                self.match_length_freq = d.match_length_freq;
+                self.match_length_sum = d.match_length_freq.iter().sum();
+                self.off_code_freq = d.off_code_freq;
+                self.off_code_sum = d.off_code_freq.iter().sum();
+                self.set_base_prices::<OPT_LEVEL>();
+                return;
+            }
 
-            // base initial cost of literals on direct frequency within src
+            // first block, no dictionary: base initial cost of literals on
+            // direct frequency within src
             let mut lit = MAX_LIT as u32;
             hist_count_simple(&mut self.lit_freq, &mut lit, src);
             self.lit_sum = downscale_stats(&mut self.lit_freq, 8, false);
@@ -430,11 +511,39 @@ struct Bt {
     iend: *const u8,
     /// The extDict (`window.dictBase`), its readable part
     /// `dict_lowest..dict_end` (empty without an extDict) and the prefix
-    /// start.
+    /// start. With an attached dictionary (dictMatchState), its
+    /// `dms->window.base`, start and `nextSrc` instead.
     dict_base: *const u8,
     dict_lowest: *const u8,
     dict_end: *const u8,
     prefix_start: *const u8,
+    /// The attached dictionary's tables (dictMatchState only).
+    dms: OptDms,
+}
+
+/// The attached dictionary's tables and limits as the optimal parser's
+/// dictMatchState match finder uses them.
+#[derive(Clone, Copy)]
+struct OptDms {
+    hash_table: *const u32,
+    bt: *const u32,
+    /// `dms->cParams.hashLog`, and the mask of its tree (`chainLog - 1`).
+    hash_log: u32,
+    bt_mask: u32,
+    /// `dms->window.lowLimit` and `nextSrc - base` (`dmsHighLimit`).
+    low_limit: u32,
+    high_limit: u32,
+}
+
+impl OptDms {
+    const NONE: OptDms = OptDms {
+        hash_table: core::ptr::null(),
+        bt: core::ptr::null(),
+        hash_log: 0,
+        bt_mask: 0,
+        low_limit: 0,
+        high_limit: 0,
+    };
 }
 
 impl Bt {
@@ -718,7 +827,7 @@ unsafe fn update_tree<const MLS: u32, const EXT: bool>(s: &mut Bt, ip: *const u8
 /// `ip + 8 <= iend`, `iend` the block end.
 #[allow(unsafe_code, clippy::too_many_arguments)]
 #[inline(never)]
-unsafe fn get_all_matches<const MLS: u32, const EXT: bool>(
+unsafe fn get_all_matches<const MLS: u32, const EXT: bool, const DMS: bool>(
     s: &mut Bt,
     matches: &mut [Match],
     next_to_update3: &mut u32,
@@ -807,6 +916,26 @@ unsafe fn get_all_matches<const MLS: u32, const EXT: bool>(
                     rep_len = s.count_ext(ip.add(min_match), rep_match.add(min_match), ilimit)
                         + min_match;
                 }
+            } else if DMS {
+                // repIndex < dictLimit || repIndex >= curr: in the attached
+                // dictionary (`dmsBase + repIndex - dmsIndexDelta`)
+                let dms_index_delta = window_low.wrapping_sub(s.dms.high_limit);
+                let rep_match = s
+                    .dict_base
+                    .wrapping_add(rep_index.wrapping_sub(dms_index_delta) as usize);
+                // `curr > repIndex >= dmsLowLimit`, the 4 bytes in the
+                // dictionary
+                if (rep_offset.wrapping_sub(1)
+                    < curr.wrapping_sub(s.dms.low_limit.wrapping_add(dms_index_delta)))
+                    & index_overlap_check(dict_limit, rep_index)
+                    && {
+                        s.chk(rep_match, 4);
+                        read_minmatch::<MLS>(ip) == read_minmatch::<MLS>(rep_match)
+                    }
+                {
+                    rep_len = s.count_ext(ip.add(min_match), rep_match.add(min_match), ilimit)
+                        + min_match;
+                }
             }
 
             // save longer solution
@@ -879,6 +1008,9 @@ unsafe fn get_all_matches<const MLS: u32, const EXT: bool>(
                 if (match_length > OPT_NUM as usize) | (ip.add(match_length) == ilimit) {
                     // equal: no way to know if inf or sup; drop, to
                     // preserve bt consistency
+                    if DMS {
+                        nb_compares = 0; // break should also skip searching dms
+                    }
                     break;
                 }
             }
@@ -908,6 +1040,72 @@ unsafe fn get_all_matches<const MLS: u32, const EXT: bool>(
         *smaller_ptr = 0;
         *larger_ptr = 0;
 
+        if DMS && nb_compares > 0 {
+            // the attached dictionary's tree (sorted, read only), with the
+            // compares left; its candidates are positions it inserted (at
+            // least 8 bytes before its end), counted on into the prefix
+            let d = s.dms;
+            let dms_index_delta = window_low.wrapping_sub(d.high_limit);
+            let dms_bt_low = if d.bt_mask < d.high_limit - d.low_limit {
+                d.high_limit - d.bt_mask
+            } else {
+                d.low_limit
+            };
+            let dms_h = hash_mls::<MLS>(ip, d.hash_log);
+            let mut dict_match_index = *d.hash_table.add(dms_h);
+            common_length_smaller = 0;
+            common_length_larger = 0;
+            while nb_compares > 0 && dict_match_index > d.low_limit {
+                let next_ptr = d.bt.add(2 * (dict_match_index & d.bt_mask) as usize);
+                // guaranteed minimum nb of common bytes
+                let mut match_length = common_length_smaller.min(common_length_larger);
+                let mut m = s.dict_base.wrapping_add(dict_match_index as usize);
+                s.chk(m, 0);
+                // (a guaranteed length past the dictionary's end counts no
+                // more, as in libzstd)
+                if m.wrapping_add(match_length) as usize <= s.dict_end as usize {
+                    match_length += s.count_ext(ip.add(match_length), m.add(match_length), ilimit);
+                }
+                if dict_match_index as usize + match_length >= d.high_limit as usize {
+                    // to prepare for next usage of match[matchLength]
+                    m = s
+                        .base
+                        .wrapping_add(dict_match_index.wrapping_add(dms_index_delta) as usize);
+                }
+
+                if match_length > best_length {
+                    let match_index = dict_match_index.wrapping_add(dms_index_delta);
+                    if match_length > match_end_idx.wrapping_sub(match_index) as usize {
+                        match_end_idx = match_index + match_length as u32;
+                    }
+                    best_length = match_length;
+                    matches[mnum] = Match {
+                        off: offset_to_offbase(curr - match_index),
+                        len: match_length as u32,
+                    };
+                    mnum += 1;
+                    if (match_length > OPT_NUM as usize) | (ip.add(match_length) == ilimit) {
+                        break; // drop, to guarantee consistency
+                    }
+                }
+
+                if dict_match_index <= dms_bt_low {
+                    break; // beyond tree size, stop the search
+                }
+                let mm = m.wrapping_add(match_length);
+                s.chk(mm, 1);
+                if *mm < *ip.add(match_length) {
+                    common_length_smaller = match_length;
+                    dict_match_index = *next_ptr.add(1);
+                } else {
+                    // match is larger than current
+                    common_length_larger = match_length;
+                    dict_match_index = *next_ptr;
+                }
+                nb_compares -= 1;
+            }
+        }
+
         debug_assert!(match_end_idx > curr + 8);
         s.next_to_update = match_end_idx - 8; // skip repetitive patterns
     }
@@ -933,8 +1131,8 @@ pub(crate) fn compress_block_opt(
     end: usize,
 ) -> usize {
     match ms.cparams.strategy {
-        Strategy::BtOpt => opt_dispatch::<0, false>(ms, ss, rep, buf, start, end),
-        Strategy::BtUltra => opt_dispatch::<2, false>(ms, ss, rep, buf, start, end),
+        Strategy::BtOpt => opt_dispatch::<0, false, false>(ms, ss, rep, buf, start, end),
+        Strategy::BtUltra => opt_dispatch::<2, false, false>(ms, ss, rep, buf, start, end),
         Strategy::BtUltra2 => {
             let curr = ms.window.index(start);
             // 2-passes strategy: a first pass over the first block of a
@@ -949,10 +1147,93 @@ pub(crate) fn compress_block_opt(
             {
                 init_stats_ultra(ms, ss, rep, buf, start, end);
             }
-            opt_dispatch::<2, false>(ms, ss, rep, buf, start, end)
+            opt_dispatch::<2, false, false>(ms, ss, rep, buf, start, end)
         }
         s => unreachable!("not an optimal strategy: {s:?}"),
     }
+}
+
+/// `ZSTD_compressBlock_btopt_dictMatchState()` and
+/// `ZSTD_compressBlock_btultra_dictMatchState()` (also for btultra2, as in
+/// libzstd): as [`compress_block_opt`], with an attached dictionary
+/// ([`MatchState::dms`]) whose repcodes and binary tree are searched too.
+#[inline(never)]
+pub(crate) fn compress_block_opt_dict_match_state(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
+    match ms.cparams.strategy {
+        Strategy::BtOpt => opt_dispatch::<0, false, true>(ms, ss, rep, buf, start, end),
+        Strategy::BtUltra | Strategy::BtUltra2 => {
+            opt_dispatch::<2, false, true>(ms, ss, rep, buf, start, end)
+        }
+        s => unreachable!("not an optimal strategy: {s:?}"),
+    }
+}
+
+/// `ZSTD_updateTree()` for a dictionary's content (`ZSTD_loadDictionaryContent`
+/// for btlazy2 and the optimal strategies): inserts the positions from
+/// `nextToUpdate` up to `end - HASH_READ_SIZE` of `buf` into the (sorted)
+/// binary tree, with `mls = minMatch`.
+///
+/// # Panics
+///
+/// If the window is not one segment of `buf` covering those positions, or
+/// the tables have not the size of the parameters.
+#[allow(unsafe_code)]
+pub(crate) fn update_tree_for_dict(ms: &mut MatchState, buf: &[u8], end: usize) {
+    let cparams = ms.cparams;
+    // These checks make the raw-pointer accesses below sound.
+    assert!(end <= buf.len() && end >= HASH_READ_SIZE);
+    assert!(cparams.hash_log <= 32 && ms.hash_table.len() == 1usize << cparams.hash_log);
+    assert!(cparams.chain_log >= 1 && cparams.chain_log <= 32);
+    assert!(ms.chain_table.len() == 1usize << cparams.chain_log);
+    assert!(!ms.window.has_ext_dict());
+    let window_start = ms.window.pos(ms.window.dict_limit);
+    assert!(window_start <= ms.window.pos(ms.next_to_update));
+    assert!(end.wrapping_sub(ms.window.base) <= u32::MAX as usize);
+    let bp = buf.as_ptr();
+    let base = bp.wrapping_add(ms.window.base);
+    let iend = bp.wrapping_add(end);
+    let mut s = Bt {
+        base,
+        hash_table: ms.hash_table.as_mut_ptr(),
+        bt: ms.chain_table.as_mut_ptr(),
+        hash_table3: ms.hash_table3.as_mut_ptr(),
+        hash_log: cparams.hash_log,
+        hash_log3: ms.hash_log3,
+        bt_mask: (1u32 << (cparams.chain_log - 1)) - 1,
+        search_log: cparams.search_log,
+        window_log: cparams.window_log,
+        low_limit: ms.window.low_limit,
+        dict_limit: ms.window.dict_limit,
+        loaded_dict_end: ms.loaded_dict_end,
+        next_to_update: ms.next_to_update,
+        sufficient_len: cparams.target_length.min(OPT_NUM - 1),
+        lowest: bp.wrapping_add(window_start),
+        iend,
+        dict_base: base,
+        dict_lowest: iend,
+        dict_end: iend,
+        prefix_start: bp.wrapping_add(window_start),
+        dms: OptDms::NONE,
+    };
+    let ip = iend.wrapping_sub(HASH_READ_SIZE);
+    // SAFETY: the positions inserted are in the window, before `ip`, and
+    // readable up to `iend` (asserted above); see `update_tree`.
+    unsafe {
+        match cparams.min_match {
+            5 => update_tree::<5, false>(&mut s, ip, iend),
+            6 => update_tree::<6, false>(&mut s, ip, iend),
+            7 => update_tree::<7, false>(&mut s, ip, iend),
+            _ => update_tree::<4, false>(&mut s, ip, iend),
+        }
+    }
+    ms.next_to_update = s.next_to_update;
 }
 
 /// `ZSTD_compressBlock_btopt_extDict()` and `ZSTD_compressBlock_btultra_extDict()`
@@ -969,9 +1250,9 @@ pub(crate) fn compress_block_opt_ext_dict(
     end: usize,
 ) -> usize {
     match ms.cparams.strategy {
-        Strategy::BtOpt => opt_dispatch::<0, true>(ms, ss, rep, buf, start, end),
+        Strategy::BtOpt => opt_dispatch::<0, true, false>(ms, ss, rep, buf, start, end),
         Strategy::BtUltra | Strategy::BtUltra2 => {
-            opt_dispatch::<2, true>(ms, ss, rep, buf, start, end)
+            opt_dispatch::<2, true, false>(ms, ss, rep, buf, start, end)
         }
         s => unreachable!("not an optimal strategy: {s:?}"),
     }
@@ -993,7 +1274,7 @@ fn init_stats_ultra(
     debug_assert!(ss.nb_seq == 0); // no ldm
     debug_assert!(ms.window.dict_limit == ms.window.low_limit); // no dictionary
     debug_assert!(ms.window.dict_limit.wrapping_sub(ms.next_to_update) <= 1); // no prefix
-    opt_dispatch::<2, false>(ms, ss, &mut tmp_rep, buf, start, end); // generate stats into ms.opt
+    opt_dispatch::<2, false, false>(ms, ss, &mut tmp_rep, buf, start, end); // generate stats into ms.opt
     // invalidate the first scan from history, only keep entropy stats
     ss.reset();
     ms.window.base = ms.window.base.wrapping_sub(src_size);
@@ -1004,7 +1285,7 @@ fn init_stats_ultra(
 
 /// Picks the `mls` instance of [`opt_generic`].
 #[inline(always)]
-fn opt_dispatch<const OPT_LEVEL: u32, const EXT: bool>(
+fn opt_dispatch<const OPT_LEVEL: u32, const EXT: bool, const DMS: bool>(
     ms: &mut MatchState,
     ss: &mut SeqStore,
     rep: &mut [u32; 3],
@@ -1013,10 +1294,10 @@ fn opt_dispatch<const OPT_LEVEL: u32, const EXT: bool>(
     end: usize,
 ) -> usize {
     match ms.cparams.min_match.clamp(3, 6) {
-        3 => opt_generic::<3, OPT_LEVEL, EXT>(ms, ss, rep, buf, start, end),
-        4 => opt_generic::<4, OPT_LEVEL, EXT>(ms, ss, rep, buf, start, end),
-        5 => opt_generic::<5, OPT_LEVEL, EXT>(ms, ss, rep, buf, start, end),
-        _ => opt_generic::<6, OPT_LEVEL, EXT>(ms, ss, rep, buf, start, end),
+        3 => opt_generic::<3, OPT_LEVEL, EXT, DMS>(ms, ss, rep, buf, start, end),
+        4 => opt_generic::<4, OPT_LEVEL, EXT, DMS>(ms, ss, rep, buf, start, end),
+        5 => opt_generic::<5, OPT_LEVEL, EXT, DMS>(ms, ss, rep, buf, start, end),
+        _ => opt_generic::<6, OPT_LEVEL, EXT, DMS>(ms, ss, rep, buf, start, end),
     }
 }
 
@@ -1024,7 +1305,7 @@ fn opt_dispatch<const OPT_LEVEL: u32, const EXT: bool>(
 /// `ZSTD_extDict` with `EXT`) and no LDM.
 #[allow(unsafe_code)]
 #[inline(always)]
-fn opt_generic<const MLS: u32, const OPT_LEVEL: u32, const EXT: bool>(
+fn opt_generic<const MLS: u32, const OPT_LEVEL: u32, const EXT: bool, const DMS: bool>(
     ms: &mut MatchState,
     ss: &mut SeqStore,
     rep: &mut [u32; 3],
@@ -1044,23 +1325,46 @@ fn opt_generic<const MLS: u32, const OPT_LEVEL: u32, const EXT: bool>(
         assert!(ms.hash_table3.len() == 1usize << ms.hash_log3);
     }
     assert!(EXT == ms.window.has_ext_dict());
+    assert!(!(EXT && DMS));
     let window_start = ms.window.pos(ms.window.dict_limit);
     assert!(window_start <= start, "window start is not in the buffer");
     assert!(ms.next_to_update >= ms.window.dict_limit);
     assert!(end.wrapping_sub(ms.window.base) <= u32::MAX as usize);
-    // With an extDict: it is in the buffer (and so is the prefix).
-    let (dict_lowest, dict_end) = if EXT {
+    // With an extDict: it is in its buffer (and the prefix in `buf`). With
+    // an attached dictionary: its content and tables, checked by
+    // `DmsView::new`.
+    let cd = if DMS {
+        Some(ms.dict.clone().expect("attached dictionary"))
+    } else {
+        None
+    };
+    let (dict_base, dict_lowest, dict_end, dms) = if EXT {
         let w = ExtWindow::new(
             &ms.window,
             buf,
+            ms.ext_buf(buf),
             start,
             end,
             ms.window.low_limit,
             ms.window.dict_limit,
         );
-        (w.dict_start, w.dict_end)
+        (w.dict_base, w.dict_start, w.dict_end, OptDms::NONE)
+    } else if let Some(cd) = &cd {
+        let d = DmsView::new(cd);
+        assert!(d.chain_log >= 1 && d.chain_log <= 32 && d.hash_log <= 32);
+        assert!(cd.ms.chain_table.len() == 1usize << d.chain_log);
+        assert!(ms.window.dict_limit >= d.high_limit);
+        let dms = OptDms {
+            hash_table: d.hash_table,
+            bt: d.chain_table,
+            hash_log: d.hash_log,
+            bt_mask: (1u32 << (d.chain_log - 1)) - 1,
+            low_limit: d.low_limit,
+            high_limit: d.high_limit,
+        };
+        (d.base, d.start, d.end, dms)
     } else {
-        (buf.as_ptr(), buf.as_ptr())
+        (buf.as_ptr(), buf.as_ptr(), buf.as_ptr(), OptDms::NONE)
     };
     debug_assert!(OPT_LEVEL <= 2);
 
@@ -1069,6 +1373,7 @@ fn opt_generic<const MLS: u32, const OPT_LEVEL: u32, const EXT: bool>(
         stats,
         price_table,
         match_table,
+        dict_costs,
     } = &mut *st;
     assert!(price_table.len() == OPT_SIZE && match_table.len() == OPT_SIZE);
     let opt = &mut price_table[..];
@@ -1101,10 +1406,11 @@ fn opt_generic<const MLS: u32, const OPT_LEVEL: u32, const EXT: bool>(
         sufficient_len,
         lowest: bp.wrapping_add(window_start),
         iend,
-        dict_base: bp.wrapping_add(ms.window.dict_base),
+        dict_base,
         dict_lowest,
         dict_end,
         prefix_start,
+        dms,
     };
 
     let mut ip = istart;
@@ -1112,7 +1418,7 @@ fn opt_generic<const MLS: u32, const OPT_LEVEL: u32, const EXT: bool>(
     let mut last_stretch = Optimal::default();
 
     // init
-    stats.rescale_freqs::<OPT_LEVEL>(&buf[start..end]);
+    stats.rescale_freqs::<OPT_LEVEL>(&buf[start..end], dict_costs.as_deref());
     ip = ip.wrapping_add((ip == prefix_start) as usize);
 
     // SAFETY (whole loop): see the module docs. Matches are searched at
@@ -1131,7 +1437,7 @@ fn opt_generic<const MLS: u32, const OPT_LEVEL: u32, const EXT: bool>(
                 {
                     let litlen = (ip as usize - anchor as usize) as u32;
                     let ll0 = u32::from(litlen == 0);
-                    let nb_matches = get_all_matches::<MLS, EXT>(
+                    let nb_matches = get_all_matches::<MLS, EXT, DMS>(
                         &mut s,
                         matches,
                         &mut next_to_update3,
@@ -1289,7 +1595,7 @@ fn opt_generic<const MLS: u32, const OPT_LEVEL: u32, const EXT: bool>(
                         let previous_price = opt[c].price;
                         let base_price = previous_price + stats.ll_price::<OPT_LEVEL>(0);
                         let reps = opt[c].rep;
-                        let nb_matches = get_all_matches::<MLS, EXT>(
+                        let nb_matches = get_all_matches::<MLS, EXT, DMS>(
                             &mut s,
                             matches,
                             &mut next_to_update3,

@@ -5,7 +5,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::vec;
 
 use crate::dict::Dictionary;
-use crate::enc::{EndOp, StreamEncoder};
+use crate::enc::{EncoderDictionary, EndOp, StreamEncoder};
 use crate::error::Error;
 use crate::stream::StreamDecoder;
 
@@ -152,6 +152,44 @@ impl<W: Write> Encoder<W> {
         Encoder {
             writer,
             enc: StreamEncoder::new(level),
+            buf: vec![0u8; ENCODER_BUF_SIZE].into_boxed_slice(),
+        }
+    }
+
+    /// Compresses at `level` with the dictionary `dict` (see
+    /// [`Compressor::set_dictionary`](crate::Compressor::set_dictionary))
+    /// into `writer`, like the `zstd` crate's `Encoder::with_dictionary`.
+    ///
+    /// ```
+    /// use std::io::Write;
+    /// let dict = b"hello world, hello there";
+    /// let mut enc = zstd_native::Encoder::with_dictionary(Vec::new(), 3, dict)?;
+    /// enc.write_all(b"hello there, hello world")?;
+    /// let compressed = enc.finish()?;
+    /// let dict = zstd_native::Dictionary::new(dict).unwrap();
+    /// let mut d = zstd_native::Decompressor::with_dictionary(dict);
+    /// assert_eq!(d.decompress(&compressed).unwrap(), b"hello there, hello world");
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::InvalidData`] if a zstd-format dictionary is
+    /// corrupt.
+    pub fn with_dictionary(writer: W, level: i32, dict: &[u8]) -> io::Result<Self> {
+        Ok(Encoder {
+            writer,
+            enc: StreamEncoder::with_dictionary(level, dict).map_err(enc_err)?,
+            buf: vec![0u8; ENCODER_BUF_SIZE].into_boxed_slice(),
+        })
+    }
+
+    /// Compresses with a prepared dictionary, at its level, into `writer`
+    /// (the `zstd` crate's `Encoder::with_prepared_dictionary`).
+    pub fn with_prepared_dictionary(writer: W, dict: &EncoderDictionary) -> Self {
+        Encoder {
+            writer,
+            enc: StreamEncoder::with_prepared_dictionary(dict),
             buf: vec![0u8; ENCODER_BUF_SIZE].into_boxed_slice(),
         }
     }

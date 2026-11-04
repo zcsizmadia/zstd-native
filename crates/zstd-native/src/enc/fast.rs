@@ -1,5 +1,6 @@
 //! The `fast` strategy (levels 1-2 and negative levels): a port of libzstd
-//! 1.5.7's `compress/zstd_fast.c` (noDict and extDict paths), plus the
+//! 1.5.7's `compress/zstd_fast.c` (noDict, extDict and dictMatchState
+//! paths), plus the
 //! parts of `ZSTD_MatchState_t` / `ZSTD_window_t`
 //! (`compress/zstd_compress_internal.h`) and of `zstd_compress.c`'s block
 //! loop that drive it.
@@ -23,6 +24,17 @@
 //! them as raw pointers for the `_extDict` match finders, which
 //! [`build_seq_store`] picks when [`Window::has_ext_dict`] (libzstd's
 //! `ZSTD_selectBlockCompressor`).
+//!
+//! # Dictionaries
+//!
+//! A dictionary's content (see the `cdict` module) stays in its own buffer:
+//! a window that starts with it has `base` in that buffer
+//! ([`Window::base_in_dict`]), and the frame's first input segment makes
+//! it the extDict ([`Window::dict_base_in_dict`], read through
+//! [`MatchState::ext_buf`]). An attached dictionary ([`MatchState::dms`]) is
+//! not in the window at all: the `_dictMatchState` match finders read its
+//! own window and tables ([`DmsView`]), its index `i` standing for the
+//! window's `i + dictIndexDelta`, just below the prefix.
 //!
 //! # Driving it (libzstd's one-shot path, `ZSTD_compress2`/`ZSTD_compress`)
 //!
@@ -92,6 +104,13 @@ pub(crate) struct Window {
     pub(crate) low_limit: u32,
     /// `nbOverflowCorrections`.
     pub(crate) nb_overflow_corrections: u32,
+    /// `base` is a position in the dictionary's buffer, not the caller's
+    /// (after loading a dictionary's content, see
+    /// [`MatchState::dict`]): the next update is non-contiguous.
+    pub(crate) base_in_dict: bool,
+    /// `dictBase` is a position in the dictionary's buffer: the extDict
+    /// segment is the loaded dictionary.
+    pub(crate) dict_base_in_dict: bool,
 }
 
 impl Window {
@@ -104,6 +123,8 @@ impl Window {
             dict_limit: WINDOW_START_INDEX,
             low_limit: WINDOW_START_INDEX,
             nb_overflow_corrections: 0,
+            base_in_dict: false,
+            dict_base_in_dict: false,
         }
     }
 
@@ -150,13 +171,17 @@ impl Window {
         if src_size == 0 {
             return contiguous;
         }
-        if src != self.next_src || force_non_contiguous {
+        // After a dictionary's content (in another buffer), the caller's
+        // data is never contiguous with it.
+        if src != self.next_src || force_non_contiguous || self.base_in_dict {
             // not contiguous
             let distance_from_base = self.next_src.wrapping_sub(self.base);
             self.low_limit = self.dict_limit;
             debug_assert!(distance_from_base == distance_from_base as u32 as usize);
             self.dict_limit = distance_from_base as u32;
             self.dict_base = self.base;
+            self.dict_base_in_dict = self.base_in_dict;
+            self.base_in_dict = false;
             self.base = src.wrapping_sub(distance_from_base);
             if self.dict_limit - self.low_limit < HASH_READ_SIZE as u32 {
                 self.low_limit = self.dict_limit; // too small extDict
@@ -165,10 +190,11 @@ impl Window {
         }
         self.next_src = src.wrapping_add(src_size);
         // if input and dictionary overlap: reduce dictionary (area presumed
-        // modified by input)
+        // modified by input); a dictionary in its own buffer never overlaps
         let src_end = src.wrapping_add(src_size);
-        if (src_end > self.dict_base.wrapping_add(self.low_limit as usize))
-            & (src < self.dict_base.wrapping_add(self.dict_limit as usize))
+        if !self.dict_base_in_dict
+            && (src_end > self.dict_base.wrapping_add(self.low_limit as usize))
+                & (src < self.dict_base.wrapping_add(self.dict_limit as usize))
         {
             let high_input_idx = src_end.wrapping_sub(self.dict_base);
             let low_limit_max = if high_input_idx > self.dict_limit as usize {
@@ -231,12 +257,14 @@ impl Window {
 
     /// `ZSTD_window_enforceMaxDist()`: raises `lowLimit` (and `dictLimit`)
     /// so that indices stay within `max_dist` of `block_end`. Invalidates
-    /// the dictionary (`*loaded_dict_end = 0`) when the window is reached.
+    /// the dictionary (`*loaded_dict_end = 0`, `*dms = false`) when the
+    /// window is reached.
     pub(crate) fn enforce_max_dist(
         &mut self,
         block_end: usize,
         max_dist: u32,
         loaded_dict_end: &mut u32,
+        dms: &mut bool,
     ) {
         let block_end_idx = block_end.wrapping_sub(self.base) as u32;
         if block_end_idx > max_dist.wrapping_add(*loaded_dict_end) {
@@ -248,22 +276,26 @@ impl Window {
                 self.dict_limit = self.low_limit;
             }
             *loaded_dict_end = 0;
+            *dms = false;
         }
     }
 
-    /// `ZSTD_checkDictValidity()` (without a dictMatchState, which this
-    /// port doesn't support yet).
+    /// `ZSTD_checkDictValidity()`: invalidates the dictionary
+    /// (`*loaded_dict_end = 0`, `*dms = false`: no dictMatchState) once the
+    /// block reaches beyond the window, or after a non-contiguous update.
     pub(crate) fn check_dict_validity(
         &self,
         block_end: usize,
         max_dist: u32,
         loaded_dict_end: &mut u32,
+        dms: &mut bool,
     ) {
         let block_end_idx = block_end.wrapping_sub(self.base) as u32;
         let lde = *loaded_dict_end;
         debug_assert!(block_end_idx >= lde);
         if block_end_idx > lde.wrapping_add(max_dist) || lde != self.dict_limit {
             *loaded_dict_end = 0;
+            *dms = false;
         }
     }
 }
@@ -370,13 +402,35 @@ pub(crate) struct MatchState {
     /// `opt`: the optimal parser's state (btopt and above), allocated on
     /// first use and kept (like libzstd's workspace).
     pub(crate) opt: Option<alloc::boxed::Box<super::opt::OptState>>,
+    /// The dictionary in use for the frame: the attached one
+    /// (`dictMatchState`, when [`dms`](Self::dms)), or the one whose content
+    /// was loaded or copied into this match state (the buffer behind
+    /// [`Window::base_in_dict`] and [`Window::dict_base_in_dict`]).
+    pub(crate) dict: Option<alloc::sync::Arc<super::cdict::CDict>>,
+    /// `dictMatchState != NULL`: the match finders search
+    /// [`dict`](Self::dict)'s tables (the `_dictMatchState` variants).
+    pub(crate) dms: bool,
 }
 
 impl MatchState {
     /// A fresh match state (`ZSTD_reset_matchState` with `ZSTDirp_reset`
     /// and `ZSTDcrp_makeClean`).
     pub(crate) fn new(cparams: CParams) -> Self {
-        let mut ms = Self {
+        let mut ms = Self::empty(cparams);
+        ms.reset(cparams);
+        ms
+    }
+
+    /// As [`new`](Self::new), with [`reset_with`](Self::reset_with)'s
+    /// arguments.
+    pub(crate) fn new_with(cparams: CParams, use_row: bool, for_cdict: bool) -> Self {
+        let mut ms = Self::empty(cparams);
+        ms.reset_with(cparams, use_row, for_cdict);
+        ms
+    }
+
+    fn empty(cparams: CParams) -> Self {
+        Self {
             window: Window::new(),
             loaded_dict_end: 0,
             next_to_update: 0,
@@ -394,9 +448,9 @@ impl MatchState {
             hash_log3: 0,
             hash_table3: Vec::new(),
             opt: None,
-        };
-        ms.reset(cparams);
-        ms
+            dict: None,
+            dms: false,
+        }
     }
 
     /// `ZSTD_reset_matchState()` with `ZSTDirp_reset` (indices restart at
@@ -407,15 +461,24 @@ impl MatchState {
     /// same sequences and this port always resets. With the row match
     /// finder, the hash salt advances (`ZSTD_advanceHashSalt`).
     pub(crate) fn reset(&mut self, cparams: CParams) {
+        let use_row = row_match_finder_used(
+            cparams.strategy,
+            resolve_row_match_finder_mode(ParamSwitch::Auto, &cparams),
+        );
+        self.reset_with(cparams, use_row, false);
+    }
+
+    /// [`reset`](Self::reset) with the row match finder use given (a CCtx
+    /// using a CDict takes the CDict's, `params.useRowMatchFinder =
+    /// cdict->useRowMatchFinder`), for a CCtx or, with `for_cdict`, a CDict
+    /// (`ZSTD_resetTarget_CDict`: no `hashTable3`, no optimal parser state,
+    /// a zeroed tag table and a hash salt of 0).
+    pub(crate) fn reset_with(&mut self, cparams: CParams, use_row: bool, for_cdict: bool) {
         self.window = Window::new();
         self.lazy_skipping = false;
         self.invalidate();
         let h_size = 1usize << cparams.hash_log;
         clear_table(&mut self.hash_table, h_size);
-        let use_row = row_match_finder_used(
-            cparams.strategy,
-            resolve_row_match_finder_mode(ParamSwitch::Auto, &cparams),
-        );
         // ZSTD_allocateChainTable: none for `fast` and the row match finder.
         let c_size = if cparams.strategy == Strategy::Fast || use_row {
             0
@@ -425,16 +488,22 @@ impl MatchState {
         clear_table(&mut self.chain_table, c_size);
         self.use_row_match_finder = use_row;
         if use_row {
-            // The tag table is "init once" (see its docs): new bytes are
-            // zeroed, existing ones are kept.
-            self.tag_table.resize(h_size, 0);
-            self.advance_hash_salt();
+            if for_cdict {
+                self.tag_table.clear();
+                self.tag_table.resize(h_size, 0);
+                self.hash_salt = 0;
+            } else {
+                // The tag table is "init once" (see its docs): new bytes are
+                // zeroed, existing ones are kept.
+                self.tag_table.resize(h_size, 0);
+                self.advance_hash_salt();
+            }
             let row_log = cparams.search_log.clamp(4, 6);
             debug_assert!(cparams.hash_log >= row_log);
             self.row_hash_log = cparams.hash_log - row_log;
         }
         // The optimal parser's tables (hashTable3 only with minMatch 3).
-        self.hash_log3 = if cparams.min_match == 3 {
+        self.hash_log3 = if cparams.min_match == 3 && !for_cdict {
             HASHLOG3_MAX.min(cparams.window_log)
         } else {
             0
@@ -445,7 +514,7 @@ impl MatchState {
             0
         };
         clear_table(&mut self.hash_table3, h3_size);
-        if cparams.strategy >= Strategy::BtOpt && self.opt.is_none() {
+        if cparams.strategy >= Strategy::BtOpt && self.opt.is_none() && !for_cdict {
             self.opt = Some(alloc::boxed::Box::new(super::opt::OptState::new()));
         }
         self.cparams = cparams;
@@ -469,6 +538,8 @@ impl MatchState {
         self.window.clear();
         self.next_to_update = self.window.dict_limit;
         self.loaded_dict_end = 0;
+        self.dms = false;
+        self.dict = None;
         // force reset of btopt stats
         if let Some(opt) = self.opt.as_deref_mut() {
             opt.stats.lit_length_sum = 0;
@@ -535,7 +606,9 @@ impl MatchState {
             }
             reduce_table(&mut self.hash_table3, correction);
             self.next_to_update = self.next_to_update.saturating_sub(correction);
+            // invalidate dictionaries on overflow correction
             self.loaded_dict_end = 0;
+            self.dms = false;
         }
     }
 
@@ -549,9 +622,9 @@ impl MatchState {
         let end = start + block_size;
         self.overflow_correct_if_needed(start, end);
         self.window
-            .check_dict_validity(end, max_dist, &mut self.loaded_dict_end);
+            .check_dict_validity(end, max_dist, &mut self.loaded_dict_end, &mut self.dms);
         self.window
-            .enforce_max_dist(start, max_dist, &mut self.loaded_dict_end);
+            .enforce_max_dist(start, max_dist, &mut self.loaded_dict_end, &mut self.dms);
         if self.next_to_update < self.window.low_limit {
             self.next_to_update = self.window.low_limit;
         }
@@ -583,6 +656,65 @@ impl MatchState {
             ip += FAST_HASH_FILL_STEP;
         }
     }
+
+    /// `ZSTD_fillHashTableForCDict()`: as [`fill_hash_table`](Self::fill_hash_table),
+    /// with tagged entries (`ZSTD_writeTaggedIndex`: the index shifted left
+    /// by `ZSTD_SHORT_CACHE_TAG_BITS`, a tag from the hash's low bits).
+    pub(crate) fn fill_hash_table_for_cdict(
+        &mut self,
+        buf: &[u8],
+        end: usize,
+        dtlm: TableLoadMethod,
+    ) {
+        const FAST_HASH_FILL_STEP: usize = 3;
+        let h_bits = self.cparams.hash_log + SHORT_CACHE_TAG_BITS;
+        let mls = self.cparams.min_match;
+        assert!(end <= buf.len());
+        let mut ip = self.window.pos(self.next_to_update);
+        while ip + FAST_HASH_FILL_STEP + HASH_READ_SIZE < end + 2 {
+            let curr = self.window.index(ip);
+            write_tagged_index(
+                &mut self.hash_table,
+                hash_at_buf(buf, ip, h_bits, mls),
+                curr,
+            );
+            if dtlm == TableLoadMethod::Full {
+                for p in 1..FAST_HASH_FILL_STEP {
+                    let hash_and_tag = hash_at_buf(buf, ip + p, h_bits, mls);
+                    if self.hash_table[hash_and_tag >> SHORT_CACHE_TAG_BITS] == 0 {
+                        write_tagged_index(&mut self.hash_table, hash_and_tag, curr + p as u32);
+                    }
+                }
+            }
+            ip += FAST_HASH_FILL_STEP;
+        }
+    }
+
+    /// The buffer holding the extDict segment: the dictionary's content
+    /// while the window's extDict is the loaded (or copied) dictionary,
+    /// else `buf` (a wrapped stream buffer).
+    pub(crate) fn ext_buf<'a>(&'a self, buf: &'a [u8]) -> &'a [u8] {
+        match &self.dict {
+            Some(d) if self.window.dict_base_in_dict => &d.content,
+            _ => buf,
+        }
+    }
+}
+
+/// `ZSTD_SHORT_CACHE_TAG_BITS`: CDict hash tables of `fast` and `dfast`
+/// hold `index << 8 | tag`.
+pub(crate) const SHORT_CACHE_TAG_BITS: u32 = 8;
+/// `ZSTD_SHORT_CACHE_TAG_MASK`.
+pub(crate) const SHORT_CACHE_TAG_MASK: u32 = (1 << SHORT_CACHE_TAG_BITS) - 1;
+
+/// `ZSTD_writeTaggedIndex()`: stores `index` with the tag of `hash_and_tag`
+/// (a hash of `hashLog + 8` bits) in the slot of its top `hashLog` bits.
+#[inline(always)]
+pub(crate) fn write_tagged_index(table: &mut [u32], hash_and_tag: usize, index: u32) {
+    let hash = hash_and_tag >> SHORT_CACHE_TAG_BITS;
+    let tag = hash_and_tag as u32 & SHORT_CACHE_TAG_MASK;
+    debug_assert!(index >> (32 - SHORT_CACHE_TAG_BITS) == 0);
+    table[hash] = (index << SHORT_CACHE_TAG_BITS) | tag;
 }
 
 /// Resizes `table` to `size` zeroed entries, reusing its allocation.
@@ -599,8 +731,8 @@ fn hash_at_buf(buf: &[u8], pos: usize, h_bits: u32, mls: u32) -> usize {
     super::seq_store::hash_at(buf, pos, h_bits, mls)
 }
 
-/// `ZSTD_buildSeqStore()` for the `fast` strategy without a dictionary,
-/// LDM or an external sequence producer: fills `ss` with the sequences of
+/// `ZSTD_buildSeqStore()` without LDM or an external sequence producer,
+/// for every strategy and dictionary mode: fills `ss` with the sequences of
 /// the block `buf[start..end]` and its last literals. `rep` must hold the
 /// previous block's repcodes on entry (libzstd copies `prevCBlock->rep` to
 /// `nextCBlock->rep`) and holds this block's on return. Returns `false`
@@ -636,6 +768,19 @@ pub(crate) fn build_seq_store(
             }
             Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
                 super::opt::compress_block_opt_ext_dict(ms, ss, rep, buf, start, end)
+            }
+        }
+    } else if ms.dms {
+        match ms.cparams.strategy {
+            Strategy::Fast => compress_block_fast_dict_match_state(ms, ss, rep, buf, start, end),
+            Strategy::DFast => super::dfast::compress_block_double_fast_dict_match_state(
+                ms, ss, rep, buf, start, end,
+            ),
+            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2 => {
+                super::lazy::compress_block_lazy_dict_match_state(ms, ss, rep, buf, start, end)
+            }
+            Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
+                super::opt::compress_block_opt_dict_match_state(ms, ss, rep, buf, start, end)
             }
         }
     } else {
@@ -1112,14 +1257,16 @@ pub(crate) struct ExtWindow {
 
 impl ExtWindow {
     /// The window of the block `buf[start..end]` with the extDict starting
-    /// at `dict_start_index` and the prefix at `prefix_start_index`.
+    /// at `dict_start_index` and the prefix at `prefix_start_index`; the
+    /// extDict is in `ext` (see [`MatchState::ext_buf`]).
     ///
     /// # Panics
     ///
-    /// If a segment is not in `buf`, or the block not in the prefix.
+    /// If a segment is not in its buffer, or the block not in the prefix.
     pub(crate) fn new(
         w: &Window,
         buf: &[u8],
+        ext: &[u8],
         start: usize,
         end: usize,
         dict_start_index: u32,
@@ -1133,17 +1280,18 @@ impl ExtWindow {
         let dict_start = w.dict_base.wrapping_add(dict_start_index as usize);
         let dict_end = w.dict_base.wrapping_add(prefix_start_index as usize);
         assert!(
-            dict_start <= dict_end && dict_end <= buf.len(),
+            dict_start <= dict_end && dict_end <= ext.len(),
             "extDict is not in the buffer"
         );
         let bp = buf.as_ptr();
+        let ep = ext.as_ptr();
         ExtWindow {
             base: bp.wrapping_add(w.base),
-            dict_base: bp.wrapping_add(w.dict_base),
+            dict_base: ep.wrapping_add(w.dict_base),
             dict_start_index,
             prefix_start_index,
-            dict_start: bp.wrapping_add(dict_start),
-            dict_end: bp.wrapping_add(dict_end),
+            dict_start: ep.wrapping_add(dict_start),
+            dict_end: ep.wrapping_add(dict_end),
             prefix_start: bp.wrapping_add(prefix_start),
             istart: bp.wrapping_add(start),
             iend: bp.wrapping_add(end),
@@ -1253,6 +1401,7 @@ fn ext_dict_generic<const MLS: u32>(
     let w = ExtWindow::new(
         &ms.window,
         buf,
+        ms.ext_buf(buf),
         start,
         end,
         dict_start_index,
@@ -1551,6 +1700,425 @@ unsafe fn ext_offset_match(
         }
     }
     (match0, m_length, offcode, match_end)
+}
+
+/// The attached dictionary's match state (libzstd's `dictMatchState`) as
+/// the `_dictMatchState` match finders see it: raw pointers into the
+/// [`CDict`](super::cdict::CDict)'s content and tables, after the checks
+/// that make reading them sound.
+pub(crate) struct DmsView {
+    /// `dms->window.base`: the position of the dictionary's index 0.
+    pub(crate) base: *const u8,
+    pub(crate) hash_table: *const u32,
+    pub(crate) chain_table: *const u32,
+    pub(crate) tag_table: *const u8,
+    /// `dms->cParams.hashLog`, `chainLog`, and `dms->rowHashLog`.
+    pub(crate) hash_log: u32,
+    pub(crate) chain_log: u32,
+    pub(crate) row_hash_log: u32,
+    /// `dms->window.dictLimit` and `lowLimit` (equal for a CDict: its
+    /// content is one segment).
+    pub(crate) dict_limit: u32,
+    pub(crate) low_limit: u32,
+    /// `dms->window.nextSrc`: the end of the content, and its index
+    /// (`dmsSize`, `dictHighLimit`).
+    pub(crate) end: *const u8,
+    pub(crate) high_limit: u32,
+    /// The first readable byte: `base + lowLimit`.
+    pub(crate) start: *const u8,
+}
+
+impl DmsView {
+    /// The view of `cd`'s match state.
+    ///
+    /// # Panics
+    ///
+    /// If its window is not in its content, or a table has not the size
+    /// of its parameters.
+    pub(crate) fn new(cd: &super::cdict::CDict) -> Self {
+        let ms = &cd.ms;
+        let w = &ms.window;
+        let cp = &ms.cparams;
+        let content = cd.content.as_ptr();
+        assert!(w.low_limit <= w.dict_limit);
+        let start = w.pos(w.low_limit);
+        let end = w.next_src;
+        assert!(
+            start <= end && end <= cd.content.len(),
+            "dictionary window is not in its content"
+        );
+        assert!(cp.hash_log + SHORT_CACHE_TAG_BITS <= 32);
+        assert!(ms.hash_table.len() == 1usize << cp.hash_log);
+        assert!(ms.chain_table.is_empty() || ms.chain_table.len() == 1usize << cp.chain_log);
+        assert!(ms.tag_table.is_empty() || ms.tag_table.len() == ms.hash_table.len());
+        DmsView {
+            base: content.wrapping_add(w.base),
+            hash_table: ms.hash_table.as_ptr(),
+            chain_table: ms.chain_table.as_ptr(),
+            tag_table: ms.tag_table.as_ptr(),
+            hash_log: cp.hash_log,
+            chain_log: cp.chain_log,
+            row_hash_log: ms.row_hash_log,
+            dict_limit: w.dict_limit,
+            low_limit: w.low_limit,
+            end: content.wrapping_add(end),
+            high_limit: w.index(end),
+            start: content.wrapping_add(start),
+        }
+    }
+
+    /// Debug check that `n` bytes at `p` are in the dictionary's content.
+    #[inline(always)]
+    pub(crate) fn chk(&self, p: *const u8, n: usize) {
+        let (p, e) = (p as usize, (p as usize).wrapping_add(n));
+        debug_assert!(
+            p >= self.start as usize && e <= self.end as usize,
+            "read out of the dictionary"
+        );
+    }
+}
+
+/// `ZSTD_comparePackedTags()`: whether the tags (low 8 bits) match.
+#[inline(always)]
+pub(crate) fn compare_packed_tags(packed_tag1: usize, packed_tag2: usize) -> bool {
+    (packed_tag1 as u32 & SHORT_CACHE_TAG_MASK) == (packed_tag2 as u32 & SHORT_CACHE_TAG_MASK)
+}
+
+/// `ZSTD_compressBlock_fast_dictMatchState()`: as [`compress_block_fast`],
+/// with an attached dictionary ([`MatchState::dms`]) whose tagged hash
+/// table is searched where the window's has no candidate. Picks
+/// `ZSTD_compressBlock_fast_dictMatchState_<mls>_0` like libzstd (3 and
+/// other values use 4).
+#[inline(never)]
+pub(crate) fn compress_block_fast_dict_match_state(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
+    debug_assert!(ms.cparams.strategy == Strategy::Fast);
+    match ms.cparams.min_match {
+        5 => dms_generic::<5>(ms, ss, rep, buf, start, end),
+        6 => dms_generic::<6>(ms, ss, rep, buf, start, end),
+        7 => dms_generic::<7>(ms, ss, rep, buf, start, end),
+        _ => dms_generic::<4>(ms, ss, rep, buf, start, end),
+    }
+}
+
+/// `ZSTD_compressBlock_fast_dictMatchState_generic()`.
+///
+/// Memory safety: the window is one segment in `buf` (no extDict:
+/// `ZSTD_matchState_dictMode`) from `prefixStart`, the dictionary's content
+/// another, checked by [`DmsView::new`]. Window candidates are read only at
+/// or above `prefixStartIndex`, dictionary candidates only above its start
+/// (`dictMatchIndex > dictStartIndex`, the tagged index of a hashed
+/// position, at least 8 bytes before its end); repcodes are at most
+/// `dictAndPrefixLength` at entry (asserted), so their index maps into the
+/// dictionary or the prefix, and `ZSTD_index_overlap_check` keeps 4-byte
+/// reads in one segment. Matches are counted to the end of their segment,
+/// then on in the prefix (`ZSTD_count_2segments`). Debug builds check reads
+/// with `chk`.
+#[allow(unsafe_code)]
+#[inline(always)]
+fn dms_generic<const MLS: u32>(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
+    const K_STEP_INCR: usize = 1 << K_SEARCH_STRENGTH;
+    let cparams = ms.cparams;
+    let hlog = cparams.hash_log;
+    // These checks make the raw-pointer accesses below sound.
+    assert!(start <= end && end <= buf.len());
+    assert!(ms.hash_table.len() == 1usize << hlog && hlog <= 32);
+    assert!(!ms.window.has_ext_dict());
+    let window_start = ms.window.pos(ms.window.dict_limit);
+    assert!(window_start <= start, "window start is not in the buffer");
+    assert!(end.wrapping_sub(ms.window.base) <= u32::MAX as usize);
+    let cd = ms.dict.clone().expect("attached dictionary");
+    let d = DmsView::new(&cd);
+    debug_assert_eq!(ms.loaded_dict_end, ms.window.dict_limit);
+
+    // support stepSize of 0
+    let step_size = cparams.target_length as usize + (cparams.target_length == 0) as usize;
+    let bp = buf.as_ptr();
+    let base = bp.wrapping_add(ms.window.base);
+    let istart = bp.wrapping_add(start);
+    let mut ip0 = istart;
+    let mut ip1 = ip0.wrapping_add(step_size);
+    let mut anchor = istart;
+    let prefix_start_index = ms.window.dict_limit;
+    let prefix_start = base.wrapping_add(prefix_start_index as usize);
+    let iend = bp.wrapping_add(end);
+    let ilimit = iend.wrapping_sub(HASH_READ_SIZE);
+    let mut offset_1 = rep[0];
+    let mut offset_2 = rep[1];
+
+    let dict_hash_table = d.hash_table;
+    let dict_start_index = d.dict_limit;
+    let dict_base = d.base;
+    let dict_start = dict_base.wrapping_add(dict_start_index as usize);
+    let dict_end = d.end;
+    // ensure there will be no underflow when translating a dict index into
+    // a local index
+    assert!(prefix_start_index >= d.high_limit);
+    let dict_index_delta = prefix_start_index - d.high_limit;
+    let dict_and_prefix_length =
+        (start - window_start) as u32 + (dict_end as usize - dict_start as usize) as u32;
+    let dict_hbits = d.hash_log + SHORT_CACHE_TAG_BITS;
+
+    let ht = ms.hash_table.as_mut_ptr();
+    let idx = |p: *const u8| (p as usize).wrapping_sub(base as usize) as u32;
+    // Debug check that `n` bytes at `p` are in the window or the dictionary.
+    let chk = |p: *const u8, n: usize| {
+        if (p as usize) >= (dict_start as usize) && (p as usize) < (dict_end as usize) {
+            d.chk(p, n);
+        } else {
+            debug_assert!(
+                (p as usize) >= (prefix_start as usize) && (p as usize) + n <= (iend as usize),
+                "read out of the window"
+            );
+        }
+    };
+
+    // init
+    ip0 = ip0.wrapping_add((dict_and_prefix_length == 0) as usize);
+    // dictMatchState repCode checks don't currently handle repCode == 0
+    // disabling.
+    assert!(offset_1 <= dict_and_prefix_length && offset_2 <= dict_and_prefix_length);
+    assert!(step_size >= 1);
+
+    // SAFETY (whole block): see the function docs. Hash table writes use
+    // hashes of `hlog` bits into a table of `1 << hlog` entries, dictionary
+    // reads hashes of `dict_hbits - 8` bits into a table of that size
+    // (asserted above and by `DmsView::new`).
+    unsafe {
+        let hash = |p: *const u8| {
+            chk(p, HASH_READ_SIZE);
+            hash_mls::<MLS>(p, hlog)
+        };
+        let dict_hash = |p: *const u8| hash_mls::<MLS>(p, dict_hbits);
+        // the position of a repcode's match: in the dictionary below the
+        // prefix
+        let rep_pos = |rep_index: u32| {
+            if rep_index < prefix_start_index {
+                dict_base.wrapping_add(rep_index.wrapping_sub(dict_index_delta) as usize)
+            } else {
+                base.wrapping_add(rep_index as usize)
+            }
+        };
+
+        // Outer search loop
+        'outer: while ip1 <= ilimit {
+            // repcode check at (ip0 + 1) is safe because ip0 < ip1
+            let m_length: usize;
+            let mut hash0 = hash(ip0);
+
+            let dict_hash_and_tag0 = dict_hash(ip0);
+            let mut dict_match_index_and_tag =
+                *dict_hash_table.add(dict_hash_and_tag0 >> SHORT_CACHE_TAG_BITS);
+            let mut dict_tags_match =
+                compare_packed_tags(dict_match_index_and_tag as usize, dict_hash_and_tag0);
+
+            let mut match_index = *ht.add(hash0);
+            let mut curr = idx(ip0);
+            let mut step = step_size;
+            let mut next_step = ip0.wrapping_add(K_STEP_INCR);
+
+            // Inner search loop
+            loop {
+                let mtch = base.wrapping_add(match_index as usize);
+                let rep_index = curr.wrapping_add(1).wrapping_sub(offset_1);
+                let rep_match = rep_pos(rep_index);
+                let hash1 = hash(ip1);
+                let dict_hash_and_tag1 = dict_hash(ip1);
+                *ht.add(hash0) = curr; // update hash table
+
+                if index_overlap_check(prefix_start_index, rep_index) && {
+                    chk(rep_match, 4);
+                    read32(rep_match) == read32(ip0.add(1))
+                } {
+                    let rep_match_end = if rep_index < prefix_start_index {
+                        dict_end
+                    } else {
+                        iend
+                    };
+                    m_length = count_2segments(
+                        ip0.add(1 + 4),
+                        rep_match.add(4),
+                        iend,
+                        rep_match_end,
+                        prefix_start,
+                    ) + 4;
+                    ip0 = ip0.add(1);
+                    ss.store_seq(
+                        buf,
+                        anchor as usize - bp as usize,
+                        ip0 as usize - anchor as usize,
+                        end,
+                        REPCODE1_TO_OFFBASE,
+                        m_length,
+                    );
+                    break;
+                }
+
+                if dict_tags_match {
+                    // Found a possible dict match
+                    let dict_match_index = dict_match_index_and_tag >> SHORT_CACHE_TAG_BITS;
+                    let mut dict_match = dict_base.wrapping_add(dict_match_index as usize);
+                    if dict_match_index > dict_start_index && {
+                        chk(dict_match, 4);
+                        read32(dict_match) == read32(ip0)
+                    } {
+                        // To replicate extDict parse behavior, we only use
+                        // dict matches when the normal matchIndex is invalid
+                        if match_index <= prefix_start_index {
+                            let offset = curr - dict_match_index - dict_index_delta;
+                            let mut ml = count_2segments(
+                                ip0.add(4),
+                                dict_match.add(4),
+                                iend,
+                                dict_end,
+                                prefix_start,
+                            ) + 4;
+                            while ((ip0 > anchor) & (dict_match > dict_start))
+                                && *ip0.sub(1) == *dict_match.sub(1)
+                            {
+                                ip0 = ip0.sub(1);
+                                dict_match = dict_match.sub(1);
+                                ml += 1;
+                            } // catch up
+                            offset_2 = offset_1;
+                            offset_1 = offset;
+                            m_length = ml;
+                            ss.store_seq(
+                                buf,
+                                anchor as usize - bp as usize,
+                                ip0 as usize - anchor as usize,
+                                end,
+                                offset_to_offbase(offset),
+                                m_length,
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                if match_index >= prefix_start_index && {
+                    chk(mtch, 4);
+                    read32(ip0) == read32(mtch)
+                } {
+                    // found a regular match of size >= 4
+                    let mut mtch = mtch;
+                    let offset = (ip0 as usize - mtch as usize) as u32;
+                    let mut ml = count(ip0.add(4), mtch.add(4), iend) + 4;
+                    while ((ip0 > anchor) & (mtch > prefix_start)) && *ip0.sub(1) == *mtch.sub(1) {
+                        ip0 = ip0.sub(1);
+                        mtch = mtch.sub(1);
+                        ml += 1;
+                    } // catch up
+                    offset_2 = offset_1;
+                    offset_1 = offset;
+                    m_length = ml;
+                    ss.store_seq(
+                        buf,
+                        anchor as usize - bp as usize,
+                        ip0 as usize - anchor as usize,
+                        end,
+                        offset_to_offbase(offset),
+                        m_length,
+                    );
+                    break;
+                }
+
+                // Prepare for next iteration
+                dict_match_index_and_tag =
+                    *dict_hash_table.add(dict_hash_and_tag1 >> SHORT_CACHE_TAG_BITS);
+                dict_tags_match =
+                    compare_packed_tags(dict_match_index_and_tag as usize, dict_hash_and_tag1);
+                match_index = *ht.add(hash1);
+
+                if ip1 >= next_step {
+                    step += 1;
+                    next_step = next_step.wrapping_add(K_STEP_INCR);
+                }
+                ip0 = ip1;
+                ip1 = ip1.wrapping_add(step);
+                if ip1 > ilimit {
+                    break 'outer;
+                }
+
+                curr = idx(ip0);
+                hash0 = hash1;
+            } // end inner search loop
+
+            // match found
+            debug_assert!(m_length != 0);
+            ip0 = ip0.add(m_length);
+            anchor = ip0;
+
+            if ip0 <= ilimit {
+                // Fill Table
+                debug_assert!(base.wrapping_add(curr as usize + 2) > istart);
+                *ht.add(hash(base.wrapping_add(curr as usize + 2))) = curr + 2;
+                *ht.add(hash(ip0.sub(2))) = idx(ip0.sub(2));
+
+                // check immediate repcode
+                while ip0 <= ilimit {
+                    let current2 = idx(ip0);
+                    let rep_index2 = current2.wrapping_sub(offset_2);
+                    let rep_match2 = rep_pos(rep_index2);
+                    if index_overlap_check(prefix_start_index, rep_index2) && {
+                        chk(rep_match2, 4);
+                        read32(rep_match2) == read32(ip0)
+                    } {
+                        let rep_end2 = if rep_index2 < prefix_start_index {
+                            dict_end
+                        } else {
+                            iend
+                        };
+                        let rep_length2 = count_2segments(
+                            ip0.add(4),
+                            rep_match2.add(4),
+                            iend,
+                            rep_end2,
+                            prefix_start,
+                        ) + 4;
+                        core::mem::swap(&mut offset_1, &mut offset_2);
+                        ss.store_seq(
+                            buf,
+                            anchor as usize - bp as usize,
+                            0,
+                            end,
+                            REPCODE1_TO_OFFBASE,
+                            rep_length2,
+                        );
+                        *ht.add(hash(ip0)) = current2;
+                        ip0 = ip0.add(rep_length2);
+                        anchor = ip0;
+                        continue;
+                    }
+                    break;
+                }
+            }
+
+            // Prepare for next iteration
+            debug_assert!(ip0 == anchor);
+            ip1 = ip0.wrapping_add(step_size);
+        }
+    }
+
+    // _cleanup: save reps for next block
+    rep[0] = offset_1;
+    rep[1] = offset_2;
+
+    // Return the last literals size
+    iend as usize - anchor as usize
 }
 
 #[cfg(test)]
@@ -1863,7 +2431,7 @@ pub(super) mod tests {
         let mut w = Window::new();
         w.update(0, 1 << 20, false);
         let mut lde = 0;
-        w.enforce_max_dist(1 << 19, 1 << 17, &mut lde);
+        w.enforce_max_dist(1 << 19, 1 << 17, &mut lde, &mut false);
         assert_eq!(w.low_limit, (1 << 19) + 2 - (1 << 17));
         assert_eq!(w.dict_limit, w.low_limit);
     }

@@ -1,7 +1,9 @@
 //! The row-based match finder of the greedy, lazy and lazy2 strategies
 //! (`windowLog > 14`): a port of libzstd 1.5.7's "(SIMD) Row-based
 //! matchfinder" (`compress/zstd_lazy.c`, `ZSTD_RowFindBestMatch` and
-//! helpers), noDict and extDict paths. The parser is in [`lazy`](super::lazy).
+//! helpers), noDict, extDict and dictMatchState paths (the attached
+//! dictionary's rows are hashed unsalted: a CDict's salt is 0). The parser
+//! is in [`lazy`](super::lazy).
 //!
 //! The hash table is split into rows of `1 << rowLog` indices (`rowLog =
 //! clamp(searchLog, 4, 6)`); a position's salted hash
@@ -290,7 +292,9 @@ unsafe fn match_bits_swar<const ROW_LOG: u32>(tag_row: *const u8, tag: u8) -> u6
     !matches
 }
 
-/// `ZSTD_RowFindBestMatch()` (noDict, or extDict with `EXT`): the longest match at `ip` among
+/// `ZSTD_RowFindBestMatch()` (noDict, extDict with `EXT`, dictMatchState
+/// with `DMS`: then the attached dictionary's row too, with the attempts
+/// left): the longest match at `ip` among
 /// the row candidates whose tag matches (at most `1 << min(searchLog,
 /// rowLog)`). Inserts the positions up to `ip` included (only `ip` in lazy
 /// skipping mode) and collects the hash in `hashSaltEntropy`. Returns the
@@ -302,7 +306,12 @@ unsafe fn match_bits_swar<const ROW_LOG: u32>(tag_row: *const u8, tag: u8) -> u6
 /// `nextToUpdate`.
 #[allow(unsafe_code)]
 #[inline(never)]
-pub(super) unsafe fn row_find_best_match<const MLS: u32, const ROW_LOG: u32, const EXT: bool>(
+pub(super) unsafe fn row_find_best_match<
+    const MLS: u32,
+    const ROW_LOG: u32,
+    const EXT: bool,
+    const DMS: bool,
+>(
     s: &mut Searcher,
     ip: *const u8,
     ilimit: *const u8,
@@ -323,6 +332,19 @@ pub(super) unsafe fn row_find_best_match<const MLS: u32, const ROW_LOG: u32, con
     // `low_limit` and before `ip`, and `ip + ml < ilimit` holds before each
     // 4-byte read at `ml - 3`.
     unsafe {
+        // the attached dictionary's row (unsalted hash; its rows are
+        // within its tables of `1 << (rowHashLog + rowLog)` entries)
+        let (dms_tag, dms_rel_row) = if DMS {
+            s.chk(ip, 8);
+            let d = s.dms;
+            let dms_hash = hash_salted::<MLS>(ip, d.row_hash_log + ROW_HASH_TAG_BITS, 0);
+            let dms_rel_row = (dms_hash >> ROW_HASH_TAG_BITS) << ROW_LOG;
+            row_prefetch::<ROW_LOG>(d.hash_table, d.tag_table, dms_rel_row);
+            (dms_hash as u8, dms_rel_row as usize)
+        } else {
+            (0, 0)
+        };
+
         // Update the hashTable and tagTable up to (but not including) ip
         let hash = if !s.lazy_skipping {
             update_internal::<MLS, ROW_LOG>(s, ip);
@@ -403,6 +425,54 @@ pub(super) unsafe fn row_find_best_match<const MLS: u32, const ROW_LOG: u32, con
                 *offset_ptr = curr - match_index + REP_NUM;
                 if ip.add(current_ml) == ilimit {
                     break; // best possible, avoids read overflow on next attempt
+                }
+            }
+        }
+
+        if DMS {
+            let d = s.dms;
+            let dms_lowest_index = d.dict_limit;
+            let dms_base = s.dict_base;
+            let dms_index_delta = s.dict_limit - d.high_limit;
+            let dms_row = d.hash_table.add(dms_rel_row);
+            let dms_tag_row = d.tag_table.add(dms_rel_row);
+            let head = u32::from(*dms_tag_row) & row_mask;
+            let mut match_buffer = [0u32; ROW_HASH_MAX_ENTRIES];
+            let mut num_matches = 0usize;
+            let mut matches = match_mask::<ROW_LOG>(dms_tag_row, dms_tag, head);
+
+            while matches > 0 && nb_attempts > 0 {
+                let match_pos = (head + matches.trailing_zeros()) & row_mask;
+                let match_index = *dms_row.add(match_pos as usize);
+                matches &= matches - 1;
+                if match_pos == 0 {
+                    continue;
+                }
+                if match_index < dms_lowest_index {
+                    break;
+                }
+                prefetch_l1(dms_base.wrapping_add(match_index as usize));
+                match_buffer[num_matches] = match_index;
+                num_matches += 1;
+                nb_attempts -= 1;
+            }
+
+            // Return the longest match
+            for &match_index in &match_buffer[..num_matches] {
+                let mut current_ml = 0;
+                debug_assert!(match_index >= dms_lowest_index);
+                let m = dms_base.wrapping_add(match_index as usize);
+                s.chk(m, 4);
+                if read32(m) == read32(ip) {
+                    current_ml = s.count_ext(ip.add(4), m.add(4), ilimit) + 4;
+                }
+                if current_ml > ml {
+                    ml = current_ml;
+                    debug_assert!(curr > match_index + dms_index_delta);
+                    *offset_ptr = curr - (match_index + dms_index_delta) + REP_NUM;
+                    if ip.add(current_ml) == ilimit {
+                        break;
+                    }
                 }
             }
         }
