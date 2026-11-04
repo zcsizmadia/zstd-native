@@ -39,7 +39,7 @@ On this Windows machine, cargo is in `~/.cargo/bin` (not on PATH in Bash).
   reader, `FastBits` of the sequence loop), `huf.rs` fast loops,
   `huf_asm.rs` (asm! port of libzstd's Huffman loops), `block.rs`
   sequence execution and copies, the encoder's match finders and
-  `enc/search_asm.rs` (asm! search loops of `fast` and `dfast`), the
+  `enc/block_asm.rs` (asm! block loops of `fast` and `dfast`), the
   encoder's bit writers (`enc/bitwriter.rs`, `enc/huf_enc.rs`: 8-byte
   flushes) and its run-time dispatch to `#[target_feature]` loops
   (`enc/seq_store.rs`), the output writes in `decoder.rs`, and the
