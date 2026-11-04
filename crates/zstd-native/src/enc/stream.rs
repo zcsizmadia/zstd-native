@@ -474,7 +474,7 @@ impl StreamEncoder {
                 let m = self
                     .mt
                     .get_or_insert_with(|| Box::new(super::mt::MtCtx::new()));
-                m.init_frame(&self.mt_params, cp, ldm, cd, self.pledged);
+                m.init_frame(&self.mt_params, cp, ldm, cd, self.pledged)?;
                 self.out_content = 0;
                 self.out_flushed = 0;
                 self.stage = Stage::Load;

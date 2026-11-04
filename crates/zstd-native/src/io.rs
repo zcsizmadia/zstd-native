@@ -271,6 +271,7 @@ impl<W: Write> Encoder<W> {
 fn enc_err(e: Error) -> io::Error {
     let kind = match e {
         Error::SrcSizeWrong | Error::StageWrong => io::ErrorKind::InvalidInput,
+        Error::MemoryAllocation => io::ErrorKind::OutOfMemory,
         _ => io::ErrorKind::InvalidData,
     };
     io::Error::new(kind, e)
