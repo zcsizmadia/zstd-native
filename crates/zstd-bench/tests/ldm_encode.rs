@@ -508,7 +508,12 @@ fn forced_with_checksum() {
     let dict = data[100_000..150_000].to_vec();
     let f = with(Frame::streamed(16, 19, true, 600_000, 100_000));
     check("checksum dict", &[f], &data, Dict::Prepared(&dict, 16));
-    // level 22 with an unknown size (LDM on by itself)
-    let f = with(Frame::streamed(22, 0, false, 1 << 20, 300_000));
-    check("checksum L22", &[f], &data, Dict::None);
+    // level 22 with an unknown size (LDM on by itself, a 128 MiB window):
+    // 64-bit only, since on 32-bit runners libzstd's allocation can fail
+    // while other tests run in the same address space
+    #[cfg(target_pointer_width = "64")]
+    {
+        let f = with(Frame::streamed(22, 0, false, 1 << 20, 300_000));
+        check("checksum L22", &[f], &data, Dict::None);
+    }
 }
