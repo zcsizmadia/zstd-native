@@ -9,21 +9,27 @@ use super::fast::{MatchState, build_seq_store};
 use super::hist::hist_count_fast;
 use super::huf_enc::HufRepeat;
 use super::literals::{HufCTables, compress_literals, min_gain};
-use super::params::{CParams, Strategy, block_size_max, one_shot_cparams};
+use super::params::{CParams, Strategy, block_size_max, block_splitter_enabled, one_shot_cparams};
 use super::presplit::{FpStats, optimal_block_size};
-use super::seq_store::{REP_START_VALUE, SeqDef, SeqStore, max_nb_seq, seq_to_codes};
+use super::seq_store::{
+    LongLengthType, MAX_LL, MAX_ML, REP_START_VALUE, STREAM_ACCUMULATOR_MIN, SeqDef, SeqStore,
+    highbit32, ll_code, max_nb_seq, ml_code,
+};
 use super::sequences::{
     FseCTables, FseRepeat, SET_COMPRESSED, SeqFields, build_ctable, encode_sequences,
     select_encoding_type,
 };
 use crate::error::{Error, Result};
-use crate::fse::{LL_DEFAULT_NORM, MAX_LL, MAX_ML, MAX_OFF, ML_DEFAULT_NORM, OF_DEFAULT_NORM};
+use crate::fse::{
+    LL_DEFAULT_NORM, MAX_LL as FSE_MAX_LL, MAX_ML as FSE_MAX_ML, MAX_OFF as FSE_MAX_OFF,
+    ML_DEFAULT_NORM, OF_DEFAULT_NORM,
+};
 
-const BLOCK_HEADER_SIZE: usize = 3;
+pub(super) const BLOCK_HEADER_SIZE: usize = 3;
 const MIN_CBLOCK_SIZE: usize = 2;
-const LONGNBSEQ: usize = 0x7F00;
-const DEFAULT_MAX_OFF: u32 = 28;
-const RLE_MAX_LENGTH: usize = 25;
+pub(super) const LONGNBSEQ: usize = 0x7F00;
+pub(super) const DEFAULT_MAX_OFF: u32 = 28;
+pub(super) const RLE_MAX_LENGTH: usize = 25;
 const SUSPECT_UNCOMPRESSIBLE_LITERAL_RATIO: usize = 20;
 
 impl SeqFields for SeqDef {
@@ -73,17 +79,240 @@ fn literals_compression_disabled(cp: &CParams) -> bool {
     cp.strategy == Strategy::Fast && cp.target_length > 0
 }
 
-/// libzstd's `ZSTD_entropyCompressSeqStore` (with `_internal` and
-/// `_wExtLitBuffer`). Returns 0 when the block should be stored raw.
-fn entropy_compress_seq_store(
+/// A run of sequences of the seq store and their literals: the whole
+/// block, or a partition of it for the block splitter (libzstd derives a
+/// `SeqStore_t` with moved pointers, `ZSTD_deriveSeqStoreChunk`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SeqChunk {
+    /// The sequences `seq_start..seq_end` (and their codes).
+    pub(crate) seq_start: usize,
+    pub(crate) seq_end: usize,
+    /// The literals `lit_start..lit_end` of the literal buffer.
+    pub(crate) lit_start: usize,
+    pub(crate) lit_end: usize,
+    /// The long length, relative to `seq_start` (it may be `seq_end -
+    /// seq_start`, just past the chunk, as in libzstd).
+    pub(crate) long_length_type: LongLengthType,
+    pub(crate) long_length_pos: u32,
+}
+
+impl SeqChunk {
+    /// The whole store.
+    pub(crate) fn full(ss: &SeqStore) -> Self {
+        SeqChunk {
+            seq_start: 0,
+            seq_end: ss.nb_seq,
+            lit_start: 0,
+            lit_end: ss.lit_len,
+            long_length_type: ss.long_length_type,
+            long_length_pos: ss.long_length_pos,
+        }
+    }
+
+    /// The number of sequences.
+    #[inline]
+    pub(crate) fn nb_seq(&self) -> usize {
+        self.seq_end - self.seq_start
+    }
+}
+
+/// `ZSTD_seqToCodes()` on a chunk: fills the code tables for its
+/// sequences. Returns libzstd's `longOffsets` (only possible on 32-bit
+/// targets).
+pub(crate) fn chunk_to_codes(ss: &mut SeqStore, ch: &SeqChunk) -> bool {
+    let (s, e) = (ch.seq_start, ch.seq_end);
+    let mut long_offsets = false;
+    let seqs = &ss.sequences[s..e];
+    let ll = &mut ss.ll_code[s..e];
+    let of = &mut ss.of_code[s..e];
+    let ml = &mut ss.ml_code[s..e];
+    for (u, q) in seqs.iter().enumerate() {
+        let of_code = highbit32(q.off_base);
+        ll[u] = ll_code(u32::from(q.lit_length)) as u8;
+        of[u] = of_code as u8;
+        ml[u] = ml_code(u32::from(q.ml_base)) as u8;
+        debug_assert!(!(usize::BITS == 64 && of_code >= STREAM_ACCUMULATOR_MIN));
+        if usize::BITS == 32 && of_code >= STREAM_ACCUMULATOR_MIN {
+            long_offsets = true;
+        }
+    }
+    // The long length may be just past a partition (libzstd writes its code
+    // there too; it is the right code for that sequence).
+    let p = s + ch.long_length_pos as usize;
+    match ch.long_length_type {
+        LongLengthType::LiteralLength if p < ss.ll_code.len() => ss.ll_code[p] = MAX_LL,
+        LongLengthType::MatchLength if p < ss.ml_code.len() => ss.ml_code[p] = MAX_ML,
+        _ => {}
+    }
+    long_offsets
+}
+
+/// libzstd's `ZSTD_symbolEncodingTypeStats_t`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SeqStats {
+    pub(crate) ll_type: u32,
+    pub(crate) of_type: u32,
+    pub(crate) ml_type: u32,
+    /// Size of the table descriptions written.
+    pub(crate) size: usize,
+    /// Size of the last compressed table description (0 if none).
+    pub(crate) last_count_size: usize,
+}
+
+/// libzstd's `ZSTD_buildSequencesStatistics`: computes the codes of the
+/// chunk's sequences (at least one), chooses each code's table encoding,
+/// builds `next`'s tables and writes their descriptions to `dst`.
+pub(crate) fn build_sequences_statistics(
     dst: &mut [u8],
     ss: &mut SeqStore,
+    ch: &SeqChunk,
+    prev: &FseCTables,
+    next: &mut FseCTables,
+    strategy: u32,
+) -> Result<SeqStats> {
+    let nb_seq = ch.nb_seq();
+    debug_assert!(nb_seq != 0);
+    chunk_to_codes(ss, ch);
+    let mut count = [0u32; 256];
+    let mut stats = SeqStats {
+        ll_type: 0,
+        of_type: 0,
+        ml_type: 0,
+        size: 0,
+        last_count_size: 0,
+    };
+    let mut op = 0usize;
+    let (ll_codes, of_codes, ml_codes) = (
+        &ss.ll_code[ch.seq_start..ch.seq_end],
+        &ss.of_code[ch.seq_start..ch.seq_end],
+        &ss.ml_code[ch.seq_start..ch.seq_end],
+    );
+
+    // build CTable for Literal Lengths
+    let mut max = FSE_MAX_LL as u32;
+    let most = hist_count_fast(&mut count, &mut max, ll_codes) as usize;
+    next.ll_repeat = prev.ll_repeat;
+    stats.ll_type = select_encoding_type(
+        &mut next.ll_repeat,
+        &count,
+        max,
+        most,
+        nb_seq,
+        9,
+        &prev.ll,
+        &LL_DEFAULT_NORM,
+        6,
+        true,
+        strategy,
+    );
+    let n = build_ctable(
+        &mut dst[op..],
+        &mut next.ll,
+        9,
+        stats.ll_type,
+        &mut count,
+        max,
+        ll_codes,
+        &LL_DEFAULT_NORM,
+        6,
+        FSE_MAX_LL as u32,
+        &prev.ll,
+    )?;
+    if stats.ll_type == SET_COMPRESSED {
+        stats.last_count_size = n;
+    }
+    op += n;
+
+    // build CTable for Offsets
+    let mut max = FSE_MAX_OFF as u32;
+    let most = hist_count_fast(&mut count, &mut max, of_codes) as usize;
+    // the basic table can only be used if max <= DefaultMaxOff, otherwise
+    // the offsets are too large
+    let default_allowed = max <= DEFAULT_MAX_OFF;
+    next.of_repeat = prev.of_repeat;
+    stats.of_type = select_encoding_type(
+        &mut next.of_repeat,
+        &count,
+        max,
+        most,
+        nb_seq,
+        8,
+        &prev.of,
+        &OF_DEFAULT_NORM,
+        5,
+        default_allowed,
+        strategy,
+    );
+    let n = build_ctable(
+        &mut dst[op..],
+        &mut next.of,
+        8,
+        stats.of_type,
+        &mut count,
+        max,
+        of_codes,
+        &OF_DEFAULT_NORM,
+        5,
+        DEFAULT_MAX_OFF,
+        &prev.of,
+    )?;
+    if stats.of_type == SET_COMPRESSED {
+        stats.last_count_size = n;
+    }
+    op += n;
+
+    // build CTable for MatchLengths
+    let mut max = FSE_MAX_ML as u32;
+    let most = hist_count_fast(&mut count, &mut max, ml_codes) as usize;
+    next.ml_repeat = prev.ml_repeat;
+    stats.ml_type = select_encoding_type(
+        &mut next.ml_repeat,
+        &count,
+        max,
+        most,
+        nb_seq,
+        9,
+        &prev.ml,
+        &ML_DEFAULT_NORM,
+        6,
+        true,
+        strategy,
+    );
+    let n = build_ctable(
+        &mut dst[op..],
+        &mut next.ml,
+        9,
+        stats.ml_type,
+        &mut count,
+        max,
+        ml_codes,
+        &ML_DEFAULT_NORM,
+        6,
+        FSE_MAX_ML as u32,
+        &prev.ml,
+    )?;
+    if stats.ml_type == SET_COMPRESSED {
+        stats.last_count_size = n;
+    }
+    op += n;
+    stats.size = op;
+    Ok(stats)
+}
+
+/// libzstd's `ZSTD_entropyCompressSeqStore` (with `_internal` and
+/// `_wExtLitBuffer`) on the chunk `ch` of `ss`, from a block (or
+/// partition) of `block_size` bytes. Returns 0 when it should be stored
+/// raw.
+pub(crate) fn entropy_compress_seq_store(
+    dst: &mut [u8],
+    ss: &mut SeqStore,
+    ch: &SeqChunk,
     prev: &EntropyTables,
     next: &mut EntropyTables,
     cp: &CParams,
     block_size: usize,
 ) -> Result<usize> {
-    let r = entropy_compress_internal(dst, ss, prev, next, cp);
+    let r = entropy_compress_internal(dst, ss, ch, prev, next, cp);
     let c = match r {
         Ok(0) => return Ok(0),
         Err(Error::OutputTooSmall) if block_size <= dst.len() => return Ok(0),
@@ -100,19 +329,20 @@ fn entropy_compress_seq_store(
 fn entropy_compress_internal(
     dst: &mut [u8],
     ss: &mut SeqStore,
+    ch: &SeqChunk,
     prev: &EntropyTables,
     next: &mut EntropyTables,
     cp: &CParams,
 ) -> Result<usize> {
     let strategy = cp.strategy as u32;
-    let nb_seq = ss.nb_seq;
-    let lit_size = ss.lit_len;
+    let nb_seq = ch.nb_seq();
+    let lit_size = ch.lit_end - ch.lit_start;
     let mut op = 0usize;
     {
         let suspect = nb_seq == 0 || lit_size / nb_seq >= SUSPECT_UNCOMPRESSIBLE_LITERAL_RATIO;
         op += compress_literals(
             dst,
-            &ss.lit_buf[..lit_size],
+            &ss.lit_buf[ch.lit_start..ch.lit_end],
             &prev.huf,
             &mut next.huf,
             strategy,
@@ -140,157 +370,55 @@ fn entropy_compress_internal(
         return Ok(op);
     }
 
-    // ZSTD_buildSequencesStatistics
     let seq_head = op;
     op += 1;
-    seq_to_codes(ss);
-    let mut count = [0u32; 256];
-    let mut last_count_size = 0usize;
-    let (ll_codes, of_codes, ml_codes) = (
-        &ss.ll_code[..nb_seq],
-        &ss.of_code[..nb_seq],
-        &ss.ml_code[..nb_seq],
-    );
+    let stats =
+        build_sequences_statistics(&mut dst[op..], ss, ch, &prev.fse, &mut next.fse, strategy)?;
+    op += stats.size;
+    dst[seq_head] = ((stats.ll_type << 6) + (stats.of_type << 4) + (stats.ml_type << 2)) as u8;
 
-    let mut max = MAX_LL as u32;
-    let most = hist_count_fast(&mut count, &mut max, ll_codes) as usize;
-    next.fse.ll_repeat = prev.fse.ll_repeat;
-    let ll_type = select_encoding_type(
-        &mut next.fse.ll_repeat,
-        &count,
-        max,
-        most,
-        nb_seq,
-        9,
-        &prev.fse.ll,
-        &LL_DEFAULT_NORM,
-        6,
-        true,
-        strategy,
-    );
-    let n = build_ctable(
-        &mut dst[op..],
-        &mut next.fse.ll,
-        9,
-        ll_type,
-        &mut count,
-        max,
-        ll_codes,
-        &LL_DEFAULT_NORM,
-        6,
-        MAX_LL as u32,
-        &prev.fse.ll,
-    )?;
-    if ll_type == SET_COMPRESSED {
-        last_count_size = n;
-    }
-    op += n;
-
-    let mut max = MAX_OFF as u32;
-    let most = hist_count_fast(&mut count, &mut max, of_codes) as usize;
-    let default_allowed = max <= DEFAULT_MAX_OFF;
-    next.fse.of_repeat = prev.fse.of_repeat;
-    let of_type = select_encoding_type(
-        &mut next.fse.of_repeat,
-        &count,
-        max,
-        most,
-        nb_seq,
-        8,
-        &prev.fse.of,
-        &OF_DEFAULT_NORM,
-        5,
-        default_allowed,
-        strategy,
-    );
-    let n = build_ctable(
-        &mut dst[op..],
-        &mut next.fse.of,
-        8,
-        of_type,
-        &mut count,
-        max,
-        of_codes,
-        &OF_DEFAULT_NORM,
-        5,
-        DEFAULT_MAX_OFF,
-        &prev.fse.of,
-    )?;
-    if of_type == SET_COMPRESSED {
-        last_count_size = n;
-    }
-    op += n;
-
-    let mut max = MAX_ML as u32;
-    let most = hist_count_fast(&mut count, &mut max, ml_codes) as usize;
-    next.fse.ml_repeat = prev.fse.ml_repeat;
-    let ml_type = select_encoding_type(
-        &mut next.fse.ml_repeat,
-        &count,
-        max,
-        most,
-        nb_seq,
-        9,
-        &prev.fse.ml,
-        &ML_DEFAULT_NORM,
-        6,
-        true,
-        strategy,
-    );
-    let n = build_ctable(
-        &mut dst[op..],
-        &mut next.fse.ml,
-        9,
-        ml_type,
-        &mut count,
-        max,
-        ml_codes,
-        &ML_DEFAULT_NORM,
-        6,
-        MAX_ML as u32,
-        &prev.fse.ml,
-    )?;
-    if ml_type == SET_COMPRESSED {
-        last_count_size = n;
-    }
-    op += n;
-    dst[seq_head] = ((ll_type << 6) + (of_type << 4) + (ml_type << 2)) as u8;
-
+    let (s, e) = (ch.seq_start, ch.seq_end);
     let bitstream = encode_sequences(
         &mut dst[op..],
         &next.fse.ml,
-        ml_codes,
+        &ss.ml_code[s..e],
         &next.fse.of,
-        of_codes,
+        &ss.of_code[s..e],
         &next.fse.ll,
-        ll_codes,
-        &ss.sequences[..nb_seq],
+        &ss.ll_code[s..e],
+        &ss.sequences[s..e],
     )?;
     op += bitstream;
     // zstd <= 1.3.4 decoders reject a last table description under 4 bytes
     // together with the bitstream: libzstd stores such blocks raw.
-    if last_count_size != 0 && last_count_size + bitstream < 4 {
+    if stats.last_count_size != 0 && stats.last_count_size + bitstream < 4 {
         return Ok(0);
     }
     Ok(op)
 }
 
 /// libzstd's `ZSTD_isRLE`.
-fn is_rle(src: &[u8]) -> bool {
+pub(super) fn is_rle(src: &[u8]) -> bool {
     src.iter().all(|&b| b == src[0])
 }
 
 /// Compression state for one frame at a time (libzstd's `ZSTD_CCtx` for
 /// the one-shot path).
 pub(crate) struct FrameCompressor {
-    cp: CParams,
-    ms: MatchState,
-    ss: SeqStore,
-    prev: Box<EntropyTables>,
-    next: Box<EntropyTables>,
-    rep: [u32; 3],
+    pub(super) cp: CParams,
+    pub(super) ms: MatchState,
+    pub(super) ss: SeqStore,
+    /// `blockState.prevCBlock->entropy`
+    pub(super) prev: Box<EntropyTables>,
+    /// `blockState.nextCBlock->entropy`
+    pub(super) next: Box<EntropyTables>,
+    /// `blockState.prevCBlock->rep`
+    pub(super) rep: [u32; 3],
     fp: Box<FpStats>,
-    first_block: bool,
+    /// `isFirstBlock`
+    pub(super) first_block: bool,
+    /// The post-block splitter is enabled (`ZSTD_blockSplitterEnabled`).
+    split: bool,
 }
 
 impl FrameCompressor {
@@ -306,6 +434,7 @@ impl FrameCompressor {
             rep: REP_START_VALUE,
             fp: Box::new(FpStats::new()),
             first_block: true,
+            split: block_splitter_enabled(&cp),
         }
     }
 
@@ -331,6 +460,7 @@ impl FrameCompressor {
         }
         self.rep = REP_START_VALUE;
         self.first_block = true;
+        self.split = block_splitter_enabled(&cp);
     }
 
     /// libzstd's `ZSTD_compressBlock_internal`: 0 = store raw, 1 = RLE
@@ -347,9 +477,11 @@ impl FrameCompressor {
         {
             0
         } else {
+            let ch = SeqChunk::full(&self.ss);
             let mut c = entropy_compress_seq_store(
                 dst,
                 &mut self.ss,
+                &ch,
                 &self.prev,
                 &mut self.next,
                 &self.cp,
@@ -395,6 +527,14 @@ impl FrameCompressor {
                 return Err(Error::OutputTooSmall);
             }
             self.ms.prepare_block(pos, bs);
+            if self.split {
+                let c_size = self.compress_block_split(&mut dst[op..], src, pos, pos + bs, last)?;
+                savings += bs as i64 - c_size as i64;
+                pos += bs;
+                op += c_size;
+                self.first_block = false;
+                continue;
+            }
             let c = self.compress_block(&mut dst[op + BLOCK_HEADER_SIZE..], src, pos, pos + bs)?;
             let c_size = if c == 0 {
                 // ZSTD_noCompressBlock
