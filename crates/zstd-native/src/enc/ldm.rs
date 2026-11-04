@@ -674,6 +674,32 @@ impl LdmState {
         self.window.update(src, src_size, false);
     }
 
+    /// The multithreaded compressor's serial LDM step for a job
+    /// (`ZSTDMT_serialState_genSequences`): appends `buf[start..end]` to the
+    /// window and returns its long matches (at most
+    /// [`reset`](Self::reset)'s `block_size / minMatchLength`, the job
+    /// size there).
+    ///
+    /// # Errors
+    ///
+    /// As [`generate_sequences`](Self::generate_sequences) (not possible
+    /// for a job of at most the job size).
+    pub(crate) fn job_sequences(
+        &mut self,
+        buf: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Result<RawSeqStore> {
+        self.window.update(start, end - start, false);
+        self.generate_sequences(buf, start, end)?;
+        let capacity = self.seqs.capacity;
+        let mut seqs = core::mem::take(&mut self.seqs);
+        self.seqs.capacity = capacity;
+        seqs.pos = 0;
+        seqs.pos_in_sequence = 0;
+        Ok(seqs)
+    }
+
     /// `ZSTD_ldm_insertEntry()`.
     #[inline]
     fn insert_entry(&mut self, hash: u32, entry: LdmEntry) {
@@ -1028,6 +1054,72 @@ pub(crate) fn build_seq_store_ldm(
     debug_assert!(ldm.seqs.pos == ldm.seqs.seq.len());
     ss.store_last_literals(&buf[end - last_ll_size..end]);
     Ok(true)
+}
+
+/// `ZSTD_buildSeqStore()` with external sequences (`cctx->externSeqStore`,
+/// `ZSTD_referenceExternalSequences`): the long matches of a whole job of
+/// the multithreaded compressor, generated serially before the job (see
+/// the `mt` module), consumed block by block. Once they are all consumed,
+/// as [`build_seq_store`](super::fast::build_seq_store). `view` is scratch
+/// space.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_seq_store_ext(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    raw: &mut RawSeqStore,
+    view: &mut Vec<RawSeq>,
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> bool {
+    let size = end - start;
+    let opt = ms.cparams.strategy >= Strategy::BtOpt;
+    if size < MIN_SEQ_STORE_BLOCK {
+        if opt {
+            raw.skip_bytes(size);
+        } else {
+            raw.skip_sequences(size, ms.cparams.min_match);
+        }
+        return false;
+    }
+    if raw.pos >= raw.seq.len() {
+        return super::fast::build_seq_store(ms, ss, rep, buf, start, end);
+    }
+    ss.reset();
+    // limited update after a very long match
+    let curr = ms.window.index(start);
+    if curr > ms.next_to_update + 384 {
+        ms.next_to_update = curr - 192u32.min(curr - ms.next_to_update - 384);
+    }
+    let last_ll_size = if opt {
+        // The parser reads a copy of the store from `pos` and
+        // `posInSequence`: the sequences reaching into the block, the first
+        // one without its `posInSequence` bytes (the same candidates).
+        view.clear();
+        let mut covered = 0usize;
+        for (i, &s) in raw.seq[raw.pos..].iter().enumerate() {
+            let mut s = s;
+            if i == 0 {
+                let pis = raw.pos_in_sequence as u32;
+                let lits = s.lit_length.min(pis);
+                s.lit_length -= lits;
+                s.match_length -= pis - lits;
+            }
+            covered += (s.lit_length + s.match_length) as usize;
+            view.push(s);
+            if covered > size {
+                break;
+            }
+        }
+        let n = super::opt::compress_block_opt_ldm(ms, ss, rep, buf, start, end, view);
+        raw.skip_bytes(size);
+        n
+    } else {
+        ldm_block_compress(raw, ms, ss, rep, buf, start, end)
+    };
+    ss.store_last_literals(&buf[end - last_ll_size..end]);
+    true
 }
 
 /// `ZSTD_ldm_blockCompress()`: compresses the block `buf[start..end]` with

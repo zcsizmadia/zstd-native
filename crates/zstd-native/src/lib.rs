@@ -38,7 +38,10 @@
 //! (libzstd's `ZSTD_compressStream2`, byte-identical for the same calls).
 //! All of them take dictionaries too ([`compress_with_dictionary`],
 //! [`Compressor::with_dictionary`], or an [`EncoderDictionary`] prepared
-//! once), with libzstd's output.
+//! once), with libzstd's output. With `std`, [`Compressor`],
+//! [`StreamEncoder`] and [`Encoder`] also compress with worker threads
+//! (`set_workers`, libzstd's `ZSTD_c_nbWorkers`), with libzstd's
+//! multithreaded output.
 //!
 //! ```
 //! use std::io::Write;

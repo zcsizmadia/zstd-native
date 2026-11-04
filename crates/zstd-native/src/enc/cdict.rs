@@ -389,10 +389,37 @@ fn indices_are_tagged(cp: &CParams) -> bool {
 pub(crate) fn load_dictionary_content(
     ms: &mut MatchState,
     buf: &[u8],
+    start: usize,
+    end: usize,
+    dtlm: TableLoadMethod,
+    for_cdict: bool,
+) {
+    load_content(ms, buf, start, end, dtlm, for_cdict, true);
+}
+
+/// `ZSTD_compress_insertDictionary` of a raw-content prefix with
+/// `ZSTD_c_forceMaxWindow` set (`ZSTD_dtlm_fast`, `ZSTD_tfp_forCCtx`), as
+/// the multithreaded compressor loads a job's overlap with the previous
+/// job (`ZSTDMT_compressionJob`): `buf[start..end]` is followed in `buf`
+/// by the data to compress, so the window stays contiguous, and the
+/// prefix is part of the window rather than a dictionary
+/// (`loadedDictEnd = 0`). Prefixes under 8 bytes are ignored.
+pub(crate) fn load_prefix(ms: &mut MatchState, buf: &[u8], start: usize, end: usize) {
+    if end - start >= 8 {
+        load_content(ms, buf, start, end, TableLoadMethod::Fast, false, false);
+    }
+}
+
+/// [`load_dictionary_content`] (`own_buffer`: the content is in the
+/// dictionary's buffer), or the prefix of [`load_prefix`].
+fn load_content(
+    ms: &mut MatchState,
+    buf: &[u8],
     mut start: usize,
     end: usize,
     dtlm: TableLoadMethod,
     for_cdict: bool,
+    own_buffer: bool,
 ) {
     let cp = ms.cparams;
     debug_assert!(ms.window.is_empty());
@@ -412,8 +439,9 @@ pub(crate) fn load_dictionary_content(
         }
     }
     ms.window.update(start, end - start, false);
-    // the window's positions are now in the dictionary's buffer
-    ms.window.base_in_dict = true;
+    // the window's positions are now in the dictionary's buffer (a
+    // prefix's are in the caller's)
+    ms.window.base_in_dict = own_buffer;
 
     // If the dict is larger than we can reasonably index in our tables,
     // only load the suffix.
@@ -425,7 +453,8 @@ pub(crate) fn load_dictionary_content(
         }
     }
     ms.next_to_update = ms.window.index(start);
-    ms.loaded_dict_end = ms.window.index(end);
+    // forceWindow (a prefix): no dictionary end, the window rules apply
+    ms.loaded_dict_end = if own_buffer { ms.window.index(end) } else { 0 };
     ms.force_non_contiguous = false;
 
     if end - start <= HASH_READ_SIZE {

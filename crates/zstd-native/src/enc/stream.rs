@@ -32,6 +32,14 @@
 //! frame ([`EndOp::End`]), else for an unknown size (the level's largest
 //! window). The frame header holds the content size when it is known.
 //!
+//! # Multithreading
+//!
+//! With `std` and workers (`StreamEncoder::set_workers`), a frame of
+//! unknown size or over 512 KiB is compressed by the `mt` module instead
+//! (`ZSTDMT_compressStream_generic`): its input goes into job buffers, not
+//! the ring, the shortcut below does not apply, and the output does not
+//! depend on the output buffer sizes.
+//!
 //! # libzstd's shortcut
 //!
 //! An [`EndOp::End`] call that finds the input buffer empty at its start
@@ -164,6 +172,15 @@ pub struct StreamEncoder {
     frame_ended: bool,
     /// The dictionary of the next frames.
     dict: DictSlot,
+    /// Multithreading parameters of the next frames.
+    #[cfg(feature = "std")]
+    mt_params: super::mt::MtParams,
+    /// The multithreaded context, once used.
+    #[cfg(feature = "std")]
+    mt: Option<Box<super::mt::MtCtx>>,
+    /// The current frame is compressed by [`mt`](Self::mt).
+    #[cfg(feature = "std")]
+    mt_on: bool,
 }
 
 impl core::fmt::Debug for StreamEncoder {
@@ -172,6 +189,7 @@ impl core::fmt::Debug for StreamEncoder {
             .field("level", &self.level)
             .field("stage", &self.stage)
             .field("pledged", &self.pledged)
+            .field("workers", &self.workers_or_0())
             .finish_non_exhaustive()
     }
 }
@@ -196,7 +214,78 @@ impl StreamEncoder {
             out_flushed: 0,
             frame_ended: false,
             dict: DictSlot::None,
+            #[cfg(feature = "std")]
+            mt_params: super::mt::MtParams::default(),
+            #[cfg(feature = "std")]
+            mt: None,
+            #[cfg(feature = "std")]
+            mt_on: false,
         }
+    }
+
+    /// The worker count (0 without `std`).
+    fn workers_or_0(&self) -> u32 {
+        #[cfg(feature = "std")]
+        return self.mt_params.workers;
+        #[cfg(not(feature = "std"))]
+        0
+    }
+
+    /// Compresses the next frames with `n` worker threads (libzstd's
+    /// `ZSTD_c_nbWorkers`; at most 256, 64 on 32-bit targets); 0, the
+    /// default, compresses in the calling thread. The output is
+    /// byte-identical to libzstd's with the same worker count, see
+    /// [`Compressor::set_workers`](crate::Compressor::set_workers) for how
+    /// frames are cut into jobs, threads and memory.
+    ///
+    /// A frame whose pledged size (or, when the first call ends it, input
+    /// size) is at most 512 KiB is still compressed in the calling thread.
+    /// Otherwise, input is buffered until a job is full (or a flush or the
+    /// end comes), then compressed by a worker while more input is taken:
+    /// [`compress`](Self::compress) with [`EndOp::Continue`] returns once
+    /// it has taken some input or written some output (waiting for the
+    /// oldest job when it could do neither), and the output does not
+    /// depend on the output buffer sizes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StageWrong`] in the middle of a frame.
+    #[cfg(feature = "std")]
+    pub fn set_workers(&mut self, n: u32) -> Result<()> {
+        if self.stage != Stage::Init {
+            return Err(Error::StageWrong);
+        }
+        self.mt_params.set_workers(n);
+        Ok(())
+    }
+
+    /// The worker thread count (see [`set_workers`](Self::set_workers)).
+    #[cfg(feature = "std")]
+    pub fn workers(&self) -> u32 {
+        self.mt_params.workers
+    }
+
+    /// Sets the job size of multithreaded compression, from the next frame
+    /// on (see [`Compressor::set_job_size`](crate::Compressor::set_job_size)).
+    /// For tests.
+    #[cfg(feature = "std")]
+    #[doc(hidden)]
+    pub fn set_job_size(&mut self, size: usize) {
+        self.mt_params.set_job_size(size);
+    }
+
+    /// Sets the overlap log of multithreaded compression, from the next
+    /// frame on (see
+    /// [`Compressor::set_overlap_log`](crate::Compressor::set_overlap_log)).
+    /// For tests.
+    ///
+    /// # Panics
+    ///
+    /// If `log` is over 9.
+    #[cfg(feature = "std")]
+    #[doc(hidden)]
+    pub fn set_overlap_log(&mut self, log: u32) {
+        self.mt_params.set_overlap_log(log);
     }
 
     /// A streaming compressor for `level` with the dictionary `dict` (see
@@ -311,6 +400,12 @@ impl StreamEncoder {
         self.out_content = 0;
         self.out_flushed = 0;
         self.frame_ended = false;
+        #[cfg(feature = "std")]
+        if core::mem::take(&mut self.mt_on)
+            && let Some(m) = self.mt.as_deref_mut()
+        {
+            m.abandon();
+        }
     }
 
     /// Whether no frame is in progress: the last frame was ended and all its
@@ -371,6 +466,22 @@ impl StreamEncoder {
         );
         // ZSTD_resolveEnableLdm
         let ldm = self.force_ldm || ldm_enabled(&cp);
+        #[cfg(feature = "std")]
+        {
+            // do not invoke multi-threading when src size is too small
+            self.mt_on = self.mt_params.applies(self.pledged);
+            if self.mt_on {
+                let m = self
+                    .mt
+                    .get_or_insert_with(|| Box::new(super::mt::MtCtx::new()));
+                m.init_frame(&self.mt_params, cp, ldm, cd, self.pledged);
+                self.out_content = 0;
+                self.out_flushed = 0;
+                self.stage = Stage::Load;
+                self.frame_ended = false;
+                return Ok(());
+            }
+        }
         let fc = FrameCompressor::start_frame(&mut self.fc, cp, cd.as_ref(), self.pledged, ldm);
         let bsm = fc.block_size_max;
         let pledged = self.pledged.unwrap_or(CONTENTSIZE_UNKNOWN);
@@ -404,6 +515,17 @@ impl StreamEncoder {
     ) -> Result<CompressProgress> {
         if self.stage == Stage::Init {
             self.init(op, input.len())?;
+        }
+        #[cfg(feature = "std")]
+        if self.mt_on {
+            let m = self.mt.as_deref_mut().expect("multithreaded context");
+            let p = m.compress(input, output, op)?;
+            if op == EndOp::End && p.remaining == 0 {
+                // compression completed
+                self.mt_on = false;
+                self.end_session();
+            }
+            return Ok(p);
         }
         let mut ip = 0usize;
         let mut opos = 0usize;

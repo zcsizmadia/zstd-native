@@ -21,8 +21,11 @@ prepared once (`EncoderDictionary`, libzstd's `ZSTD_CDict`), byte-identical
 with libzstd's attached, copied or reloaded dictionary tables at every
 level, one-shot and streaming. So is long distance matching, which
 libzstd turns on by itself at level 22 for inputs over 64 MiB or of
-unknown size (and with a 128 MiB window from level 16). Not yet:
-multithreading.
+unknown size (and with a 128 MiB window from level 16). So is
+multithreaded compression (with `std`: `Compressor::set_workers`,
+`StreamEncoder::set_workers`, `Encoder::set_workers`), byte-identical
+with libzstd's for the same worker count (`ZSTD_c_nbWorkers`), on par
+with libzstd's speed in first measurements.
 
 ```rust
 let compressed = zstd_native::compress(&data, 1)?; // same bytes as libzstd
@@ -48,6 +51,11 @@ let mut c = zstd_native::Compressor::with_dictionary(3, &dict_bytes)?;
 let compressed = c.compress(&message)?;
 let prepared = zstd_native::EncoderDictionary::new(&dict_bytes, 3)?;
 let mut enc = zstd_native::Encoder::with_prepared_dictionary(Vec::new(), &prepared);
+
+// Multithreaded compression (same bytes as libzstd with ZSTD_c_nbWorkers 4):
+let mut c = zstd_native::Compressor::new(3);
+c.set_workers(4);
+let compressed = c.compress(&large_input)?;
 ```
 
 ## Speed

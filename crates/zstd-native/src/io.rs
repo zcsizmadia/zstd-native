@@ -207,6 +207,31 @@ impl<W: Write> Encoder<W> {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
     }
 
+    /// Compresses with `n` worker threads (see
+    /// [`StreamEncoder::set_workers`]; the `zstd` crate's
+    /// `Encoder::multithread`), with libzstd's output for the same worker
+    /// count. Must be called before the first write.
+    ///
+    /// ```
+    /// use std::io::Write;
+    /// let data = b"hello hello hello hello ".repeat(100_000);
+    /// let mut enc = zstd_native::Encoder::new(Vec::new(), 3);
+    /// enc.set_workers(4)?;
+    /// enc.write_all(&data)?;
+    /// let compressed = enc.finish()?;
+    /// assert_eq!(zstd_native::decompress(&compressed).unwrap(), data);
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::InvalidInput`] after the first write.
+    pub fn set_workers(&mut self, n: u32) -> io::Result<()> {
+        self.enc
+            .set_workers(n)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+    }
+
     /// The underlying writer.
     pub fn get_ref(&self) -> &W {
         &self.writer

@@ -151,8 +151,28 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
    table; byte-identical with libzstd, also forced on at every level
    (a hidden test hook). Not ported: the public LDM parameters
    (`ZSTD_c_enableLongDistanceMatching`, `ZSTD_c_ldm*`).
-   Next: speed (#17), multithreading.
-4. Multithreaded compression.
+   Next: speed (#17).
+4. ~~Multithreaded compression~~ (done, #23, `enc/mt.rs`, with `std`): a
+   port of `zstdmt_compress.c` and of how `ZSTD_compressStream2` drives it
+   (`nbWorkers >= 1`; still single-threaded for known sizes up to 512
+   KiB). Frames are cut into jobs of `ZSTD_c_jobSize` bytes (default
+   `4 << windowLog`, at least 1 MiB), or shorter at a flush or the end;
+   each job is a separate compression (`ZSTDMT_compressionJob`): the
+   first writes the frame header and uses the dictionary, the others
+   start from the previous job's last `overlap` bytes (`ZSTD_c_overlapLog`,
+   a raw-content prefix with `forceMaxWindow`) with invalidated repcodes,
+   in 512 KiB chunks, the last ends the frame. Workers are std threads,
+   started with the first multithreaded frame and kept by the compressor;
+   jobs own their input (prefix included) and output, and are written out
+   in order, so the output never depends on timing. LDM runs serially per
+   job over a copy of libzstd's round input buffer (whose wrap points
+   decide the LDM window's segments) and gives the job external
+   sequences. Byte-identical with libzstd for the same worker count, job
+   size and overlap log: one-shot (`ZSTD_compress2`) and streaming,
+   every strategy, flushes, pledged sizes, dictionaries, LDM; on par with
+   libzstd's speed with 4-8 workers in first measurements (Windows
+   laptop), single-threaded speed unchanged. Not ported: `ZSTD_c_rsyncable`,
+   checksums (the encoder writes none yet).
 5. Fuzzing (cargo-fuzz, differential vs libzstd), Miri, CI matrix
    (x86-64/AArch64, Linux/Windows/macOS, 32-bit), AArch64 tuning.
 
