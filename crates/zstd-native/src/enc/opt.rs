@@ -650,6 +650,47 @@ impl Bt {
         }
     }
 
+    /// Prefetches what the search (or insertion) of the position after `ip`
+    /// starts with. The parser searches and inserts consecutive positions,
+    /// and each one begins with random accesses into tables of up to 16 MiB
+    /// (hash) and 64 MiB (tree) at the high levels and into the window,
+    /// missing every cache with nothing to overlap the misses with: the
+    /// bucket of `ip + 2` (so that it is readable here for `ip + 1` next
+    /// time, with the tree node and the bytes of its head), the 3-byte
+    /// bucket and the tree slot of `ip + 1`. Hints only: a stale or empty
+    /// head only wastes the fetch.
+    ///
+    /// # Safety
+    /// `ip + 8 <= iend` (the hashes read up to 8 bytes at `ip + 1` and
+    /// `ip + 2`, checked against `iend` here).
+    #[allow(unsafe_code)]
+    #[inline(always)]
+    unsafe fn prefetch_next<const MLS: u32>(&self, ip: *const u8, iend: *const u8) {
+        // SAFETY: the reads are inside the block (checked), the hash table
+        // read is masked into the table; prefetches never fault.
+        unsafe {
+            if ip.add(1 + HASH_READ_SIZE) > iend {
+                return;
+            }
+            let nip = ip.add(1);
+            let curr = self.idx(ip);
+            let head = *self.hash_table.add(hash_mls::<MLS>(nip, self.hash_log));
+            prefetch_l1(self.bt.add(2 * (head & self.bt_mask) as usize).cast());
+            prefetch_l1(self.pos(head));
+            prefetch_l1(self.bt.add(2 * ((curr + 1) & self.bt_mask) as usize).cast());
+            if MLS == 3 {
+                prefetch_l1(self.hash_table3.add(hash3_ptr(nip, self.hash_log3)).cast());
+            }
+            if ip.add(2 + HASH_READ_SIZE) <= iend {
+                prefetch_l1(
+                    self.hash_table
+                        .add(hash_mls::<MLS>(ip.add(2), self.hash_log))
+                        .cast(),
+                );
+            }
+        }
+    }
+
     /// `ZSTD_getLowestMatchIndex()`.
     #[inline(always)]
     fn lowest_match_index(&self, curr: u32) -> u32 {
@@ -759,6 +800,7 @@ unsafe fn insert_bt1<const MLS: u32, const EXT: bool>(
     // the prefix reaches it).
     unsafe {
         s.chk(ip, 8);
+        s.prefetch_next::<MLS>(ip, iend);
         let h = hash_mls::<MLS>(ip, s.hash_log);
         let mut match_index = *s.hash_table.add(h);
         let mut smaller_ptr = bt.add(2 * (curr & bt_mask) as usize);
@@ -882,24 +924,10 @@ unsafe fn get_all_matches<const MLS: u32, const EXT: bool, const DMS: bool>(
     // the 3-byte hash and tree candidates are at or above `matchLow` and
     // before `curr`; forward reads stop at `ilimit` (the block end).
     unsafe {
-        let curr = s.idx(ip);
-        // The parser searches consecutive positions: prefetch the next one's
-        // hash bucket(s) and its slot in the tree (random accesses into
-        // tables of up to 16 and 64 MiB at the high levels, missing every
-        // cache) now, so that the misses overlap this position's search.
-        // The hash reads 8 bytes at `ip + 1`, in the block when
-        // `ip + 1 + 8 <= iend`.
-        if ip.add(1 + HASH_READ_SIZE) <= iend {
-            let nip = ip.add(1);
-            prefetch_l1(s.hash_table.add(hash_mls::<MLS>(nip, s.hash_log)).cast());
-            if MLS == 3 {
-                prefetch_l1(s.hash_table3.add(hash3_ptr(nip, s.hash_log3)).cast());
-            }
-            prefetch_l1(bt.add(2 * ((curr + 1) & bt_mask) as usize).cast());
-        }
-
+        s.prefetch_next::<MLS>(ip, iend);
         update_tree::<MLS, EXT>(s, ip, iend);
 
+        let curr = s.idx(ip);
         let dict_limit = s.dict_limit;
         let bt_low = curr.saturating_sub(bt_mask);
         let window_low = s.lowest_match_index(curr);
