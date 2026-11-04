@@ -224,6 +224,21 @@ porting. It is never compiled into this crate. C libzstd (the `zstd`
 crate) is used only by the benchmark and fuzz crates. Design notes and
 the roadmap are in [docs/PROPOSAL.md](docs/PROPOSAL.md).
 
+## Sibling project
+
+[xz-native](https://github.com/zcsizmadia/xz-native)
+([crates.io](https://crates.io/crates/xz-native)) applies the same approach
+to xz/liblzma 5.8.4:
+- pure Rust;
+- `.xz`, `.lzma` and `.lz` decoding, and `.xz` and `.lzma` encoding
+  byte-identical to liblzma;
+- the same strictness on bad input;
+- at or above liblzma's speed.
+
+The two crates share their design: run-time CPU dispatch with a `portable`
+fallback, differential tests and fuzzing against the C library, and
+versions that name the upstream release they match.
+
 ## License
 
 [BSD-3-Clause](LICENSE), like zstd. zstd-native is a port of parts of it.
