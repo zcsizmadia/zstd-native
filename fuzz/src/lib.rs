@@ -291,6 +291,9 @@ pub struct EncParams {
     pub workers_n: u8,
     pub job_size_n: u8,
     pub overlap_log_n: u8,
+    /// Frame parameters: bit 0 the checksum, bit 1 no content size, bit 2
+    /// no dictionary ID.
+    pub frame_flags_n: u8,
     pub dict: EncDict,
 }
 
@@ -324,6 +327,18 @@ impl EncParams {
     }
     pub fn overlap_log(&self) -> u32 {
         (self.overlap_log_n % 10) as u32
+    }
+    /// `ZSTD_c_checksumFlag`
+    pub fn checksum(&self) -> bool {
+        self.frame_flags_n & 1 != 0
+    }
+    /// `ZSTD_c_contentSizeFlag`
+    pub fn content_size(&self) -> bool {
+        self.frame_flags_n & 2 == 0
+    }
+    /// `ZSTD_c_dictIDFlag`
+    pub fn dict_id(&self) -> bool {
+        self.frame_flags_n & 4 == 0
     }
 
     /// Longest input for the level (the optimal parser is slow).
@@ -371,6 +386,12 @@ pub fn c_context<'a>(p: &EncParams, cdict: Option<&'a CDict<'static>>) -> CCtx<'
     c.set_parameter(CParameter::JobSize(p.job_size() as u32))
         .unwrap();
     c.set_parameter(CParameter::OverlapSizeLog(p.overlap_log()))
+        .unwrap();
+    c.set_parameter(CParameter::ChecksumFlag(p.checksum()))
+        .unwrap();
+    c.set_parameter(CParameter::ContentSizeFlag(p.content_size()))
+        .unwrap();
+    c.set_parameter(CParameter::DictIdFlag(p.dict_id()))
         .unwrap();
     match &p.dict {
         EncDict::None => {}
@@ -450,6 +471,9 @@ pub fn native_encoder(p: &EncParams) -> Option<zstd_native::StreamEncoder> {
     e.set_workers(p.workers()).unwrap();
     e.set_job_size(p.job_size());
     e.set_overlap_log(p.overlap_log());
+    e.set_checksum(p.checksum()).unwrap();
+    e.set_content_size_flag(p.content_size()).unwrap();
+    e.set_dict_id_flag(p.dict_id()).unwrap();
     Some(e)
 }
 

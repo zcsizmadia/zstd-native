@@ -55,7 +55,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use super::cdict::{DictSlot, EncoderDictionary, frame_cparams};
-use super::compress::{FrameCompressor, FrameStage, compress_bound};
+use super::compress::{FrameCompressor, FrameParams, FrameStage, compress_bound};
 use super::params::{CONTENTSIZE_UNKNOWN, WINDOWLOG_ABSOLUTEMIN, WINDOWLOG_MAX, ldm_enabled};
 use crate::error::{Error, Result};
 
@@ -157,6 +157,8 @@ pub struct StreamEncoder {
     force_ldm: bool,
     /// `pledgedSrcSizePlusOne - 1` for the next or current frame.
     pledged: Option<u64>,
+    /// The frame parameters of the next frames.
+    fparams: FrameParams,
     stage: Stage,
     fc: Option<Box<FrameCompressor>>,
     /// `inBuff`: `in_buff_size` bytes of ring and [`IN_BUFF_SLACK`].
@@ -202,6 +204,7 @@ impl StreamEncoder {
             window_log: 0,
             force_ldm: false,
             pledged: None,
+            fparams: FrameParams::default(),
             stage: Stage::Init,
             fc: None,
             in_buff: Vec::new(),
@@ -391,6 +394,48 @@ impl StreamEncoder {
         Ok(())
     }
 
+    /// Ends the next frames with a content checksum (libzstd's
+    /// `ZSTD_c_checksumFlag`; off by default; see
+    /// [`Compressor::set_checksum`](crate::Compressor::set_checksum)).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StageWrong`] in the middle of a frame.
+    pub fn set_checksum(&mut self, on: bool) -> Result<()> {
+        self.set_fparams(|fp| fp.checksum = on)
+    }
+
+    /// Writes the content size into the next frames' headers when it is
+    /// known (libzstd's `ZSTD_c_contentSizeFlag`; on by default; see
+    /// [`Compressor::set_content_size_flag`](crate::Compressor::set_content_size_flag)).
+    /// The pledged size still chooses the parameters and is still checked.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StageWrong`] in the middle of a frame.
+    pub fn set_content_size_flag(&mut self, on: bool) -> Result<()> {
+        self.set_fparams(|fp| fp.content_size = on)
+    }
+
+    /// Writes the dictionary's ID into the next frames' headers (libzstd's
+    /// `ZSTD_c_dictIDFlag`; on by default; see
+    /// [`Compressor::set_dict_id_flag`](crate::Compressor::set_dict_id_flag)).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StageWrong`] in the middle of a frame.
+    pub fn set_dict_id_flag(&mut self, on: bool) -> Result<()> {
+        self.set_fparams(|fp| fp.dict_id = on)
+    }
+
+    fn set_fparams(&mut self, f: impl FnOnce(&mut FrameParams)) -> Result<()> {
+        if self.stage != Stage::Init {
+            return Err(Error::StageWrong);
+        }
+        f(&mut self.fparams);
+        Ok(())
+    }
+
     /// Abandons the current frame, if any (libzstd's `ZSTD_CCtx_reset`
     /// with `ZSTD_reset_session_only`): the next call starts a new one. The
     /// pledged source size is forgotten; the level is kept.
@@ -474,7 +519,7 @@ impl StreamEncoder {
                 let m = self
                     .mt
                     .get_or_insert_with(|| Box::new(super::mt::MtCtx::new()));
-                m.init_frame(&self.mt_params, cp, ldm, cd, self.pledged);
+                m.init_frame(&self.mt_params, cp, ldm, cd, self.pledged, self.fparams);
                 self.out_content = 0;
                 self.out_flushed = 0;
                 self.stage = Stage::Load;
@@ -483,6 +528,7 @@ impl StreamEncoder {
             }
         }
         let fc = FrameCompressor::start_frame(&mut self.fc, cp, cd.as_ref(), self.pledged, ldm);
+        fc.set_frame_params(self.fparams);
         let bsm = fc.block_size_max;
         let pledged = self.pledged.unwrap_or(CONTENTSIZE_UNKNOWN);
         let window_size = (1u64 << cp.window_log).min(pledged).max(1) as usize;

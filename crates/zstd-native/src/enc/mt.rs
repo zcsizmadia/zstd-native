@@ -51,11 +51,12 @@ use std::vec;
 use std::vec::Vec;
 
 use super::cdict::{CDict, load_prefix};
-use super::compress::{FrameCompressor, compress_bound};
+use super::compress::{FrameCompressor, FrameParams, compress_bound};
 use super::ldm::{LdmState, RawSeqStore};
 use super::params::{BLOCKSIZE_MAX, CParams, Strategy, cycle_log};
 use super::stream::{CompressProgress, EndOp};
 use crate::error::{Error, Result};
+use crate::xxhash::Xxh64;
 
 /// `ZSTDMT_JOBSIZE_MIN`: the smallest job size, and the largest frame
 /// compressed single-threaded even with workers.
@@ -272,6 +273,9 @@ struct SerialState {
 /// What the jobs of a frame share.
 struct Frame {
     cp: CParams,
+    /// The frame parameters (the first job writes the header; the last
+    /// one, if it is also the first, the checksum).
+    fparams: FrameParams,
     /// The dictionary (the first job's only).
     cdict: Option<Arc<CDict>>,
     /// `frameContentSize`
@@ -369,7 +373,9 @@ fn run_job(fc: &mut Option<Box<FrameCompressor>>, job: &Job) -> Result<(Vec<u8>,
     let size = buf.len() - src_start;
     let fc = if job.id == 0 {
         // the frame's parameters and size, the dictionary
-        FrameCompressor::start_frame(fc, f.cp, f.cdict.as_ref(), f.pledged, false)
+        let fc = FrameCompressor::start_frame(fc, f.cp, f.cdict.as_ref(), f.pledged, false);
+        fc.set_frame_params(f.fparams);
+        fc
     } else {
         // the job's size, the previous job's end as a prefix
         let fc = FrameCompressor::start_frame_for_prefix(fc, f.cp, Some(size as u64), false);
@@ -561,6 +567,12 @@ pub(crate) struct MtCtx {
     /// Input taken in the frame, and its pledged size.
     consumed: u64,
     pledged: Option<u64>,
+    /// `serial.xxhState`: the XXH64 of the input taken in the frame, with
+    /// the checksum flag.
+    xxh: Option<Xxh64>,
+    /// The checksum to append to the last job's output, when the frame has
+    /// several jobs (`frameChecksumNeeded`; a single job writes its own).
+    trailer: Option<u32>,
     /// The job table's size (the smallest power of 2 above `nbWorkers +
     /// 2`): at most this many jobs posted and not written out.
     max_jobs: usize,
@@ -614,6 +626,8 @@ impl MtCtx {
             frame_ended: false,
             consumed: 0,
             pledged: None,
+            xxh: None,
+            trailer: None,
             max_jobs: 0,
             out_cap: 0,
         }
@@ -630,6 +644,7 @@ impl MtCtx {
         ldm: bool,
         cdict: Option<Arc<CDict>>,
         pledged: Option<u64>,
+        fparams: FrameParams,
     ) {
         debug_assert!(p.workers > 0);
         self.abandon();
@@ -662,6 +677,8 @@ impl MtCtx {
         self.frame_ended = false;
         self.consumed = 0;
         self.pledged = pledged;
+        self.xxh = fparams.checksum.then(Xxh64::new);
+        self.trailer = None;
         // ZSTDMT_createJobsTable(nbWorkers + 2)
         self.max_jobs = 1 << ((workers as u32 + 2).ilog2() + 1);
         // a buffer per job of the table, plus the one being filled
@@ -699,6 +716,7 @@ impl MtCtx {
         };
         self.frame = Some(Arc::new(Frame {
             cp,
+            fparams,
             cdict,
             pledged,
             serial,
@@ -818,8 +836,12 @@ impl MtCtx {
             if self.pledged.is_some_and(|p| self.consumed > p) {
                 return Err(Error::SrcSizeWrong);
             }
+            let loaded = &input[*ip..*ip + to_load];
+            if let Some(h) = &mut self.xxh {
+                h.update(loaded);
+            }
             let b = self.in_buf.as_mut().expect("input range");
-            b.extend_from_slice(&input[*ip..*ip + to_load]);
+            b.extend_from_slice(loaded);
             *ip += to_load;
             forward_progress = to_load > 0;
         }
@@ -876,10 +898,18 @@ impl MtCtx {
                 return Err(Error::SrcSizeWrong);
             }
             let src_size = self.filled();
+            if end && self.next_job > 0 {
+                // several jobs: the checksum follows the last one's output
+                self.trailer = self.xxh.as_ref().map(|h| h.digest() as u32);
+            }
             if src_size == 0 && self.next_job > 0 {
                 // a last empty block ends the frame
                 debug_assert!(end);
-                self.ready = Some(Ready::Done(vec![1, 0, 0]));
+                let mut v = vec![1, 0, 0];
+                if let Some(c) = self.trailer.take() {
+                    v.extend_from_slice(&c.to_le_bytes());
+                }
+                self.ready = Some(Ready::Done(v));
                 self.in_buf = None;
                 self.prev = None;
                 self.frame_ended = true;
@@ -958,7 +988,19 @@ impl MtCtx {
         {
             match slot.take(block) {
                 None => return Ok(1), // current job not completely compressed
-                Some(Outcome::Done(v, n)) => {
+                Some(Outcome::Done(mut v, mut n)) => {
+                    if self.frame_ended
+                        && self.jobs.len() == 1
+                        && self.ready.is_none()
+                        && let Some(c) = self.trailer.take()
+                    {
+                        // the last job: add the frame checksum
+                        if v.len() < n + 4 {
+                            v.resize(n + 4, 0);
+                        }
+                        v[n..n + 4].copy_from_slice(&c.to_le_bytes());
+                        n += 4;
+                    }
                     self.out = v;
                     self.out_len = n;
                     self.out_pos = 0;
@@ -1056,7 +1098,11 @@ mod tests {
         let mut outs = Vec::new();
         for inline in [false, true] {
             let mut m = MtCtx::new();
-            m.init_frame(&p, cp, false, None, Some(data.len() as u64));
+            let fp = FrameParams {
+                checksum: true,
+                ..FrameParams::default()
+            };
+            m.init_frame(&p, cp, false, None, Some(data.len() as u64), fp);
             if inline {
                 m.pool = Pool {
                     tx: None,
