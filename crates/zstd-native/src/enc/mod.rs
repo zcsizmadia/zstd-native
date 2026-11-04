@@ -15,11 +15,13 @@
 //! - `params`: compression levels and parameter adjustment (clevels.h,
 //!   `ZSTD_getCParams_internal`, `ZSTD_adjustCParams_internal`)
 //! - `fast`: compress/zstd_fast.c
+//! - `dfast`: compress/zstd_double_fast.c
 //! - `presplit`: compress/zstd_preSplit.c
 #![allow(dead_code)] // filled in step by step (issue #6)
 
 pub(crate) mod bitwriter;
 pub(crate) mod compress;
+pub(crate) mod dfast;
 pub(crate) mod fast;
 pub(crate) mod fse_enc;
 pub(crate) mod hist;
@@ -36,8 +38,9 @@ pub use compress::compress_bound;
 /// faster; 0 means the default, 3), like libzstd's `ZSTD_compress`: the
 /// output is byte-identical to libzstd 1.5.7's.
 ///
-/// Work in progress (issue #6): only the fast strategy (levels 1, 2 and
-/// negative) is implemented so far; other levels return
+/// Work in progress (issue #6): only the `fast` and `dfast` strategies
+/// (levels 1-3 and negative, and 4 except for inputs up to 16 KB or of
+/// 128-256 KB) are implemented so far; other levels return
 /// [`Error::UnsupportedFrameParameter`](crate::Error::UnsupportedFrameParameter).
 ///
 /// ```
@@ -147,7 +150,10 @@ impl Compressor {
 
 fn check_level(level: i32, src_size: usize) -> crate::error::Result<()> {
     let cp = params::one_shot_cparams(level, src_size as u64);
-    if cp.strategy != params::Strategy::Fast {
+    if !matches!(
+        cp.strategy,
+        params::Strategy::Fast | params::Strategy::DFast
+    ) {
         return Err(crate::error::Error::UnsupportedFrameParameter);
     }
     Ok(())

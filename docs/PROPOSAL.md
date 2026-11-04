@@ -112,9 +112,9 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
    0.98-1.21x libzstd's streaming decoder). Next: write into the
    caller's buffer directly when it can hold the frame.
 3. Encoder, byte-identical with libzstd per level (the oracle for tests;
-   it makes speed the only variable). Done: the fast strategy (levels 1-2
-   and negative; `enc/`, issue #6), 0.91-0.95x libzstd's speed. Next:
-   speed, dfast (#7), the lazy family (#8), optimal parsing (#9),
+   it makes speed the only variable). Done: fast (levels 1-2 and
+   negative; `enc/`, issue #6) and dfast (levels 3-4, #7), 0.90-0.96x
+   libzstd's speed. Next: speed (#17), the lazy family (#8), optimal parsing (#9),
    streaming/dictionaries/multithreading (#10).
 4. Multithreaded compression, dictionaries for the encoder, long distance
    matching.
