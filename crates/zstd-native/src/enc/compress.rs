@@ -9,7 +9,10 @@ use super::fast::{MatchState, build_seq_store};
 use super::hist::hist_count_fast;
 use super::huf_enc::HufRepeat;
 use super::literals::{HufCTables, compress_literals, min_gain};
-use super::params::{CParams, Strategy, block_size_max, block_splitter_enabled, one_shot_cparams};
+use super::params::{
+    CONTENTSIZE_UNKNOWN, CParams, Strategy, block_size_max, block_splitter_enabled,
+    one_shot_cparams,
+};
 use super::presplit::{FpStats, optimal_block_size};
 use super::seq_store::{
     LongLengthType, MAX_LL, MAX_ML, REP_START_VALUE, STREAM_ACCUMULATOR_MIN, SeqDef, SeqStore,
@@ -402,8 +405,19 @@ pub(super) fn is_rle(src: &[u8]) -> bool {
     src.iter().all(|&b| b == src[0])
 }
 
-/// Compression state for one frame at a time (libzstd's `ZSTD_CCtx` for
-/// the one-shot path).
+/// libzstd's `ZSTD_compressionStage_e` (`cctx->stage`) for a started frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameStage {
+    /// `ZSTDcs_init`: the frame header is not written yet.
+    Init,
+    /// `ZSTDcs_ongoing`: blocks are being written.
+    Ongoing,
+    /// `ZSTDcs_ending`: the last block was written.
+    Ending,
+}
+
+/// Compression state for one frame at a time (libzstd's `ZSTD_CCtx`
+/// without the streaming buffers, see [`StreamEncoder`](super::stream::StreamEncoder)).
 pub(crate) struct FrameCompressor {
     pub(super) cp: CParams,
     pub(super) ms: MatchState,
@@ -419,12 +433,27 @@ pub(crate) struct FrameCompressor {
     pub(super) first_block: bool,
     /// The post-block splitter is enabled (`ZSTD_blockSplitterEnabled`).
     split: bool,
+    /// `blockSizeMax`
+    pub(super) block_size_max: usize,
+    /// `stage`
+    pub(super) stage: FrameStage,
+    /// `pledgedSrcSizePlusOne - 1`: the frame's content size, if known.
+    pledged: Option<u64>,
+    /// `consumedSrcSize` and `producedCSize` for the frame.
+    consumed: u64,
+    produced: u64,
 }
 
 impl FrameCompressor {
     pub(crate) fn new(level: i32, src_size: usize) -> Self {
         let cp = one_shot_cparams(level, src_size as u64);
-        let bsm = block_size_max(&cp, src_size as u64);
+        Self::with_params(cp, Some(src_size as u64))
+    }
+
+    /// A compressor for a frame of `pledged` bytes (`None`: unknown) with
+    /// the resolved parameters `cp`.
+    pub(crate) fn with_params(cp: CParams, pledged: Option<u64>) -> Self {
+        let bsm = block_size_max(&cp, pledged.unwrap_or(CONTENTSIZE_UNKNOWN));
         FrameCompressor {
             cp,
             ms: MatchState::new(cp),
@@ -435,6 +464,11 @@ impl FrameCompressor {
             fp: Box::new(FpStats::new()),
             first_block: true,
             split: block_splitter_enabled(&cp),
+            block_size_max: bsm,
+            stage: FrameStage::Init,
+            pledged,
+            consumed: 0,
+            produced: 0,
         }
     }
 
@@ -443,7 +477,13 @@ impl FrameCompressor {
     /// and `ZSTD_reset_compressedBlockState`).
     pub(crate) fn reset(&mut self, level: i32, src_size: usize) {
         let cp = one_shot_cparams(level, src_size as u64);
-        let bsm = block_size_max(&cp, src_size as u64);
+        self.reset_with_params(cp, Some(src_size as u64));
+    }
+
+    /// As [`reset`](Self::reset), with resolved parameters and a frame of
+    /// `pledged` bytes (`None`: unknown).
+    pub(crate) fn reset_with_params(&mut self, cp: CParams, pledged: Option<u64>) {
+        let bsm = block_size_max(&cp, pledged.unwrap_or(CONTENTSIZE_UNKNOWN));
         self.cp = cp;
         self.ms.reset(cp);
         if self.ss.max_nb_lit < bsm || self.ss.max_nb_seq < max_nb_seq(bsm, cp.min_match) {
@@ -461,6 +501,11 @@ impl FrameCompressor {
         self.rep = REP_START_VALUE;
         self.first_block = true;
         self.split = block_splitter_enabled(&cp);
+        self.block_size_max = bsm;
+        self.stage = FrameStage::Init;
+        self.pledged = pledged;
+        self.consumed = 0;
+        self.produced = 0;
     }
 
     /// libzstd's `ZSTD_compressBlock_internal`: 0 = store raw, 1 = RLE
@@ -503,78 +548,162 @@ impl FrameCompressor {
         Ok(c_size)
     }
 
-    /// Compresses `src` as one frame into `dst`; returns the frame size.
-    pub(crate) fn compress(&mut self, dst: &mut [u8], src: &[u8]) -> Result<usize> {
-        let n = src.len();
-        let mut op = write_frame_header(dst, &self.cp, n as u64)?;
-        if n == 0 {
-            // ZSTD_writeEpilogue: one empty last raw block.
-            if dst.len() - op < 3 {
-                return Err(Error::OutputTooSmall);
-            }
-            dst[op..op + 3].copy_from_slice(&1u32.to_le_bytes()[..3]);
-            return Ok(op + 3);
-        }
-        self.ms.update_window(0, n);
-        let bsm = block_size_max(&self.cp, n as u64);
-        let mut savings: i64 = 0;
-        let mut pos = 0usize;
-        while pos < n {
-            let bs =
-                optimal_block_size(&src[pos..], bsm, 0, self.cp.strategy, savings, &mut self.fp);
-            let last = u32::from(bs == n - pos);
+    /// libzstd's `ZSTD_compress_frameChunk`: compresses `buf[start..end]`
+    /// (already in the window) as blocks of at most `blockSizeMax` bytes,
+    /// the pre-splitter deciding their sizes; with `last_chunk`, the last
+    /// one ends the frame. Returns the size written.
+    fn frame_chunk(
+        &mut self,
+        dst: &mut [u8],
+        buf: &[u8],
+        start: usize,
+        end: usize,
+        last_chunk: bool,
+    ) -> Result<usize> {
+        let bsm = self.block_size_max;
+        let mut savings = self.consumed as i64 - self.produced as i64;
+        let mut op = 0usize;
+        let mut pos = start;
+        while pos < end {
+            let bs = optimal_block_size(
+                &buf[pos..end],
+                bsm,
+                0,
+                self.cp.strategy,
+                savings,
+                &mut self.fp,
+            );
+            let last = u32::from(last_chunk && bs == end - pos);
             if dst.len() - op < BLOCK_HEADER_SIZE + MIN_CBLOCK_SIZE + 1 {
                 return Err(Error::OutputTooSmall);
             }
             self.ms.prepare_block(pos, bs);
-            if self.split {
-                let c_size = self.compress_block_split(&mut dst[op..], src, pos, pos + bs, last)?;
-                savings += bs as i64 - c_size as i64;
-                pos += bs;
-                op += c_size;
-                self.first_block = false;
-                continue;
-            }
-            let c = self.compress_block(&mut dst[op + BLOCK_HEADER_SIZE..], src, pos, pos + bs)?;
-            let c_size = if c == 0 {
-                // ZSTD_noCompressBlock
-                if bs + BLOCK_HEADER_SIZE > dst.len() - op {
-                    return Err(Error::OutputTooSmall);
-                }
-                let h = last + ((bs as u32) << 3);
-                dst[op..op + 3].copy_from_slice(&h.to_le_bytes()[..3]);
-                dst[op + 3..op + 3 + bs].copy_from_slice(&src[pos..pos + bs]);
-                bs + BLOCK_HEADER_SIZE
+            let c_size = if self.split {
+                self.compress_block_split(&mut dst[op..], buf, pos, pos + bs, last)?
             } else {
-                let h = if c == 1 {
-                    last + (1 << 1) + ((bs as u32) << 3)
+                let c =
+                    self.compress_block(&mut dst[op + BLOCK_HEADER_SIZE..], buf, pos, pos + bs)?;
+                if c == 0 {
+                    // ZSTD_noCompressBlock
+                    if bs + BLOCK_HEADER_SIZE > dst.len() - op {
+                        return Err(Error::OutputTooSmall);
+                    }
+                    let h = last + ((bs as u32) << 3);
+                    dst[op..op + 3].copy_from_slice(&h.to_le_bytes()[..3]);
+                    dst[op + 3..op + 3 + bs].copy_from_slice(&buf[pos..pos + bs]);
+                    bs + BLOCK_HEADER_SIZE
                 } else {
-                    last + (2 << 1) + ((c as u32) << 3)
-                };
-                dst[op..op + 3].copy_from_slice(&h.to_le_bytes()[..3]);
-                c + BLOCK_HEADER_SIZE
+                    let h = if c == 1 {
+                        last + (1 << 1) + ((bs as u32) << 3)
+                    } else {
+                        last + (2 << 1) + ((c as u32) << 3)
+                    };
+                    dst[op..op + 3].copy_from_slice(&h.to_le_bytes()[..3]);
+                    c + BLOCK_HEADER_SIZE
+                }
             };
             savings += bs as i64 - c_size as i64;
             pos += bs;
             op += c_size;
             self.first_block = false;
         }
+        if last_chunk && op > 0 {
+            self.stage = FrameStage::Ending;
+        }
         Ok(op)
+    }
+
+    /// libzstd's `ZSTD_compressContinue_internal` (frame mode): writes the
+    /// frame header on the first call, appends `buf[start..end]` to the
+    /// window and compresses it. Returns the size written.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutputTooSmall`], or [`Error::SrcSizeWrong`] when more than
+    /// the pledged size was given.
+    pub(super) fn compress_continue(
+        &mut self,
+        dst: &mut [u8],
+        buf: &[u8],
+        start: usize,
+        end: usize,
+        last_chunk: bool,
+    ) -> Result<usize> {
+        let mut fh_size = 0;
+        if self.stage == FrameStage::Init {
+            fh_size = write_frame_header(dst, &self.cp, self.pledged)?;
+            self.stage = FrameStage::Ongoing;
+        }
+        if start == end {
+            return Ok(fh_size);
+        }
+        self.ms.update_window(start, end - start);
+        let c_size = self.frame_chunk(&mut dst[fh_size..], buf, start, end, last_chunk)?;
+        self.consumed += (end - start) as u64;
+        self.produced += (c_size + fh_size) as u64;
+        if self.pledged.is_some_and(|p| self.consumed > p) {
+            return Err(Error::SrcSizeWrong);
+        }
+        Ok(c_size + fh_size)
+    }
+
+    /// libzstd's `ZSTD_compressEnd_public`: [`compress_continue`](Self::compress_continue)
+    /// with the last chunk, then `ZSTD_writeEpilogue` (an empty last block
+    /// if the last block isn't written yet).
+    ///
+    /// # Errors
+    ///
+    /// As `compress_continue`, and [`Error::SrcSizeWrong`] when the frame
+    /// holds less than the pledged size.
+    pub(super) fn compress_end(
+        &mut self,
+        dst: &mut [u8],
+        buf: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Result<usize> {
+        let mut op = self.compress_continue(dst, buf, start, end, true)?;
+        debug_assert!(self.stage != FrameStage::Init);
+        if self.stage != FrameStage::Ending {
+            // one last empty raw block, marked last
+            if dst.len() - op < BLOCK_HEADER_SIZE {
+                return Err(Error::OutputTooSmall);
+            }
+            dst[op..op + 3].copy_from_slice(&1u32.to_le_bytes()[..3]);
+            op += BLOCK_HEADER_SIZE;
+        }
+        self.stage = FrameStage::Init;
+        if self.pledged.is_some_and(|p| self.consumed != p) {
+            return Err(Error::SrcSizeWrong);
+        }
+        Ok(op)
+    }
+
+    /// Compresses `src` as one frame into `dst`; returns the frame size.
+    pub(crate) fn compress(&mut self, dst: &mut [u8], src: &[u8]) -> Result<usize> {
+        debug_assert_eq!(self.pledged, Some(src.len() as u64));
+        self.compress_end(dst, src, 0, src.len())
     }
 }
 
-/// libzstd's `ZSTD_writeFrameHeader` (content size known, no checksum, no
-/// dictionary).
-fn write_frame_header(dst: &mut [u8], cp: &CParams, src_size: u64) -> Result<usize> {
+/// libzstd's `ZSTD_writeFrameHeader` (no checksum, no dictionary): with the
+/// content size when `pledged` holds it.
+fn write_frame_header(dst: &mut [u8], cp: &CParams, pledged: Option<u64>) -> Result<usize> {
     if dst.len() < 18 {
         return Err(Error::OutputTooSmall);
     }
     let window_size = 1u64 << cp.window_log;
-    let single = window_size >= src_size;
+    let src_size = pledged.unwrap_or(0);
+    let content_size_flag = pledged.is_some();
+    let single = content_size_flag && window_size >= src_size;
     let wlog_byte = ((cp.window_log - 10) << 3) as u8;
-    let fcs_code = u8::from(src_size >= 256)
-        + u8::from(src_size >= 65536 + 256)
-        + u8::from(src_size >= 0xFFFF_FFFF);
+    let fcs_code = if content_size_flag {
+        u8::from(src_size >= 256)
+            + u8::from(src_size >= 65536 + 256)
+            + u8::from(src_size >= 0xFFFF_FFFF)
+    } else {
+        0
+    };
     dst[..4].copy_from_slice(&crate::frame::MAGIC.to_le_bytes());
     dst[4] = (u8::from(single) << 5) + (fcs_code << 6);
     let mut pos = 5;

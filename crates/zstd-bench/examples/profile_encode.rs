@@ -1,6 +1,6 @@
 //! Compress one dataset in a loop (MiB/s of input), zstd-native vs libzstd.
 //!
-//! `cargo run --profile bench -p zstd-bench --example profile_encode -- <dataset> <level> <native|c> <seconds>`
+//! `cargo run --profile bench -p zstd-bench --example profile_encode -- <dataset> <level> <native|c|native-stream|c-stream> <seconds> [chunk]`
 
 use std::time::Instant;
 
@@ -35,6 +35,23 @@ fn main() {
         for p in pieces {
             size += match lib {
                 "native" => zstd_native::compress_to_slice(p, &mut out, level).unwrap(),
+                // Streaming: 128 KB writes into an `io::Write` encoder.
+                "native-stream" => {
+                    use std::io::Write;
+                    let mut e = zstd_native::Encoder::new(Vec::new(), level);
+                    for w in p.chunks(128 << 10) {
+                        e.write_all(w).unwrap();
+                    }
+                    e.finish().unwrap().len()
+                }
+                "c-stream" => {
+                    use std::io::Write;
+                    let mut e = zstd::stream::write::Encoder::new(Vec::new(), level).unwrap();
+                    for w in p.chunks(128 << 10) {
+                        e.write_all(w).unwrap();
+                    }
+                    e.finish().unwrap().len()
+                }
                 _ => c.compress_to_buffer(p, &mut out[..]).unwrap(),
             };
         }

@@ -1,17 +1,17 @@
 //! The lazy strategies (greedy, lazy, lazy2 and btlazy2: levels 4/5 to
 //! 12/15 depending on the input size): a port of libzstd 1.5.7's
-//! `compress/zstd_lazy.c`, no-dictionary paths. The parser
-//! (`ZSTD_compressBlock_lazy_generic`) is shared; the match finders are
-//! the hash chain (`ZSTD_HcFindBestMatch`, here), the binary tree of
-//! btlazy2 (`ZSTD_DUBT_findBestMatch`, here) and the row-based finder
-//! (`ZSTD_RowFindBestMatch`, in [`row`](super::row)), which libzstd
-//! picks for greedy to lazy2 when `windowLog > 14`.
+//! `compress/zstd_lazy.c`, noDict and extDict paths. The parser
+//! (`ZSTD_compressBlock_lazy_generic`, or `_extDict_generic`) is shared;
+//! the match finders are the hash chain (`ZSTD_HcFindBestMatch`, here), the
+//! binary tree of btlazy2 (`ZSTD_DUBT_findBestMatch`, here) and the
+//! row-based finder (`ZSTD_RowFindBestMatch`, in [`row`](super::row)),
+//! which libzstd picks for greedy to lazy2 when `windowLog > 14`.
 //!
 //! Like libzstd's templates, the parser is monomorphized on the search
 //! method, the parse depth (0 greedy, 1 lazy, 2 lazy2 and btlazy2), `mls`
 //! (`minMatch` bounded to 4..=6) and, for the row finder, `rowLog`
-//! (`searchLog` bounded to 4..=6); the search functions are not inlined
-//! (`FORCE_NOINLINE` in libzstd).
+//! (`searchLog` bounded to 4..=6), and the search functions on `EXT`
+//! (extDict or not); they are not inlined (`FORCE_NOINLINE` in libzstd).
 //!
 //! It shares the match state, window and block loop with `fast` (see that
 //! module's docs). Table use: `hashTable` holds `minMatch`-byte hashes
@@ -25,15 +25,19 @@
 //! the tables is that of a position already passed by the parser (the
 //! parser's search positions only increase, and a stored match always ends
 //! after the last searched position), so a candidate index that passes the
-//! `>= lowLimit` check (`>= dictLimit`: there is no extDict, asserted) is a
-//! position in the window before the current one. All forward reads stop
+//! `>= lowLimit` check is a position in the window before the current one:
+//! in the prefix at or above `dictLimit`, in the extDict below it (only
+//! with an extDict, whose search functions take `EXT` and read it through
+//! `dictBase`; both segments are checked to be in the buffer at entry). All forward reads stop
 //! at the block end (`iend`); hashing reads 8 bytes at positions at most
 //! `iend - 8` (`ilimit`). Debug builds check every read with `chk`.
 
-use super::fast::{K_SEARCH_STRENGTH, MatchState, hash_mls};
+use super::fast::{ExtWindow, K_SEARCH_STRENGTH, MatchState, hash_mls, index_overlap_check};
 use super::params::Strategy;
 use super::row::{self, ROW_HASH_CACHE_SIZE};
-use super::seq_store::{REP_NUM, REPCODE1_TO_OFFBASE, SeqStore, count, highbit32, read32};
+use super::seq_store::{
+    REP_NUM, REPCODE1_TO_OFFBASE, SeqStore, count, count_2segments, highbit32, read32,
+};
 
 /// `ZSTD_DUBT_UNSORTED_MARK`: marks a binary-tree node not sorted yet.
 /// Real indices start at `ZSTD_WINDOW_START_INDEX` (2).
@@ -70,10 +74,19 @@ pub(super) struct Searcher {
     pub(super) lazy_skipping: bool,
     pub(super) hash_cache: [u32; ROW_HASH_CACHE_SIZE],
     pub(super) hash_salt_entropy: u32,
-    /// The window start and the block end: every read is in between
-    /// (debug-checked by [`Searcher::chk`]).
+    /// The window start (the prefix start with an extDict) and the block
+    /// end: every read is in between, or in the extDict (debug-checked by
+    /// [`Searcher::chk`]).
     pub(super) lowest: *const u8,
     pub(super) iend: *const u8,
+    /// The extDict (`window.dictBase`, `window.dictLimit`), its readable
+    /// part `dict_lowest..dict_end` (empty without an extDict) and the
+    /// prefix start (`base + dictLimit`).
+    pub(super) dict_base: *const u8,
+    pub(super) dict_limit: u32,
+    pub(super) dict_lowest: *const u8,
+    pub(super) dict_end: *const u8,
+    pub(super) prefix_start: *const u8,
 }
 
 impl Searcher {
@@ -92,10 +105,87 @@ impl Searcher {
     /// Debug check that `n` bytes at `p` are inside the readable window.
     #[inline(always)]
     pub(super) fn chk(&self, p: *const u8, n: usize) {
+        let (p, e) = (p as usize, (p as usize).wrapping_add(n));
         debug_assert!(
-            (p as usize) >= (self.lowest as usize) && (p as usize) + n <= (self.iend as usize),
+            (p >= self.lowest as usize && e <= self.iend as usize)
+                || (p >= self.dict_lowest as usize && e <= self.dict_end as usize),
             "read out of the window"
         );
+    }
+
+    /// The binary trees' match count (`ZSTD_insertDUBT1`,
+    /// `ZSTD_DUBT_findBestMatch`): extends the `match_length` bytes known
+    /// common between `ip` and the candidate `match_index` up to `iend`;
+    /// returns the new length and a pointer to the candidate's byte after
+    /// it (`match[matchLength]`, the next byte to compare). With `EXT`, a
+    /// candidate in the extDict is counted on into the prefix
+    /// (`ZSTD_count_2segments`), unless `in_dict` (`ip` itself is in the
+    /// extDict and `iend` its end).
+    ///
+    /// # Safety
+    /// `ip..iend` is in the window, the candidate (from `match_length`) too.
+    #[allow(unsafe_code)]
+    #[inline(always)]
+    pub(super) unsafe fn tree_count<const EXT: bool>(
+        &self,
+        ip: *const u8,
+        in_dict: bool,
+        match_index: u32,
+        match_length: usize,
+        iend: *const u8,
+    ) -> (usize, *const u8) {
+        // SAFETY: per the caller.
+        unsafe {
+            if !EXT {
+                let m = self.pos(match_index);
+                self.chk(m, 0);
+                let ml = match_length + count(ip.add(match_length), m.add(match_length), iend);
+                return (ml, m.add(ml));
+            }
+            let in_prefix = match_index as usize + match_length >= self.dict_limit as usize;
+            if in_prefix || in_dict {
+                // both in the current segment, or both in the extDict
+                let mp = if in_prefix { self.base } else { self.dict_base }
+                    .wrapping_add(match_index as usize + match_length);
+                self.chk(mp, 0);
+                let n = count(ip.add(match_length), mp, iend);
+                (match_length + n, mp.add(n))
+            } else {
+                let dm = self.dict_base.wrapping_add(match_index as usize);
+                let ml =
+                    match_length + self.count_ext(ip.add(match_length), dm.add(match_length), iend);
+                // prepare for the next read of match[matchLength]
+                let m_ml = if match_index as usize + ml >= self.dict_limit as usize {
+                    self.base.wrapping_add(match_index as usize + ml)
+                } else {
+                    dm.add(ml)
+                };
+                (ml, m_ml)
+            }
+        }
+    }
+
+    /// The position of index `i` with an extDict: in it below `dictLimit`.
+    #[inline(always)]
+    pub(super) fn ext_pos(&self, i: u32) -> *const u8 {
+        if i < self.dict_limit {
+            self.dict_base.wrapping_add(i as usize)
+        } else {
+            self.base.wrapping_add(i as usize)
+        }
+    }
+
+    /// `ZSTD_count_2segments(ip, m, ilimit, dictEnd, prefixStart)`: the
+    /// length of a match from the extDict position `m`.
+    ///
+    /// # Safety
+    /// `ip..ilimit` is in the prefix, `m..dict_end` in the extDict.
+    #[allow(unsafe_code)]
+    #[inline(always)]
+    pub(super) unsafe fn count_ext(&self, ip: *const u8, m: *const u8, ilimit: *const u8) -> usize {
+        self.chk(m, 0);
+        // SAFETY: per the caller.
+        unsafe { count_2segments(ip, m, ilimit, self.dict_end, self.prefix_start) }
     }
 
     /// `ZSTD_getLowestMatchIndex()`.
@@ -154,15 +244,16 @@ unsafe fn insert_and_find_first_index<const MLS: u32>(s: &mut Searcher, ip: *con
     }
 }
 
-/// `ZSTD_HcFindBestMatch()` (noDict): the longest match at `ip` along its
-/// hash chain, at most `1 << searchLog` candidates. Returns its length
-/// (`< 4` if none) and stores its offBase in `offset_ptr`.
+/// `ZSTD_HcFindBestMatch()` (noDict, or extDict with `EXT`): the longest
+/// match at `ip` along its hash chain, at most `1 << searchLog`
+/// candidates. Returns its length (`< 4` if none) and stores its offBase
+/// in `offset_ptr`.
 ///
 /// # Safety
 /// `ip + 8 <= ilimit`, `ilimit` the block end (see the module docs).
 #[allow(unsafe_code)]
 #[inline(never)]
-unsafe fn hc_find_best_match<const MLS: u32>(
+unsafe fn hc_find_best_match<const MLS: u32, const EXT: bool>(
     s: &mut Searcher,
     ip: *const u8,
     ilimit: *const u8,
@@ -184,12 +275,21 @@ unsafe fn hc_find_best_match<const MLS: u32>(
         let mut match_index = insert_and_find_first_index::<MLS>(s, ip);
         while match_index >= low_limit && nb_attempts > 0 {
             let mut current_ml = 0;
-            let m = s.pos(match_index);
             debug_assert!(match_index < curr);
-            s.chk(m.wrapping_add(ml - 3), 4);
-            // read 4B starting from (match + ml + 1 - sizeof(U32))
-            if read32(m.add(ml - 3)) == read32(ip.add(ml - 3)) {
-                current_ml = count(ip, m, ilimit);
+            if !EXT || match_index >= s.dict_limit {
+                let m = s.pos(match_index);
+                s.chk(m.wrapping_add(ml - 3), 4);
+                // read 4B starting from (match + ml + 1 - sizeof(U32))
+                if read32(m.add(ml - 3)) == read32(ip.add(ml - 3)) {
+                    current_ml = count(ip, m, ilimit);
+                }
+            } else {
+                let m = s.dict_base.wrapping_add(match_index as usize);
+                s.chk(m, 4);
+                // assumption: matchIndex <= dictLimit - 4 (by table construction)
+                if read32(m) == read32(ip) {
+                    current_ml = s.count_ext(ip.add(4), m.add(4), ilimit) + 4;
+                }
             }
             // save best solution
             if current_ml > ml {
@@ -248,7 +348,7 @@ unsafe fn update_dubt<const MLS: u32>(s: &mut Searcher, ip: *const u8) {
 /// `curr` is a position in the window before `input_end` (the block end).
 #[allow(unsafe_code)]
 #[inline(always)]
-unsafe fn insert_dubt1(
+unsafe fn insert_dubt1<const EXT: bool>(
     s: &Searcher,
     curr: u32,
     input_end: *const u8,
@@ -259,8 +359,13 @@ unsafe fn insert_dubt1(
     let bt_mask = (1u32 << (s.chain_log - 1)) - 1;
     let mut common_length_smaller = 0usize;
     let mut common_length_larger = 0usize;
-    let ip = s.pos(curr);
-    let iend = input_end;
+    // with an extDict, `curr` may be in it: then compare within it
+    let ip = if EXT { s.ext_pos(curr) } else { s.pos(curr) };
+    let iend = if !EXT || curr >= s.dict_limit {
+        input_end
+    } else {
+        s.dict_end
+    };
     let mut dummy32 = 0u32;
     let dummy: *mut u32 = &mut dummy32;
     let window_valid = s.low_limit;
@@ -289,9 +394,14 @@ unsafe fn insert_dubt1(
             // guaranteed minimum nb of common bytes
             let mut match_length = common_length_smaller.min(common_length_larger);
             debug_assert!(match_index < curr);
-            let m = s.pos(match_index);
-            s.chk(m, 0);
-            match_length += count(ip.add(match_length), m.add(match_length), iend);
+            let m_ml;
+            (match_length, m_ml) = s.tree_count::<EXT>(
+                ip,
+                EXT && curr < s.dict_limit,
+                match_index,
+                match_length,
+                iend,
+            );
 
             if ip.add(match_length) == iend {
                 // equal: no way to know if inf or sup; drop, to guarantee
@@ -299,7 +409,7 @@ unsafe fn insert_dubt1(
                 break;
             }
 
-            if *m.add(match_length) < *ip.add(match_length) {
+            if *m_ml < *ip.add(match_length) {
                 // match is smaller than current
                 *smaller_ptr = match_index;
                 common_length_smaller = match_length;
@@ -334,7 +444,7 @@ unsafe fn insert_dubt1(
 /// `ip + 8 <= iend`, `iend` the block end.
 #[allow(unsafe_code)]
 #[inline(always)]
-unsafe fn dubt_find_best_match<const MLS: u32>(
+unsafe fn dubt_find_best_match<const MLS: u32, const EXT: bool>(
     s: &mut Searcher,
     ip: *const u8,
     iend: *const u8,
@@ -384,7 +494,7 @@ unsafe fn dubt_find_best_match<const MLS: u32>(
         match_index = previous_candidate;
         while match_index != 0 {
             let next_candidate_idx = *bt.add(2 * (match_index & bt_mask) as usize + 1);
-            insert_dubt1(s, match_index, iend, nb_candidates, unsort_limit);
+            insert_dubt1::<EXT>(s, match_index, iend, nb_candidates, unsort_limit);
             match_index = next_candidate_idx;
             nb_candidates += 1;
         }
@@ -407,9 +517,8 @@ unsafe fn dubt_find_best_match<const MLS: u32>(
             // guaranteed minimum nb of common bytes
             let mut match_length = common_length_smaller.min(common_length_larger);
             debug_assert!(match_index < curr);
-            let m = s.pos(match_index);
-            s.chk(m, 0);
-            match_length += count(ip.add(match_length), m.add(match_length), iend);
+            let m_ml;
+            (match_length, m_ml) = s.tree_count::<EXT>(ip, false, match_index, match_length, iend);
 
             if match_length > best_length {
                 if match_length > (match_end_idx - match_index) as usize {
@@ -428,7 +537,7 @@ unsafe fn dubt_find_best_match<const MLS: u32>(
                 }
             }
 
-            if *m.add(match_length) < *ip.add(match_length) {
+            if *m_ml < *ip.add(match_length) {
                 // match is smaller than current
                 *smaller_ptr = match_index;
                 common_length_smaller = match_length;
@@ -466,7 +575,7 @@ unsafe fn dubt_find_best_match<const MLS: u32>(
 /// `ip + 8 <= iend`, `iend` the block end.
 #[allow(unsafe_code)]
 #[inline(never)]
-unsafe fn bt_find_best_match<const MLS: u32>(
+unsafe fn bt_find_best_match<const MLS: u32, const EXT: bool>(
     s: &mut Searcher,
     ip: *const u8,
     iend: *const u8,
@@ -478,7 +587,7 @@ unsafe fn bt_find_best_match<const MLS: u32>(
     // SAFETY: per the caller.
     unsafe {
         update_dubt::<MLS>(s, ip);
-        dubt_find_best_match::<MLS>(s, ip, iend, off_base_ptr)
+        dubt_find_best_match::<MLS, EXT>(s, ip, iend, off_base_ptr)
     }
 }
 
@@ -491,7 +600,7 @@ unsafe fn bt_find_best_match<const MLS: u32>(
 /// `ip + 8 <= iend` (`+ 16` for the row finder), `iend` the block end.
 #[allow(unsafe_code)]
 #[inline(always)]
-unsafe fn search_max<const MLS: u32, const METHOD: u8, const ROW_LOG: u32>(
+unsafe fn search_max<const MLS: u32, const METHOD: u8, const ROW_LOG: u32, const EXT: bool>(
     s: &mut Searcher,
     ip: *const u8,
     iend: *const u8,
@@ -500,9 +609,9 @@ unsafe fn search_max<const MLS: u32, const METHOD: u8, const ROW_LOG: u32>(
     // SAFETY: per the caller.
     unsafe {
         match METHOD {
-            SEARCH_HASH_CHAIN => hc_find_best_match::<MLS>(s, ip, iend, offset_ptr),
-            SEARCH_BINARY_TREE => bt_find_best_match::<MLS>(s, ip, iend, offset_ptr),
-            _ => row::row_find_best_match::<MLS, ROW_LOG>(s, ip, iend, offset_ptr),
+            SEARCH_HASH_CHAIN => hc_find_best_match::<MLS, EXT>(s, ip, iend, offset_ptr),
+            SEARCH_BINARY_TREE => bt_find_best_match::<MLS, EXT>(s, ip, iend, offset_ptr),
+            _ => row::row_find_best_match::<MLS, ROW_LOG, EXT>(s, ip, iend, offset_ptr),
         }
     }
 }
@@ -635,6 +744,11 @@ fn lazy_generic<const MLS: u32, const METHOD: u8, const ROW_LOG: u32, const DEPT
         hash_salt_entropy: ms.hash_salt_entropy,
         lowest,
         iend,
+        dict_base: base,
+        dict_limit: prefix_lowest_index,
+        dict_lowest: lowest,
+        dict_end: lowest,
+        prefix_start: prefix_lowest,
     };
 
     let mut ip = istart;
@@ -692,8 +806,12 @@ fn lazy_generic<const MLS: u32, const METHOD: u8, const ROW_LOG: u32, const DEPT
                 // first search (depth 0)
                 {
                     let mut offbase_found = OFFBASE_UNSET;
-                    let ml2 =
-                        search_max::<MLS, METHOD, ROW_LOG>(&mut s, ip, iend, &mut offbase_found);
+                    let ml2 = search_max::<MLS, METHOD, ROW_LOG, false>(
+                        &mut s,
+                        ip,
+                        iend,
+                        &mut offbase_found,
+                    );
                     if ml2 > match_length {
                         match_length = ml2;
                         start = ip;
@@ -733,7 +851,7 @@ fn lazy_generic<const MLS: u32, const METHOD: u8, const ROW_LOG: u32, const DEPT
                         }
                         {
                             let mut ofb_candidate = OFFBASE_UNSET;
-                            let ml2 = search_max::<MLS, METHOD, ROW_LOG>(
+                            let ml2 = search_max::<MLS, METHOD, ROW_LOG, false>(
                                 &mut s,
                                 ip,
                                 iend,
@@ -771,7 +889,7 @@ fn lazy_generic<const MLS: u32, const METHOD: u8, const ROW_LOG: u32, const DEPT
                             }
                             {
                                 let mut ofb_candidate = OFFBASE_UNSET;
-                                let ml2 = search_max::<MLS, METHOD, ROW_LOG>(
+                                let ml2 = search_max::<MLS, METHOD, ROW_LOG, false>(
                                     &mut s,
                                     ip,
                                     iend,
@@ -887,9 +1005,400 @@ fn lazy_generic<const MLS: u32, const METHOD: u8, const ROW_LOG: u32, const DEPT
     iend as usize - anchor as usize
 }
 
+/// `ZSTD_compressBlock_<strategy>_extDict[_row]()`: as
+/// [`compress_block_lazy`], for a window with an extDict segment (see
+/// [`compress_block_fast_ext_dict`](super::fast::compress_block_fast_ext_dict)).
+#[inline(never)]
+pub(crate) fn compress_block_lazy_ext_dict(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
+    macro_rules! go {
+        ($method:expr, $depth:literal) => {
+            match (
+                ms.cparams.min_match.clamp(4, 6),
+                ms.cparams.search_log.clamp(4, 6),
+            ) {
+                (4, 4) => ext_generic::<4, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
+                (4, 5) => ext_generic::<4, { $method }, 5, $depth>(ms, ss, rep, buf, start, end),
+                (4, _) => ext_generic::<4, { $method }, 6, $depth>(ms, ss, rep, buf, start, end),
+                (5, 4) => ext_generic::<5, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
+                (5, 5) => ext_generic::<5, { $method }, 5, $depth>(ms, ss, rep, buf, start, end),
+                (5, _) => ext_generic::<5, { $method }, 6, $depth>(ms, ss, rep, buf, start, end),
+                (_, 4) => ext_generic::<6, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
+                (_, 5) => ext_generic::<6, { $method }, 5, $depth>(ms, ss, rep, buf, start, end),
+                (_, _) => ext_generic::<6, { $method }, 6, $depth>(ms, ss, rep, buf, start, end),
+            }
+        };
+    }
+    macro_rules! go_mls {
+        ($method:expr, $depth:literal) => {
+            match ms.cparams.min_match.clamp(4, 6) {
+                4 => ext_generic::<4, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
+                5 => ext_generic::<5, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
+                _ => ext_generic::<6, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
+            }
+        };
+    }
+    let row = ms.use_row_match_finder;
+    match ms.cparams.strategy {
+        Strategy::Greedy if row => go!(SEARCH_ROW_HASH, 0),
+        Strategy::Greedy => go_mls!(SEARCH_HASH_CHAIN, 0),
+        Strategy::Lazy if row => go!(SEARCH_ROW_HASH, 1),
+        Strategy::Lazy => go_mls!(SEARCH_HASH_CHAIN, 1),
+        Strategy::Lazy2 if row => go!(SEARCH_ROW_HASH, 2),
+        Strategy::Lazy2 => go_mls!(SEARCH_HASH_CHAIN, 2),
+        Strategy::BtLazy2 => go_mls!(SEARCH_BINARY_TREE, 2),
+        s => unreachable!("not a lazy strategy: {s:?}"),
+    }
+}
+
+/// `ZSTD_compressBlock_lazy_extDict_generic()`.
+///
+/// Memory safety: as the noDict parser (see the module docs), with
+/// candidates and repcodes below `dictLimit` read from the extDict
+/// (`dictBase + index`, checked to be in the buffer at entry): the window
+/// check (`>= lowLimit`, or `offset <= curr - windowLow` for repcodes)
+/// keeps them at or above `lowLimit`, `ZSTD_index_overlap_check` keeps
+/// 4-byte repcode reads inside one segment, and matches are counted up to
+/// the extDict end, then on in the prefix (`ZSTD_count_2segments`).
+#[allow(unsafe_code)]
+#[inline(always)]
+fn ext_generic<const MLS: u32, const METHOD: u8, const ROW_LOG: u32, const DEPTH: u32>(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
+    let cparams = ms.cparams;
+    // These checks make the raw-pointer accesses below sound.
+    assert!(start <= end && end <= buf.len());
+    assert!(cparams.hash_log <= 32 && ms.hash_table.len() == 1usize << cparams.hash_log);
+    match METHOD {
+        SEARCH_ROW_HASH => {
+            assert!(ms.use_row_match_finder);
+            assert!(ms.tag_table.len() == ms.hash_table.len());
+            assert!(ms.row_hash_log + ROW_LOG == cparams.hash_log);
+            assert!(ms.row_hash_log + row::ROW_HASH_TAG_BITS <= 32);
+            assert!(cparams.search_log.clamp(4, 6) == ROW_LOG);
+        }
+        SEARCH_BINARY_TREE => {
+            assert!(cparams.chain_log >= 1 && cparams.chain_log <= 32);
+            assert!(ms.chain_table.len() == 1usize << cparams.chain_log);
+        }
+        _ => {
+            assert!(cparams.chain_log <= 32);
+            assert!(ms.chain_table.len() == 1usize << cparams.chain_log);
+        }
+    }
+    assert!(cparams.search_log < 32);
+    let dict_limit = ms.window.dict_limit;
+    let low_limit = ms.window.low_limit;
+    let w = ExtWindow::new(&ms.window, buf, start, end, low_limit, dict_limit);
+    assert!(ms.next_to_update >= dict_limit);
+
+    let bp = buf.as_ptr();
+    let base = w.base;
+    let dict_base = w.dict_base;
+    let istart = w.istart;
+    let iend = w.iend;
+    let ilimit = if METHOD == SEARCH_ROW_HASH {
+        iend.wrapping_sub(8 + ROW_HASH_CACHE_SIZE)
+    } else {
+        iend.wrapping_sub(8)
+    };
+    let prefix_start = w.prefix_start;
+    let dict_end = w.dict_end;
+    let dict_start = w.dict_start;
+    let window_log = cparams.window_log;
+
+    let mut s = Searcher {
+        base,
+        hash_table: ms.hash_table.as_mut_ptr(),
+        chain_table: ms.chain_table.as_mut_ptr(),
+        tag_table: ms.tag_table.as_mut_ptr(),
+        hash_log: cparams.hash_log,
+        chain_log: cparams.chain_log,
+        row_hash_log: ms.row_hash_log,
+        search_log: cparams.search_log,
+        window_log,
+        low_limit,
+        loaded_dict_end: ms.loaded_dict_end,
+        hash_salt: ms.hash_salt,
+        next_to_update: ms.next_to_update,
+        // Reset the lazy skipping state
+        lazy_skipping: false,
+        hash_cache: ms.hash_cache,
+        hash_salt_entropy: ms.hash_salt_entropy,
+        lowest: prefix_start,
+        iend,
+        dict_base,
+        dict_limit,
+        dict_lowest: dict_start,
+        dict_end,
+        prefix_start,
+    };
+
+    let mut ip = istart;
+    let mut anchor = istart;
+    let mut offset_1 = rep[0];
+    let mut offset_2 = rep[1];
+
+    // The repcode `offset` at index `curr` (position `ip`): its match
+    // length if it matches 4 bytes there (libzstd's repcode checks).
+    // SAFETY (for the callers): `ip + 4 <= iend`.
+    let rep_match = |s: &Searcher, ip: *const u8, curr: u32, offset: u32| -> usize {
+        let window_low = s.lowest_match_index(curr);
+        let rep_index = curr.wrapping_sub(offset);
+        let rep_match = s.ext_pos(rep_index);
+        // `offset <= curr - windowLow`: `curr > repIndex >= windowLow`
+        if index_overlap_check(dict_limit, rep_index) & (offset <= curr.wrapping_sub(window_low))
+            && {
+                s.chk(rep_match, 4);
+                // SAFETY: per the closure's contract and the checks above.
+                unsafe { read32(ip) == read32(rep_match) }
+            }
+        {
+            let rep_end = if rep_index < dict_limit {
+                dict_end
+            } else {
+                iend
+            };
+            s.chk(rep_match, 0);
+            // SAFETY: both ranges are in their segment.
+            unsafe { count_2segments(ip.add(4), rep_match.add(4), iend, rep_end, prefix_start) + 4 }
+        } else {
+            0
+        }
+    };
+
+    // init
+    ip = ip.wrapping_add((ip == prefix_start) as usize);
+
+    // SAFETY (whole block): see the function docs.
+    unsafe {
+        if METHOD == SEARCH_ROW_HASH {
+            let ntu = s.next_to_update;
+            row::fill_hash_cache::<MLS, ROW_LOG>(&mut s, ntu, ilimit);
+        }
+
+        // Match Loop
+        while ip < ilimit {
+            let mut match_length = 0usize;
+            let mut off_base = REPCODE1_TO_OFFBASE;
+            let mut start = ip.add(1);
+            let mut curr = s.idx(ip);
+
+            // check repCode
+            let mut store_now = false;
+            {
+                let ml = rep_match(&s, ip.add(1), curr + 1, offset_1);
+                if ml != 0 {
+                    // repcode detected we should take it
+                    match_length = ml;
+                    store_now = DEPTH == 0;
+                }
+            }
+
+            if !store_now {
+                // first search (depth 0)
+                {
+                    let mut ofb_candidate = OFFBASE_UNSET;
+                    let ml2 = search_max::<MLS, METHOD, ROW_LOG, true>(
+                        &mut s,
+                        ip,
+                        iend,
+                        &mut ofb_candidate,
+                    );
+                    if ml2 > match_length {
+                        match_length = ml2;
+                        start = ip;
+                        off_base = ofb_candidate;
+                    }
+                }
+
+                if match_length < 4 {
+                    let step = (ip as usize - anchor as usize) >> K_SEARCH_STRENGTH;
+                    // jump faster over incompressible sections
+                    ip = ip.add(step + 1);
+                    // Enter the lazy skipping mode once we are skipping more
+                    // than 8 bytes at a time.
+                    s.lazy_skipping = step > LAZY_SKIPPING_STEP;
+                    continue;
+                }
+
+                // let's try to find a better solution
+                if DEPTH >= 1 {
+                    while ip < ilimit {
+                        ip = ip.add(1);
+                        curr += 1;
+                        // check repCode
+                        if off_base != 0 {
+                            let rep_length = rep_match(&s, ip, curr, offset_1);
+                            let gain2 = (rep_length * 3) as i64;
+                            let gain1 = (match_length * 3) as i64 - highbit32(off_base) as i64 + 1;
+                            if rep_length >= 4 && gain2 > gain1 {
+                                match_length = rep_length;
+                                off_base = REPCODE1_TO_OFFBASE;
+                                start = ip;
+                            }
+                        }
+
+                        // search match, depth 1
+                        {
+                            let mut ofb_candidate = OFFBASE_UNSET;
+                            let ml2 = search_max::<MLS, METHOD, ROW_LOG, true>(
+                                &mut s,
+                                ip,
+                                iend,
+                                &mut ofb_candidate,
+                            );
+                            // raw approx
+                            let gain2 = (ml2 * 4) as i64 - highbit32(ofb_candidate) as i64;
+                            let gain1 = (match_length * 4) as i64 - highbit32(off_base) as i64 + 4;
+                            if ml2 >= 4 && gain2 > gain1 {
+                                match_length = ml2;
+                                off_base = ofb_candidate;
+                                start = ip;
+                                continue; // search a better one
+                            }
+                        }
+
+                        // let's find an even better one
+                        if DEPTH == 2 && ip < ilimit {
+                            ip = ip.add(1);
+                            curr += 1;
+                            // check repCode
+                            if off_base != 0 {
+                                let rep_length = rep_match(&s, ip, curr, offset_1);
+                                let gain2 = (rep_length * 4) as i64;
+                                let gain1 =
+                                    (match_length * 4) as i64 - highbit32(off_base) as i64 + 1;
+                                if rep_length >= 4 && gain2 > gain1 {
+                                    match_length = rep_length;
+                                    off_base = REPCODE1_TO_OFFBASE;
+                                    start = ip;
+                                }
+                            }
+
+                            // search match, depth 2
+                            {
+                                let mut ofb_candidate = OFFBASE_UNSET;
+                                let ml2 = search_max::<MLS, METHOD, ROW_LOG, true>(
+                                    &mut s,
+                                    ip,
+                                    iend,
+                                    &mut ofb_candidate,
+                                );
+                                // raw approx
+                                let gain2 = (ml2 * 4) as i64 - highbit32(ofb_candidate) as i64;
+                                let gain1 =
+                                    (match_length * 4) as i64 - highbit32(off_base) as i64 + 7;
+                                if ml2 >= 4 && gain2 > gain1 {
+                                    match_length = ml2;
+                                    off_base = ofb_candidate;
+                                    start = ip;
+                                    continue;
+                                }
+                            }
+                        }
+                        break; // nothing found: store previous solution
+                    }
+                }
+
+                // catch up
+                if off_base > REP_NUM {
+                    let offset = off_base - REP_NUM;
+                    let match_index = s.idx(start).wrapping_sub(offset);
+                    let mut m = s.ext_pos(match_index);
+                    let m_start = if match_index < dict_limit {
+                        dict_start
+                    } else {
+                        prefix_start
+                    };
+                    while (start > anchor) && (m > m_start) && {
+                        s.chk(m.wrapping_sub(1), 1);
+                        *start.sub(1) == *m.sub(1)
+                    } {
+                        start = start.sub(1);
+                        m = m.sub(1);
+                        match_length += 1;
+                    }
+                    offset_2 = offset_1;
+                    offset_1 = offset;
+                }
+            }
+
+            // store sequence
+            {
+                let lit_length = start as usize - anchor as usize;
+                ss.store_seq(
+                    buf,
+                    anchor as usize - bp as usize,
+                    lit_length,
+                    end,
+                    off_base,
+                    match_length,
+                );
+                ip = start.add(match_length);
+                anchor = ip;
+            }
+            if s.lazy_skipping {
+                // We've found a match, disable lazy skipping mode, and
+                // refill the hash cache.
+                if METHOD == SEARCH_ROW_HASH {
+                    let ntu = s.next_to_update;
+                    row::fill_hash_cache::<MLS, ROW_LOG>(&mut s, ntu, ilimit);
+                }
+                s.lazy_skipping = false;
+            }
+
+            // check immediate repcode
+            while ip <= ilimit {
+                let rep_current = s.idx(ip);
+                let ml = rep_match(&s, ip, rep_current, offset_2);
+                if ml == 0 {
+                    break;
+                }
+                // repcode detected we should take it
+                match_length = ml;
+                core::mem::swap(&mut offset_1, &mut offset_2); // swap offset history
+                ss.store_seq(
+                    buf,
+                    anchor as usize - bp as usize,
+                    0,
+                    end,
+                    REPCODE1_TO_OFFBASE,
+                    match_length,
+                );
+                ip = ip.add(match_length);
+                anchor = ip;
+            }
+        }
+    }
+
+    ms.next_to_update = s.next_to_update;
+    ms.lazy_skipping = s.lazy_skipping;
+    ms.hash_cache = s.hash_cache;
+    ms.hash_salt_entropy = s.hash_salt_entropy;
+
+    // Save reps for next block
+    rep[0] = offset_1;
+    rep[1] = offset_2;
+
+    // Return the last literals size
+    iend as usize - anchor as usize
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::fast::tests::{random, roundtrip, texty};
+    use super::super::fast::tests::{random, roundtrip, roundtrip_ring, texty};
     use super::super::fast::{MatchState, build_seq_store, reduce_table_btlazy2};
     use super::super::params::{CParams, Strategy, block_size_max, one_shot_cparams};
     use super::super::seq_store::{REP_START_VALUE, SeqDef, SeqStore};
@@ -1061,5 +1570,39 @@ mod tests {
         let mut t = [0, 1, 2, 5, 1000, 1001, DUBT_UNSORTED_MARK, 1 << 30];
         reduce_table_btlazy2(&mut t, 999);
         assert_eq!(t, [0, 1, 0, 0, 0, 2, 1, (1 << 30) - 999]);
+    }
+
+    /// The extDict variants (hash chain, row and binary tree), through a
+    /// wrapping ring buffer like the streaming compressor's.
+    #[test]
+    fn roundtrip_ring_variants() {
+        let mut src = texty(150_000, 7);
+        src.extend_from_slice(&random(5000, 8));
+        src.extend_from_slice(&src.clone()[..60_000]);
+        src.extend_from_slice(&texty(60_000, 17));
+        for strategy in LAZY {
+            for mls in [4, 5, 6] {
+                for search_log in [1, 5, 6] {
+                    // window logs up to 14 use the hash chain, above it the
+                    // row finder (greedy..lazy2)
+                    for (window_log, bs) in [(12, 4096), (14, 3000), (15, 1 << 13), (17, 1 << 17)] {
+                        let cp = CParams {
+                            window_log,
+                            chain_log: 16,
+                            hash_log: 16,
+                            search_log,
+                            min_match: mls,
+                            target_length: 8,
+                            strategy,
+                        };
+                        let (n, ext) = roundtrip_ring(&src, cp, bs);
+                        assert!(
+                            n > 1000 && ext > 0,
+                            "{strategy:?} mls {mls} slog {search_log} wlog {window_log}: {n} {ext}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

@@ -26,8 +26,13 @@
 //! Not ported (dictionary-only): `ZSTD_rescaleFreqs`' seeding from the
 //! previous block's entropy tables, which libzstd only does when those
 //! tables are valid (`HUF_repeat_valid`), i.e. from a dictionary; the
-//! extDict / dictMatchState match finders; LDM candidates
-//! (`ZSTD_optLdm_*`).
+//! dictMatchState match finders; LDM candidates (`ZSTD_optLdm_*`).
+//!
+//! With an extDict (a stream whose input buffer wrapped), the match finder
+//! runs with `EXT`: candidates below `dictLimit` are read from the extDict
+//! and counted across into the prefix (`ZSTD_count_2segments`); the parser
+//! is the same (libzstd's `dictMode` template parameter). btultra2 uses
+//! btultra's extDict variant, as in libzstd.
 //!
 //! # Memory safety
 //!
@@ -35,17 +40,17 @@
 //! position the parser has already passed (searches only happen at
 //! positions at or after `nextToUpdate`, which is past every inserted
 //! position), so candidates that pass the `>= windowLow` check (at or
-//! above `lowLimit` = `dictLimit`: no extDict, asserted) are positions in
-//! the window before the current one. Forward reads stop at the block end
+//! above `lowLimit`) are positions in the window before the current one,
+//! in the extDict when below `dictLimit`. Forward reads stop at the block end
 //! (`iend`); hashing reads 8 bytes at positions at most `iend - 8`.
 //! Debug builds check every read with `chk`.
 
-use super::fast::{MatchState, hash_mls};
+use super::fast::{ExtWindow, MatchState, hash_mls, index_overlap_check};
 use super::hist::hist_count_simple;
 use super::params::{BLOCKSIZE_MAX, Strategy};
 use super::seq_store::{
-    MAX_LL, MAX_ML, MAX_OFF, MINMATCH, REP_NUM, SeqStore, count, hash3_ptr, highbit32, ll_code,
-    ml_code, offset_to_offbase, read32, update_rep,
+    MAX_LL, MAX_ML, MAX_OFF, MINMATCH, REP_NUM, SeqStore, count, count_2segments, hash3_ptr,
+    highbit32, ll_code, ml_code, offset_to_offbase, read32, update_rep,
 };
 use crate::fse::{LL_BITS, ML_BITS};
 use alloc::vec;
@@ -418,10 +423,18 @@ struct Bt {
     next_to_update: u32,
     /// `MIN(targetLength, ZSTD_OPT_NUM - 1)`
     sufficient_len: u32,
-    /// The window start and the block end: every read is in between
-    /// (debug-checked by [`Bt::chk`]).
+    /// The window start (the prefix start with an extDict) and the block
+    /// end: every read is in between, or in the extDict (debug-checked by
+    /// [`Bt::chk`]).
     lowest: *const u8,
     iend: *const u8,
+    /// The extDict (`window.dictBase`), its readable part
+    /// `dict_lowest..dict_end` (empty without an extDict) and the prefix
+    /// start.
+    dict_base: *const u8,
+    dict_lowest: *const u8,
+    dict_end: *const u8,
+    prefix_start: *const u8,
 }
 
 impl Bt {
@@ -438,10 +451,72 @@ impl Bt {
     /// Debug check that `n` bytes at `p` are inside the readable window.
     #[inline(always)]
     fn chk(&self, p: *const u8, n: usize) {
+        let (p, e) = (p as usize, (p as usize).wrapping_add(n));
         debug_assert!(
-            (p as usize) >= (self.lowest as usize) && (p as usize) + n <= (self.iend as usize),
+            (p >= self.lowest as usize && e <= self.iend as usize)
+                || (p >= self.dict_lowest as usize && e <= self.dict_end as usize),
             "read out of the window"
         );
+    }
+
+    /// `ZSTD_count_2segments(ip, m, ilimit, dictEnd, prefixStart)`: the
+    /// length of a match from the extDict position `m`.
+    ///
+    /// # Safety
+    /// `ip..ilimit` is in the prefix, `m..dict_end` in the extDict.
+    #[allow(unsafe_code)]
+    #[inline(always)]
+    unsafe fn count_ext(&self, ip: *const u8, m: *const u8, ilimit: *const u8) -> usize {
+        self.chk(m, 0);
+        // SAFETY: per the caller.
+        unsafe { count_2segments(ip, m, ilimit, self.dict_end, self.prefix_start) }
+    }
+
+    /// The tree's match count (`ZSTD_insertBt1`,
+    /// `ZSTD_insertBtAndGetAllMatches`): extends the `match_length` bytes
+    /// known common between `ip` and the candidate `match_index` up to
+    /// `iend`; returns the new length and a pointer to the candidate's byte
+    /// after it (`match[matchLength]`). With `EXT`, a candidate in the
+    /// extDict is counted on into the prefix (`ZSTD_count_2segments`).
+    ///
+    /// # Safety
+    /// `ip..iend` is in the prefix, the candidate (from `match_length`) in
+    /// the window.
+    #[allow(unsafe_code)]
+    #[inline(always)]
+    unsafe fn tree_count<const EXT: bool>(
+        &self,
+        ip: *const u8,
+        match_index: u32,
+        match_length: usize,
+        iend: *const u8,
+    ) -> (usize, *const u8) {
+        // SAFETY: per the caller.
+        unsafe {
+            if !EXT {
+                let m = self.pos(match_index);
+                self.chk(m, 0);
+                let ml = match_length + count(ip.add(match_length), m.add(match_length), iend);
+                return (ml, m.add(ml));
+            }
+            if match_index as usize + match_length >= self.dict_limit as usize {
+                let mp = self.base.wrapping_add(match_index as usize + match_length);
+                self.chk(mp, 0);
+                let n = count(ip.add(match_length), mp, iend);
+                (match_length + n, mp.add(n))
+            } else {
+                let dm = self.dict_base.wrapping_add(match_index as usize);
+                let ml =
+                    match_length + self.count_ext(ip.add(match_length), dm.add(match_length), iend);
+                // prepare for the next read of match[matchLength]
+                let m_ml = if match_index as usize + ml >= self.dict_limit as usize {
+                    self.base.wrapping_add(match_index as usize + ml)
+                } else {
+                    dm.add(ml)
+                };
+                (ml, m_ml)
+            }
+        }
     }
 
     /// `ZSTD_getLowestMatchIndex()`.
@@ -514,7 +589,8 @@ unsafe fn insert_and_find_first_index_hash3(
     }
 }
 
-/// `ZSTD_insertBt1()` (noDict): adds the position `ip` to the tree.
+/// `ZSTD_insertBt1()` (noDict, or extDict with `EXT`): adds the position
+/// `ip` to the tree.
 /// Returns how many positions to move forward (more than 1 in long
 /// repetitive patterns).
 ///
@@ -522,7 +598,12 @@ unsafe fn insert_and_find_first_index_hash3(
 /// `ip + 8 <= iend`, `ip` in the window.
 #[allow(unsafe_code)]
 #[inline(always)]
-unsafe fn insert_bt1<const MLS: u32>(s: &Bt, ip: *const u8, iend: *const u8, target: u32) -> u32 {
+unsafe fn insert_bt1<const MLS: u32, const EXT: bool>(
+    s: &Bt,
+    ip: *const u8,
+    iend: *const u8,
+    target: u32,
+) -> u32 {
     let bt = s.bt;
     let bt_mask = s.bt_mask;
     let curr = s.idx(ip);
@@ -558,9 +639,8 @@ unsafe fn insert_bt1<const MLS: u32>(s: &Bt, ip: *const u8, iend: *const u8, tar
             // guaranteed minimum nb of common bytes
             let mut match_length = common_length_smaller.min(common_length_larger);
             debug_assert!(match_index < curr);
-            let m = s.pos(match_index);
-            s.chk(m, 0);
-            match_length += count(ip.add(match_length), m.add(match_length), iend);
+            let m_ml;
+            (match_length, m_ml) = s.tree_count::<EXT>(ip, match_index, match_length, iend);
 
             if match_length > best_length {
                 best_length = match_length;
@@ -575,7 +655,7 @@ unsafe fn insert_bt1<const MLS: u32>(s: &Bt, ip: *const u8, iend: *const u8, tar
                 break;
             }
 
-            if *m.add(match_length) < *ip.add(match_length) {
+            if *m_ml < *ip.add(match_length) {
                 // match is smaller than current
                 *smaller_ptr = match_index;
                 common_length_smaller = match_length;
@@ -610,19 +690,19 @@ unsafe fn insert_bt1<const MLS: u32>(s: &Bt, ip: *const u8, iend: *const u8, tar
     positions.max(match_end_idx - (curr + 8))
 }
 
-/// `ZSTD_updateTree_internal()` (noDict): inserts the positions from
-/// `nextToUpdate` up to `ip` (excluded).
+/// `ZSTD_updateTree_internal()` (noDict, or extDict with `EXT`): inserts
+/// the positions from `nextToUpdate` up to `ip` (excluded).
 ///
 /// # Safety
 /// `ip + 8 <= iend`.
 #[allow(unsafe_code)]
 #[inline(always)]
-unsafe fn update_tree<const MLS: u32>(s: &mut Bt, ip: *const u8, iend: *const u8) {
+unsafe fn update_tree<const MLS: u32, const EXT: bool>(s: &mut Bt, ip: *const u8, iend: *const u8) {
     let target = s.idx(ip);
     let mut idx = s.next_to_update;
     while idx < target {
         // SAFETY: idx < target: the position is before ip, in the window.
-        let forward = unsafe { insert_bt1::<MLS>(s, s.pos(idx), iend, target) };
+        let forward = unsafe { insert_bt1::<MLS, EXT>(s, s.pos(idx), iend, target) };
         debug_assert!(idx < idx.wrapping_add(forward));
         idx += forward;
     }
@@ -630,15 +710,15 @@ unsafe fn update_tree<const MLS: u32>(s: &mut Bt, ip: *const u8, iend: *const u8
 }
 
 /// `ZSTD_btGetAllMatches_internal()` with `ZSTD_insertBtAndGetAllMatches()`
-/// (noDict): fills `matches` with the repcode, 3-byte hash and tree matches
-/// at `ip`, of increasing lengths, all at least `length_to_beat` long, and
-/// returns their number. `ll0`: the literal length before `ip` is 0.
+/// (noDict, or extDict with `EXT`): fills `matches` with the repcode,
+/// 3-byte hash and tree matches at `ip`, of increasing lengths, all at
+/// least `length_to_beat` long, and returns their number. `ll0`: the literal length before `ip` is 0.
 ///
 /// # Safety
 /// `ip + 8 <= iend`, `iend` the block end.
 #[allow(unsafe_code, clippy::too_many_arguments)]
 #[inline(never)]
-unsafe fn get_all_matches<const MLS: u32>(
+unsafe fn get_all_matches<const MLS: u32, const EXT: bool>(
     s: &mut Bt,
     matches: &mut [Match],
     next_to_update3: &mut u32,
@@ -671,7 +751,7 @@ unsafe fn get_all_matches<const MLS: u32>(
     // the 3-byte hash and tree candidates are at or above `matchLow` and
     // before `curr`; forward reads stop at `ilimit` (the block end).
     unsafe {
-        update_tree::<MLS>(s, ip, iend);
+        update_tree::<MLS, EXT>(s, ip, iend);
 
         let curr = s.idx(ip);
         let dict_limit = s.dict_limit;
@@ -698,18 +778,36 @@ unsafe fn get_all_matches<const MLS: u32>(
             debug_assert!(curr >= dict_limit);
             // intentional overflow, discards 0 and -1: equivalent to
             // `curr > repIndex >= dictLimit`
-            if rep_offset.wrapping_sub(1) < curr - dict_limit && rep_index >= window_low && {
-                let r = ip.sub(rep_offset as usize);
-                s.chk(r, 4);
-                read_minmatch::<MLS>(ip) == read_minmatch::<MLS>(r)
-            } {
-                rep_len = count(
-                    ip.add(min_match),
-                    ip.add(min_match).sub(rep_offset as usize),
-                    ilimit,
-                ) + min_match;
+            if rep_offset.wrapping_sub(1) < curr - dict_limit {
+                // We must validate the repcode offset because when we're
+                // using a dictionary the valid offset range shrinks when the
+                // dictionary goes out of bounds.
+                if rep_index >= window_low && {
+                    let r = ip.sub(rep_offset as usize);
+                    s.chk(r, 4);
+                    read_minmatch::<MLS>(ip) == read_minmatch::<MLS>(r)
+                } {
+                    rep_len = count(
+                        ip.add(min_match),
+                        ip.add(min_match).sub(rep_offset as usize),
+                        ilimit,
+                    ) + min_match;
+                }
+            } else if EXT {
+                // repIndex < dictLimit || repIndex >= curr
+                let rep_match = s.dict_base.wrapping_add(rep_index as usize);
+                // `curr > repIndex >= windowLow`, the 4 bytes in the extDict
+                if (rep_offset.wrapping_sub(1) < curr - window_low)
+                    & index_overlap_check(dict_limit, rep_index)
+                    && {
+                        s.chk(rep_match, 4);
+                        read_minmatch::<MLS>(ip) == read_minmatch::<MLS>(rep_match)
+                    }
+                {
+                    rep_len = s.count_ext(ip.add(min_match), rep_match.add(min_match), ilimit)
+                        + min_match;
+                }
             }
-            // (repIndex < dictLimit: extDict / dictMatchState only)
 
             // save longer solution
             if rep_len > best_length {
@@ -731,9 +829,14 @@ unsafe fn get_all_matches<const MLS: u32>(
             if (match_index3 >= match_low) & (curr.wrapping_sub(match_index3) < (1 << 18)) {
                 // heuristic: longer distance likely too expensive
                 debug_assert!(match_index3 < curr);
-                let m = s.pos(match_index3);
-                s.chk(m, 0);
-                let mlen = count(ip, m, ilimit);
+                let mlen = if !EXT || match_index3 >= dict_limit {
+                    let m = s.pos(match_index3);
+                    s.chk(m, 0);
+                    count(ip, m, ilimit)
+                } else {
+                    let m = s.dict_base.wrapping_add(match_index3 as usize);
+                    s.count_ext(ip, m, ilimit)
+                };
                 // save best solution
                 if mlen >= MLS as usize {
                     best_length = mlen;
@@ -759,9 +862,8 @@ unsafe fn get_all_matches<const MLS: u32>(
             // guaranteed minimum nb of common bytes
             let mut match_length = common_length_smaller.min(common_length_larger);
             debug_assert!(curr > match_index);
-            let m = s.pos(match_index);
-            s.chk(m, 0);
-            match_length += count(ip.add(match_length), m.add(match_length), ilimit);
+            let m_ml;
+            (match_length, m_ml) = s.tree_count::<EXT>(ip, match_index, match_length, ilimit);
 
             if match_length > best_length {
                 debug_assert!(match_end_idx > match_index);
@@ -781,7 +883,7 @@ unsafe fn get_all_matches<const MLS: u32>(
                 }
             }
 
-            if *m.add(match_length) < *ip.add(match_length) {
+            if *m_ml < *ip.add(match_length) {
                 // match smaller than current
                 *smaller_ptr = match_index;
                 common_length_smaller = match_length;
@@ -831,8 +933,8 @@ pub(crate) fn compress_block_opt(
     end: usize,
 ) -> usize {
     match ms.cparams.strategy {
-        Strategy::BtOpt => opt_dispatch::<0>(ms, ss, rep, buf, start, end),
-        Strategy::BtUltra => opt_dispatch::<2>(ms, ss, rep, buf, start, end),
+        Strategy::BtOpt => opt_dispatch::<0, false>(ms, ss, rep, buf, start, end),
+        Strategy::BtUltra => opt_dispatch::<2, false>(ms, ss, rep, buf, start, end),
         Strategy::BtUltra2 => {
             let curr = ms.window.index(start);
             // 2-passes strategy: a first pass over the first block of a
@@ -847,7 +949,29 @@ pub(crate) fn compress_block_opt(
             {
                 init_stats_ultra(ms, ss, rep, buf, start, end);
             }
-            opt_dispatch::<2>(ms, ss, rep, buf, start, end)
+            opt_dispatch::<2, false>(ms, ss, rep, buf, start, end)
+        }
+        s => unreachable!("not an optimal strategy: {s:?}"),
+    }
+}
+
+/// `ZSTD_compressBlock_btopt_extDict()` and `ZSTD_compressBlock_btultra_extDict()`
+/// (also for btultra2, as in libzstd): as [`compress_block_opt`], for a
+/// window with an extDict segment (see
+/// [`compress_block_fast_ext_dict`](super::fast::compress_block_fast_ext_dict)).
+#[inline(never)]
+pub(crate) fn compress_block_opt_ext_dict(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
+    match ms.cparams.strategy {
+        Strategy::BtOpt => opt_dispatch::<0, true>(ms, ss, rep, buf, start, end),
+        Strategy::BtUltra | Strategy::BtUltra2 => {
+            opt_dispatch::<2, true>(ms, ss, rep, buf, start, end)
         }
         s => unreachable!("not an optimal strategy: {s:?}"),
     }
@@ -869,7 +993,7 @@ fn init_stats_ultra(
     debug_assert!(ss.nb_seq == 0); // no ldm
     debug_assert!(ms.window.dict_limit == ms.window.low_limit); // no dictionary
     debug_assert!(ms.window.dict_limit.wrapping_sub(ms.next_to_update) <= 1); // no prefix
-    opt_dispatch::<2>(ms, ss, &mut tmp_rep, buf, start, end); // generate stats into ms.opt
+    opt_dispatch::<2, false>(ms, ss, &mut tmp_rep, buf, start, end); // generate stats into ms.opt
     // invalidate the first scan from history, only keep entropy stats
     ss.reset();
     ms.window.base = ms.window.base.wrapping_sub(src_size);
@@ -880,7 +1004,7 @@ fn init_stats_ultra(
 
 /// Picks the `mls` instance of [`opt_generic`].
 #[inline(always)]
-fn opt_dispatch<const OPT_LEVEL: u32>(
+fn opt_dispatch<const OPT_LEVEL: u32, const EXT: bool>(
     ms: &mut MatchState,
     ss: &mut SeqStore,
     rep: &mut [u32; 3],
@@ -889,18 +1013,18 @@ fn opt_dispatch<const OPT_LEVEL: u32>(
     end: usize,
 ) -> usize {
     match ms.cparams.min_match.clamp(3, 6) {
-        3 => opt_generic::<3, OPT_LEVEL>(ms, ss, rep, buf, start, end),
-        4 => opt_generic::<4, OPT_LEVEL>(ms, ss, rep, buf, start, end),
-        5 => opt_generic::<5, OPT_LEVEL>(ms, ss, rep, buf, start, end),
-        _ => opt_generic::<6, OPT_LEVEL>(ms, ss, rep, buf, start, end),
+        3 => opt_generic::<3, OPT_LEVEL, EXT>(ms, ss, rep, buf, start, end),
+        4 => opt_generic::<4, OPT_LEVEL, EXT>(ms, ss, rep, buf, start, end),
+        5 => opt_generic::<5, OPT_LEVEL, EXT>(ms, ss, rep, buf, start, end),
+        _ => opt_generic::<6, OPT_LEVEL, EXT>(ms, ss, rep, buf, start, end),
     }
 }
 
-/// `ZSTD_compressBlock_opt_generic()` with `dictMode == ZSTD_noDict` and
-/// no LDM.
+/// `ZSTD_compressBlock_opt_generic()` with `dictMode` `ZSTD_noDict` (or
+/// `ZSTD_extDict` with `EXT`) and no LDM.
 #[allow(unsafe_code)]
 #[inline(always)]
-fn opt_generic<const MLS: u32, const OPT_LEVEL: u32>(
+fn opt_generic<const MLS: u32, const OPT_LEVEL: u32, const EXT: bool>(
     ms: &mut MatchState,
     ss: &mut SeqStore,
     rep: &mut [u32; 3],
@@ -919,11 +1043,25 @@ fn opt_generic<const MLS: u32, const OPT_LEVEL: u32>(
         assert!(ms.hash_log3 >= 1 && ms.hash_log3 <= 32);
         assert!(ms.hash_table3.len() == 1usize << ms.hash_log3);
     }
-    assert!(!ms.window.has_ext_dict());
+    assert!(EXT == ms.window.has_ext_dict());
     let window_start = ms.window.pos(ms.window.dict_limit);
     assert!(window_start <= start, "window start is not in the buffer");
-    assert!(ms.window.pos(ms.next_to_update) >= window_start);
+    assert!(ms.next_to_update >= ms.window.dict_limit);
     assert!(end.wrapping_sub(ms.window.base) <= u32::MAX as usize);
+    // With an extDict: it is in the buffer (and so is the prefix).
+    let (dict_lowest, dict_end) = if EXT {
+        let w = ExtWindow::new(
+            &ms.window,
+            buf,
+            start,
+            end,
+            ms.window.low_limit,
+            ms.window.dict_limit,
+        );
+        (w.dict_start, w.dict_end)
+    } else {
+        (buf.as_ptr(), buf.as_ptr())
+    };
     debug_assert!(OPT_LEVEL <= 2);
 
     let mut st = ms.opt.take().expect("optimal parser state");
@@ -963,6 +1101,10 @@ fn opt_generic<const MLS: u32, const OPT_LEVEL: u32>(
         sufficient_len,
         lowest: bp.wrapping_add(window_start),
         iend,
+        dict_base: bp.wrapping_add(ms.window.dict_base),
+        dict_lowest,
+        dict_end,
+        prefix_start,
     };
 
     let mut ip = istart;
@@ -989,7 +1131,7 @@ fn opt_generic<const MLS: u32, const OPT_LEVEL: u32>(
                 {
                     let litlen = (ip as usize - anchor as usize) as u32;
                     let ll0 = u32::from(litlen == 0);
-                    let nb_matches = get_all_matches::<MLS>(
+                    let nb_matches = get_all_matches::<MLS, EXT>(
                         &mut s,
                         matches,
                         &mut next_to_update3,
@@ -1147,7 +1289,7 @@ fn opt_generic<const MLS: u32, const OPT_LEVEL: u32>(
                         let previous_price = opt[c].price;
                         let base_price = previous_price + stats.ll_price::<OPT_LEVEL>(0);
                         let reps = opt[c].rep;
-                        let nb_matches = get_all_matches::<MLS>(
+                        let nb_matches = get_all_matches::<MLS, EXT>(
                             &mut s,
                             matches,
                             &mut next_to_update3,
@@ -1322,7 +1464,7 @@ fn opt_generic<const MLS: u32, const OPT_LEVEL: u32>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::fast::tests::{random, roundtrip, texty};
+    use super::super::fast::tests::{random, roundtrip, roundtrip_ring, texty};
     use super::super::params::{CParams, Strategy, block_size_max, one_shot_cparams};
     use super::*;
 
@@ -1448,5 +1590,37 @@ mod tests {
         let mut t = [0u32, 1, 4, 255, 256];
         assert_eq!(downscale_stats(&mut t, 8, false), 5);
         assert_eq!(t, [0, 1, 1, 1, 2]);
+    }
+
+    /// The extDict variants, through a wrapping ring buffer like the
+    /// streaming compressor's.
+    #[test]
+    fn roundtrip_ring_variants() {
+        let mut src = texty(100_000, 7);
+        src.extend_from_slice(&random(5000, 8));
+        src.extend_from_slice(&src.clone()[..40_000]);
+        src.extend_from_slice(&texty(50_000, 17));
+        for strategy in OPT {
+            for mls in 3..=6 {
+                for (search_log, target_length) in [(1, 4), (4, 32), (7, 256)] {
+                    for (window_log, bs) in [(12, 4096), (15, 5000), (16, 1 << 15)] {
+                        let cp = CParams {
+                            window_log,
+                            chain_log: 16,
+                            hash_log: 15,
+                            search_log,
+                            min_match: mls,
+                            target_length,
+                            strategy,
+                        };
+                        let (n, ext) = roundtrip_ring(&src, cp, bs);
+                        assert!(
+                            n > 1000 && ext > 0,
+                            "{strategy:?} mls {mls} slog {search_log} wlog {window_log}: {n} {ext}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

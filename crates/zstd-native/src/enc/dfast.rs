@@ -1,11 +1,12 @@
 //! The `dfast` strategy (levels 3-4, and level 2 for some input sizes): a
 //! port of libzstd 1.5.7's `compress/zstd_double_fast.c` (no-dictionary
-//! path). It shares the match state, window and block loop with `fast`
-//! (see that module's docs); `hashTable` holds 8-byte hashes ("long") and
-//! `chainTable` `minMatch`-byte hashes ("short").
+//! and extDict paths). It shares the match state, window and block loop
+//! with `fast` (see that module's docs); `hashTable` holds 8-byte hashes
+//! ("long") and `chainTable` `minMatch`-byte hashes ("short").
 
 use super::fast::{
-    HASH_READ_SIZE, K_SEARCH_STRENGTH, MatchState, TableLoadMethod, hash_mls, prefetch_l1,
+    ExtWindow, HASH_READ_SIZE, K_SEARCH_STRENGTH, MatchState, TableLoadMethod, hash_mls,
+    index_overlap_check, prefetch_l1,
 };
 use super::params::Strategy;
 use super::seq_store::{
@@ -101,7 +102,8 @@ fn no_dict_generic<const MLS: u32>(
     assert!(start <= end && end <= buf.len());
     assert!(ms.hash_table.len() == 1usize << h_bits_l && h_bits_l <= 32);
     assert!(ms.chain_table.len() == 1usize << h_bits_s && h_bits_s <= 32);
-    assert!(!ms.window.has_ext_dict());
+    // With an extDict, only through the extDict variant when the window has
+    // moved past it: every read is then in the prefix.
     let window_start = ms.window.pos(ms.window.dict_limit);
     assert!(window_start <= start, "window start is not in the buffer");
     assert!(end.wrapping_sub(ms.window.base) <= u32::MAX as usize);
@@ -386,9 +388,278 @@ fn no_dict_generic<const MLS: u32>(
     iend as usize - anchor as usize
 }
 
+/// `ZSTD_compressBlock_doubleFast_extDict()`: as
+/// [`compress_block_double_fast`], for a window with an extDict segment
+/// (see [`compress_block_fast_ext_dict`](super::fast::compress_block_fast_ext_dict)).
+#[inline(never)]
+pub(crate) fn compress_block_double_fast_ext_dict(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
+    debug_assert!(ms.cparams.strategy == Strategy::DFast);
+    match ms.cparams.min_match {
+        5 => ext_dict_generic::<5>(ms, ss, rep, buf, start, end),
+        6 => ext_dict_generic::<6>(ms, ss, rep, buf, start, end),
+        7 => ext_dict_generic::<7>(ms, ss, rep, buf, start, end),
+        _ => ext_dict_generic::<4>(ms, ss, rep, buf, start, end),
+    }
+}
+
+/// `ZSTD_compressBlock_doubleFast_extDict_generic()`.
+///
+/// Memory safety: as `fast`'s extDict variant ([`ExtWindow`] checks both
+/// segments; candidates are read above `dictStartIndex`, in the segment of
+/// their index; repcodes pass `ZSTD_index_overlap_check` and the window
+/// check before being read).
+#[allow(unsafe_code)]
+#[inline(always)]
+fn ext_dict_generic<const MLS: u32>(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
+    let cparams = ms.cparams;
+    let h_bits_l = cparams.hash_log;
+    let h_bits_s = cparams.chain_log;
+    assert!(ms.hash_table.len() == 1usize << h_bits_l && h_bits_l <= 32);
+    assert!(ms.chain_table.len() == 1usize << h_bits_s && h_bits_s <= 32);
+    let end_index = ms.window.index(end);
+    let low_limit = ms.lowest_match_index(end_index, cparams.window_log);
+    let dict_start_index = low_limit;
+    let dict_limit = ms.window.dict_limit;
+    let prefix_start_index = dict_limit.max(low_limit);
+
+    // if extDict is invalidated due to maxDistance, switch to "regular" variant
+    if prefix_start_index == dict_start_index {
+        return compress_block_double_fast(ms, ss, rep, buf, start, end);
+    }
+
+    // These checks make the raw-pointer accesses below sound.
+    let w = ExtWindow::new(
+        &ms.window,
+        buf,
+        start,
+        end,
+        dict_start_index,
+        prefix_start_index,
+    );
+    let bp = buf.as_ptr();
+    let base = w.base;
+    let istart = w.istart;
+    let iend = w.iend;
+    let ilimit = iend.wrapping_sub(HASH_READ_SIZE);
+    let hash_long = ms.hash_table.as_mut_ptr();
+    let hash_small = ms.chain_table.as_mut_ptr();
+    let mut offset_1 = rep[0];
+    let mut offset_2 = rep[1];
+
+    let mut ip = istart;
+    let mut anchor = istart;
+
+    // SAFETY (whole block): see the function docs. Hash table writes use
+    // hashes of `h_bits_l`/`h_bits_s` bits into tables of that many
+    // entries (asserted above).
+    unsafe {
+        let hash_l = |p: *const u8| {
+            w.chk(p, 8);
+            hash8_ptr(p, h_bits_l)
+        };
+        let hash_s = |p: *const u8| {
+            w.chk(p, 8);
+            hash_mls::<MLS>(p, h_bits_s)
+        };
+
+        // Search Loop
+        while ip < ilimit {
+            // < instead of <=, because (ip+1)
+            let h_small = hash_s(ip);
+            let match_index = *hash_small.add(h_small);
+            let mut mtch = w.pos(match_index);
+
+            let h_long = hash_l(ip);
+            let match_long_index = *hash_long.add(h_long);
+            let mut match_long = w.pos(match_long_index);
+
+            let curr = w.idx(ip);
+            let rep_index = curr.wrapping_add(1).wrapping_sub(offset_1); // offset_1 expected <= curr + 1
+            let rep_match = w.pos(rep_index);
+            let m_length: usize;
+            *hash_small.add(h_small) = curr; // update hash table
+            *hash_long.add(h_long) = curr;
+
+            if (index_overlap_check(prefix_start_index, rep_index)
+                & (offset_1 <= curr.wrapping_add(1).wrapping_sub(dict_start_index)))
+                && {
+                    // note: we are searching at curr+1
+                    w.chk(rep_match, 4);
+                    read32(rep_match) == read32(ip.add(1))
+                }
+            {
+                let rep_match_end = w.seg_end(rep_index);
+                m_length = w.count2(ip.add(1 + 4), rep_match.add(4), rep_match_end) + 4;
+                ip = ip.add(1);
+                ss.store_seq(
+                    buf,
+                    anchor as usize - bp as usize,
+                    ip as usize - anchor as usize,
+                    end,
+                    REPCODE1_TO_OFFBASE,
+                    m_length,
+                );
+            } else if match_long_index > dict_start_index && {
+                w.chk(match_long, 8);
+                read_le64(match_long) == read_le64(ip)
+            } {
+                let match_end = w.seg_end(match_long_index);
+                let low_match_ptr = w.seg_start(match_long_index);
+                let mut ml = w.count2(ip.add(8), match_long.add(8), match_end) + 8;
+                let offset = curr - match_long_index;
+                // catch up
+                while ((ip > anchor) & (match_long > low_match_ptr)) && {
+                    w.chk(match_long.wrapping_sub(1), 1);
+                    *ip.sub(1) == *match_long.sub(1)
+                } {
+                    ip = ip.sub(1);
+                    match_long = match_long.sub(1);
+                    ml += 1;
+                }
+                m_length = ml;
+                offset_2 = offset_1;
+                offset_1 = offset;
+                ss.store_seq(
+                    buf,
+                    anchor as usize - bp as usize,
+                    ip as usize - anchor as usize,
+                    end,
+                    offset_to_offbase(offset),
+                    m_length,
+                );
+            } else if match_index > dict_start_index && {
+                w.chk(mtch, 4);
+                read32(mtch) == read32(ip)
+            } {
+                let h3 = hash_l(ip.add(1));
+                let match_index3 = *hash_long.add(h3);
+                let mut match3 = w.pos(match_index3);
+                let offset;
+                let mut ml;
+                *hash_long.add(h3) = curr + 1;
+                if match_index3 > dict_start_index && {
+                    w.chk(match3, 8);
+                    read_le64(match3) == read_le64(ip.add(1))
+                } {
+                    let match_end = w.seg_end(match_index3);
+                    let low_match_ptr = w.seg_start(match_index3);
+                    ml = w.count2(ip.add(9), match3.add(8), match_end) + 8;
+                    ip = ip.add(1);
+                    offset = curr + 1 - match_index3;
+                    // catch up
+                    while ((ip > anchor) & (match3 > low_match_ptr)) && {
+                        w.chk(match3.wrapping_sub(1), 1);
+                        *ip.sub(1) == *match3.sub(1)
+                    } {
+                        ip = ip.sub(1);
+                        match3 = match3.sub(1);
+                        ml += 1;
+                    }
+                } else {
+                    let match_end = w.seg_end(match_index);
+                    let low_match_ptr = w.seg_start(match_index);
+                    ml = w.count2(ip.add(4), mtch.add(4), match_end) + 4;
+                    offset = curr - match_index;
+                    // catch up
+                    while ((ip > anchor) & (mtch > low_match_ptr)) && {
+                        w.chk(mtch.wrapping_sub(1), 1);
+                        *ip.sub(1) == *mtch.sub(1)
+                    } {
+                        ip = ip.sub(1);
+                        mtch = mtch.sub(1);
+                        ml += 1;
+                    }
+                }
+                m_length = ml;
+                offset_2 = offset_1;
+                offset_1 = offset;
+                ss.store_seq(
+                    buf,
+                    anchor as usize - bp as usize,
+                    ip as usize - anchor as usize,
+                    end,
+                    offset_to_offbase(offset),
+                    m_length,
+                );
+            } else {
+                ip = ip.add(((ip as usize - anchor as usize) >> K_SEARCH_STRENGTH) + 1);
+                continue;
+            }
+
+            // move to next sequence start
+            ip = ip.add(m_length);
+            anchor = ip;
+
+            if ip <= ilimit {
+                // Complementary insertion, done after the ilimit test as
+                // candidates could be > iend - 8.
+                let index_to_insert = curr + 2;
+                let p = base.wrapping_add(index_to_insert as usize);
+                *hash_long.add(hash_l(p)) = index_to_insert;
+                *hash_long.add(hash_l(ip.sub(2))) = w.idx(ip.sub(2));
+                *hash_small.add(hash_s(p)) = index_to_insert;
+                *hash_small.add(hash_s(ip.sub(1))) = w.idx(ip.sub(1));
+
+                // check immediate repcode
+                while ip <= ilimit {
+                    let current2 = w.idx(ip);
+                    let rep_index2 = current2.wrapping_sub(offset_2);
+                    let rep_match2 = w.pos(rep_index2);
+                    if (index_overlap_check(prefix_start_index, rep_index2)
+                        & (offset_2 <= current2.wrapping_sub(dict_start_index)))
+                        && {
+                            w.chk(rep_match2, 4);
+                            read32(rep_match2) == read32(ip)
+                        }
+                    {
+                        let rep_end2 = w.seg_end(rep_index2);
+                        let rep_length2 = w.count2(ip.add(4), rep_match2.add(4), rep_end2) + 4;
+                        core::mem::swap(&mut offset_1, &mut offset_2);
+                        ss.store_seq(
+                            buf,
+                            anchor as usize - bp as usize,
+                            0,
+                            end,
+                            REPCODE1_TO_OFFBASE,
+                            rep_length2,
+                        );
+                        *hash_small.add(hash_s(ip)) = current2;
+                        *hash_long.add(hash_l(ip)) = current2;
+                        ip = ip.add(rep_length2);
+                        anchor = ip;
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // save reps for next block
+    rep[0] = offset_1;
+    rep[1] = offset_2;
+
+    // Return the last literals size
+    iend as usize - anchor as usize
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::fast::tests::{random, roundtrip, texty};
+    use super::super::fast::tests::{random, roundtrip, roundtrip_ring, texty};
     use super::super::params::{CParams, Strategy, block_size_max, one_shot_cparams};
     use alloc::vec::Vec;
 
@@ -430,6 +701,34 @@ mod tests {
                 };
                 let n = roundtrip(&src, cp, (1 << 17).min(1 << window_log));
                 assert!(n > 1000, "mls {mls} wlog {window_log}: {n} sequences");
+            }
+        }
+    }
+
+    /// The extDict variant, through a wrapping ring buffer like the
+    /// streaming compressor's.
+    #[test]
+    fn roundtrip_ring_variants() {
+        let mut src = texty(150_000, 7);
+        src.extend_from_slice(&random(5000, 8));
+        src.extend_from_slice(&src.clone()[..60_000]);
+        src.extend_from_slice(&texty(100_000, 17));
+        for mls in 3..=8 {
+            for (window_log, bs) in [(10, 1 << 10), (14, 3000), (16, 1 << 15), (17, 1 << 17)] {
+                let cp = CParams {
+                    window_log,
+                    chain_log: 13,
+                    hash_log: 15,
+                    search_log: 1,
+                    min_match: mls,
+                    target_length: 0,
+                    strategy: Strategy::DFast,
+                };
+                let (n, ext) = roundtrip_ring(&src, cp, bs);
+                assert!(
+                    n > 1000 && ext > 0,
+                    "mls {mls} wlog {window_log}: {n} {ext}"
+                );
             }
         }
     }
