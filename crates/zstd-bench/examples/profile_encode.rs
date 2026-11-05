@@ -92,7 +92,7 @@ fn main() {
     }
     let el = t.elapsed().as_secs_f64();
     println!(
-        "{lib} {ds} L{level}: ratio {:.3}, {:.1} MiB/s",
+        "{lib} {ds} L{level}: ratio {:.3}, {:.3} MiB/s",
         data.len() as f64 / size as f64,
         (n as f64 * data.len() as f64) / el / (1 << 20) as f64
     );
