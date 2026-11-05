@@ -446,9 +446,8 @@ impl StreamDecoder {
             _ => {
                 self.block
                     .decode_block(src, &mut out, self.prefix, dict, self.block_max)?;
-                if out.pos - start > self.block_max {
-                    return Err(Error::Corrupted);
-                }
+                // `decode_block` bounds a block by `block_max`.
+                debug_assert!(out.pos - start <= self.block_max);
             }
         }
         self.cur = out.pos;

@@ -129,11 +129,29 @@ impl BlockDecoder {
         self.ent.fse_ok = true;
         let tables = &self.ent.seq;
         let mut rep = self.ent.rep.map(|r| r as usize);
+        // A block regenerates at most `block_max` bytes (the format's
+        // Block_Maximum_Size). libzstd's one-shot decoder, given the room,
+        // puts the literals `block_max + WILDCOPY_OVERLENGTH` after the
+        // block and stops the sequences there; its streaming stages decode
+        // into a `block_max` buffer. Bound the sequences the same way
+        // whatever the output space, so a slice and a growing `Vec` (which
+        // reserves `block_max` per block) agree. The slack keeps valid
+        // blocks on the fast (wildcopy) path.
+        let cap = out.cap;
+        let limit = out.pos.saturating_add(block_max + WILDCOPY_OVERLENGTH);
+        let start = out.pos;
+        out.cap = cap.min(limit);
         let res = run_sequences(
             self.cpu, tables, &mut rep, seq_src, nb_seq, &lits, out, prefix, dict,
         );
+        out.cap = cap;
         self.ent.rep = rep.map(|r| r as u32);
-        res
+        match res {
+            // The limit, not the output space, stopped it.
+            Err(Error::OutputTooSmall) if limit <= cap => Err(Error::Corrupted),
+            Ok(()) if out.pos - start > block_max => Err(Error::Corrupted),
+            res => res,
+        }
     }
 
     /// Literals section (libzstd's `ZSTD_decodeLiteralsBlock`). Returns the
