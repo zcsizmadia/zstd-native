@@ -191,8 +191,12 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
    size and overlap log: one-shot (`ZSTD_compress2`) and streaming,
    every strategy, flushes, pledged sizes, dictionaries, LDM; on par with
    libzstd's speed with 4-8 workers in first measurements (Windows
-   laptop), single-threaded speed unchanged. Not ported: `ZSTD_c_rsyncable`,
-   checksums (the encoder writes none yet).
+   laptop), single-threaded speed unchanged. Not ported: `ZSTD_c_rsyncable`.
+   The frame parameters `ZSTD_c_checksumFlag`, `ZSTD_c_contentSizeFlag` and
+   `ZSTD_c_dictIDFlag` are exposed (`set_checksum`, `set_content_size_flag`,
+   `set_dict_id_flag` on `Compressor`, `StreamEncoder` and `Encoder`), in
+   every mode; as in libzstd's MT path, the multithreaded context hashes
+   the input as it takes it and writes the checksum after the last job.
 5. ~~Fuzzing~~ (done, #13: cargo-fuzz targets differential against
    libzstd, see [Fuzzing](#fuzzing)), Miri, CI matrix (x86-64/AArch64,
    Linux/Windows/macOS, 32-bit), AArch64 tuning.
@@ -216,7 +220,7 @@ input picks its parameters with `arbitrary`:
 | `decode` | arbitrary bytes | never panics; the asm and Rust Huffman loops, the slice and the `Vec` APIs agree; whatever zstd-native accepts, libzstd accepts with the same output |
 | `stream_decode` | arbitrary bytes, input pieces, output sizes, a dictionary from arbitrary bytes (raw, trained, or trained and mutated), a window limit | as `decode` for `StreamDecoder` against `ZSTD_decompressStream`, plus the one-shot and `std::io::Read` decoders |
 | `decode_valid` | arbitrary data and parameters (level -7 to 22, checksum, content size, window log, long distance matching, dictionary, flush points) compressed by libzstd | every zstd-native decoding API returns the data exactly, with input and output pieces of arbitrary sizes |
-| `compress` | arbitrary data and parameters (level, window log, long distance matching, workers, job size, overlap, loaded or prepared dictionaries from arbitrary bytes), one-shot with a reused context or a streaming script of input pieces, flushes, frame ends and output sizes | byte-identical with libzstd for the same calls; both libraries decode it back |
+| `compress` | arbitrary data and parameters (level, window log, long distance matching, workers, job size, overlap, checksum, content size and dictionary ID flags, loaded or prepared dictionaries from arbitrary bytes), one-shot with a reused context or a streaming script of input pieces, flushes, frame ends and output sizes | byte-identical with libzstd for the same calls; both libraries decode it back |
 
 The Huffman `asm!` loops are forced on and off per input
 (`__private::set_asm`); the generic code paths need a build with

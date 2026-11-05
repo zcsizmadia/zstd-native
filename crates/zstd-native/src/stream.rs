@@ -154,7 +154,10 @@ impl StreamDecoder {
     }
 
     /// Sets the largest window accepted (frames needing more fail with
-    /// [`Error::WindowTooLarge`]), as `1 << log`, `log` 10 to 31.
+    /// [`Error::WindowTooLarge`]), as `1 << log`, `log` 10 to 31 (30 on
+    /// 32-bit targets, as libzstd); values outside are clamped. Frames
+    /// with a window log over 31 (30 on 32-bit) are rejected in every
+    /// mode, one-shot decoding included.
     /// The default is 27 (128 MiB), libzstd's.
     pub fn set_window_log_max(&mut self, log: u32) {
         self.window_max = 1u64 << log.clamp(10, frame::WINDOWLOG_MAX);
@@ -370,7 +373,13 @@ impl StreamDecoder {
         let last = bh & 1 != 0;
         let btype = ((bh >> 1) & 3) as u8;
         let size = (bh >> 3) as usize;
-        if btype == 3 || size > self.block_max {
+        // libzstd's streaming stages check both the compressed size (1 for
+        // an RLE block) and the regenerated size against `blockSizeMax`
+        // (`ZSTD_decompressContinue`). They differ only for an RLE block in
+        // a window of 0 (a single-segment frame of content size 0), which
+        // libzstd rejects even when it regenerates 0 bytes.
+        let csize = if btype == 1 { 1 } else { size };
+        if btype == 3 || size.max(csize) > self.block_max {
             return Err(Error::Corrupted);
         }
         self.stage = Stage::Block { btype, size, last };
@@ -437,9 +446,8 @@ impl StreamDecoder {
             _ => {
                 self.block
                     .decode_block(src, &mut out, self.prefix, dict, self.block_max)?;
-                if out.pos - start > self.block_max {
-                    return Err(Error::Corrupted);
-                }
+                // `decode_block` bounds a block by `block_max`.
+                debug_assert!(out.pos - start <= self.block_max);
             }
         }
         self.cur = out.pos;

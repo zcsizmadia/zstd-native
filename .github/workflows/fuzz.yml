@@ -1,0 +1,96 @@
+name: Fuzz
+
+# The cargo-fuzz targets in fuzz/ (docs/PROPOSAL.md, Fuzzing), each
+# differential against C libzstd 1.5.7: a few minutes per target on every
+# push and pull request, half an hour nightly or on demand. The corpus is
+# kept between runs in the Actions cache.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "1800"
+
+concurrency:
+  # Runs of the same PR share a group, and so do pushes to main: a newer
+  # push cancels the older run, so only the latest commit runs to the end.
+  # Scheduled and manual runs get their own group, so a push never
+  # cancels them.
+  group: fuzz-${{ (github.event_name == 'pull_request' || github.event_name == 'push') && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # seeds: the target has a seed corpus from src/bin/seeds.rs
+          # (libzstd frames of every kind); the others take `arbitrary`
+          # structures, not frames.
+          - { target: decode, max_len: "65536", seeds: true }
+          - { target: stream_decode, max_len: "65536", seeds: true }
+          - { target: decode_valid, max_len: "131072", seeds: false }
+          - { target: compress, max_len: "131072", seeds: false }
+    env:
+      # Short runs on pushes and PRs, long runs nightly or on demand.
+      SECONDS_PER_TARGET: ${{ github.event_name == 'schedule' && '1800' || github.event.inputs.seconds || '180' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz
+      - name: Restore corpus
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Seed corpus
+        if: matrix.seeds
+        working-directory: fuzz
+        # Writes corpus/decode and corpus/stream_decode; files of the same
+        # name are overwritten, so a restored corpus keeps its own inputs.
+        run: cargo run --release --bin seeds -- corpus
+      - name: Fuzz
+        working-directory: fuzz
+        run: >
+          cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} --
+          -max_total_time=${{ env.SECONDS_PER_TARGET }}
+          -rss_limit_mb=4096 -timeout=60 -max_len=${{ matrix.max_len }}
+      - name: Minimize corpus
+        if: always()
+        working-directory: fuzz
+        run: cargo fuzz cmin --target x86_64-unknown-linux-gnu ${{ matrix.target }} || true
+      - name: Save corpus
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

@@ -27,11 +27,14 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+          # Lint the non-x86 cfgs too, not only the default build.
+          targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p zstd-native --no-default-features -- -D warnings
       - run: cargo clippy -p zstd-native --all-targets --features portable -- -D warnings
+      - run: cargo clippy -p zstd-native --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
       - run: cargo doc -p zstd-native --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
@@ -39,6 +42,15 @@ jobs:
       # cargo-fuzz) must keep compiling.
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --check
       - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories bans licenses sources
 
   test:
     name: test ${{ matrix.name }}
@@ -76,6 +88,27 @@ jobs:
         run: |
           rustup target add i686-pc-windows-msvc
           cargo test --workspace --profile ci --target i686-pc-windows-msvc
+
+  targets:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # no_std + alloc on a microcontroller, WebAssembly, 32-bit x86
+          # Linux, and AArch64 no_std (CPU features from target features).
+          - { target: thumbv7em-none-eabihf, flags: --no-default-features }
+          - { target: wasm32-unknown-unknown, flags: "" }
+          - { target: i686-unknown-linux-gnu, flags: "" }
+          - { target: aarch64-unknown-linux-gnu, flags: --no-default-features }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - run: cargo build -p zstd-native --release --target ${{ matrix.target }} ${{ matrix.flags }}
 
   msrv:
     name: MSRV 1.89

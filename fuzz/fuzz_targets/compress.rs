@@ -1,5 +1,6 @@
 //! Compresses arbitrary data with arbitrary parameters (level -7 to 22,
 //! window log, long distance matching, workers, job size and overlap,
+//! checksum, content size and dictionary ID flags,
 //! loaded or prepared dictionaries from arbitrary bytes), one-shot with a
 //! reused context or streaming with arbitrary input pieces, flushes,
 //! frame ends and output sizes: the output must be byte-identical with
@@ -128,5 +129,8 @@ fn native_compressor(p: &EncParams) -> zstd_native::Compressor {
     c.set_workers(p.workers());
     c.set_job_size(p.job_size());
     c.set_overlap_log(p.overlap_log());
+    c.set_checksum(p.checksum());
+    c.set_content_size_flag(p.content_size());
+    c.set_dict_id_flag(p.dict_id());
     c
 }

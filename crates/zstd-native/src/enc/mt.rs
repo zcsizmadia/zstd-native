@@ -51,11 +51,12 @@ use std::vec;
 use std::vec::Vec;
 
 use super::cdict::{CDict, load_prefix};
-use super::compress::{FrameCompressor, compress_bound};
+use super::compress::{FrameCompressor, FrameParams, compress_bound};
 use super::ldm::{LdmState, RawSeqStore};
 use super::params::{BLOCKSIZE_MAX, CParams, Strategy, cycle_log};
 use super::stream::{CompressProgress, EndOp};
 use crate::error::{Error, Result};
+use crate::xxhash::Xxh64;
 
 /// `ZSTDMT_JOBSIZE_MIN`: the smallest job size, and the largest frame
 /// compressed single-threaded even with workers.
@@ -165,6 +166,75 @@ fn overlap_size(overlap_log: u32, cp: &CParams, ldm: bool) -> usize {
     if ov_log == 0 { 0 } else { 1usize << ov_log }
 }
 
+/// The buffer sizes of a multithreaded frame, from
+/// `ZSTDMT_initCStream_internal()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameSizes {
+    /// `targetSectionSize`: the job size.
+    pub(crate) target: usize,
+    /// `targetPrefixSize`: the overlap.
+    pub(crate) prefix_size: usize,
+    /// The output buffer of a job (`ZSTD_compressBound(targetSectionSize)`).
+    pub(crate) out_cap: usize,
+    /// `roundBuff.capacity`: `max(windowSize, targetSectionSize *
+    /// nbWorkers)` plus 2 or 3 jobs of slack.
+    pub(crate) ring_cap: usize,
+}
+
+impl FrameSizes {
+    /// The sizes for `p`, `cp` and `ldm`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::MemoryAllocation`] if a buffer would be larger than
+    /// `isize::MAX` bytes (`PTRDIFF_MAX`), which no allocation can be.
+    /// Only possible on 32-bit targets, where jobs are up to 512 MiB
+    /// (`ZSTDMT_JOBSIZE_MAX`) and workers up to 64: level 22's 512 MiB
+    /// jobs or `set_job_size(512 << 20)` need a round buffer of
+    /// `(nbWorkers + 3) * 512 MiB`, 2 GiB with one worker. libzstd computes
+    /// these sizes in `size_t` without overflow checks and `malloc`s the
+    /// round buffer up front: the allocation fails (`memory_allocation`),
+    /// or with more workers the size wraps around (to a smaller
+    /// buffer than its jobs use). zstd-native returns the error in both
+    /// cases.
+    pub(crate) fn new(p: &MtParams, cp: &CParams, ldm: bool) -> Result<FrameSizes> {
+        const MAX: usize = isize::MAX as usize;
+        let prefix_size = overlap_size(p.overlap_log, cp, ldm);
+        let target = if p.job_size == 0 {
+            1usize << target_job_log(cp, ldm)
+        } else {
+            p.job_size
+        };
+        // job size must be >= overlap size
+        let target = target.max(prefix_size);
+        // compress_bound(n) <= n + n / 256 + 64
+        let out_cap = target
+            .checked_add((target >> 8) + 64)
+            .filter(|&n| n <= MAX)
+            .map(|_| compress_bound(target));
+        // If ldm is enabled we need windowSize space; two buffers of slack,
+        // plus one for the overlap.
+        let window_size = if ldm { 1usize << cp.window_log } else { 0 };
+        let nb_slack = 2 + usize::from(prefix_size > 0);
+        let workers = (p.workers as usize).max(1);
+        let ring_cap = target.checked_mul(workers).and_then(|sections| {
+            window_size
+                .max(sections)
+                .checked_add(target.checked_mul(nb_slack)?)
+        });
+        match (out_cap, ring_cap) {
+            // the LDM copy of the round buffer has RING_SLACK bytes more
+            (Some(out_cap), Some(ring_cap)) if ring_cap <= MAX - RING_SLACK => Ok(FrameSizes {
+                target,
+                prefix_size,
+                out_cap,
+                ring_cap,
+            }),
+            _ => Err(Error::MemoryAllocation),
+        }
+    }
+}
+
 /// Locks `m`, ignoring poisoning (a panicking job is reported through its
 /// [`Slot`]).
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -272,6 +342,9 @@ struct SerialState {
 /// What the jobs of a frame share.
 struct Frame {
     cp: CParams,
+    /// The frame parameters (the first job writes the header; the last
+    /// one, if it is also the first, the checksum).
+    fparams: FrameParams,
     /// The dictionary (the first job's only).
     cdict: Option<Arc<CDict>>,
     /// `frameContentSize`
@@ -369,7 +442,9 @@ fn run_job(fc: &mut Option<Box<FrameCompressor>>, job: &Job) -> Result<(Vec<u8>,
     let size = buf.len() - src_start;
     let fc = if job.id == 0 {
         // the frame's parameters and size, the dictionary
-        FrameCompressor::start_frame(fc, f.cp, f.cdict.as_ref(), f.pledged, false)
+        let fc = FrameCompressor::start_frame(fc, f.cp, f.cdict.as_ref(), f.pledged, false);
+        fc.set_frame_params(f.fparams);
+        fc
     } else {
         // the job's size, the previous job's end as a prefix
         let fc = FrameCompressor::start_frame_for_prefix(fc, f.cp, Some(size as u64), false);
@@ -561,6 +636,12 @@ pub(crate) struct MtCtx {
     /// Input taken in the frame, and its pledged size.
     consumed: u64,
     pledged: Option<u64>,
+    /// `serial.xxhState`: the XXH64 of the input taken in the frame, with
+    /// the checksum flag.
+    xxh: Option<Xxh64>,
+    /// The checksum to append to the last job's output, when the frame has
+    /// several jobs (`frameChecksumNeeded`; a single job writes its own).
+    trailer: Option<u32>,
     /// The job table's size (the smallest power of 2 above `nbWorkers +
     /// 2`): at most this many jobs posted and not written out.
     max_jobs: usize,
@@ -614,6 +695,8 @@ impl MtCtx {
             frame_ended: false,
             consumed: 0,
             pledged: None,
+            xxh: None,
+            trailer: None,
             max_jobs: 0,
             out_cap: 0,
         }
@@ -623,6 +706,11 @@ impl MtCtx {
     /// (`None`: unknown) with the frame parameters `cp`, long distance
     /// matching if `ldm`, and the dictionary `cdict`, abandoning any frame
     /// in progress.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::MemoryAllocation`] if the buffers of the frame don't fit
+    /// in memory (see [`FrameSizes::new`]); no frame is started.
     pub(crate) fn init_frame(
         &mut self,
         p: &MtParams,
@@ -630,29 +718,21 @@ impl MtCtx {
         ldm: bool,
         cdict: Option<Arc<CDict>>,
         pledged: Option<u64>,
-    ) {
+        fparams: FrameParams,
+    ) -> Result<()> {
         debug_assert!(p.workers > 0);
         self.abandon();
+        let sizes = FrameSizes::new(p, &cp, ldm)?;
         if self.pool.size != p.workers {
             self.pool = Pool::new(0); // join the old workers first
             self.pool = Pool::new(p.workers);
         }
         let workers = p.workers as usize;
-        self.prefix_size = overlap_size(p.overlap_log, &cp, ldm);
-        let mut target = if p.job_size == 0 {
-            1usize << target_job_log(&cp, ldm)
-        } else {
-            p.job_size
-        };
-        // job size must be >= overlap size
-        target = target.max(self.prefix_size);
+        let target = sizes.target;
+        self.prefix_size = sizes.prefix_size;
         self.target = target;
-        self.out_cap = compress_bound(target);
-        // If ldm is enabled we need windowSize space; two buffers of slack,
-        // plus one for the overlap.
-        let window_size = if ldm { 1usize << cp.window_log } else { 0 };
-        let nb_slack = 2 + usize::from(self.prefix_size > 0);
-        self.ring_cap = window_size.max(target * workers) + target * nb_slack;
+        self.out_cap = sizes.out_cap;
+        self.ring_cap = sizes.ring_cap;
         self.ring_pos = 0;
         self.in_buf = None;
         self.in_prefix = 0;
@@ -662,6 +742,8 @@ impl MtCtx {
         self.frame_ended = false;
         self.consumed = 0;
         self.pledged = pledged;
+        self.xxh = fparams.checksum.then(Xxh64::new);
+        self.trailer = None;
         // ZSTDMT_createJobsTable(nbWorkers + 2)
         self.max_jobs = 1 << ((workers as u32 + 2).ilog2() + 1);
         // a buffer per job of the table, plus the one being filled
@@ -699,6 +781,7 @@ impl MtCtx {
         };
         self.frame = Some(Arc::new(Frame {
             cp,
+            fparams,
             cdict,
             pledged,
             serial,
@@ -707,6 +790,7 @@ impl MtCtx {
             cancelled: AtomicBool::new(false),
             bufs: Arc::clone(&self.bufs),
         }));
+        Ok(())
     }
 
     /// Abandons the frame in progress, if any: its jobs stop as soon as
@@ -818,8 +902,12 @@ impl MtCtx {
             if self.pledged.is_some_and(|p| self.consumed > p) {
                 return Err(Error::SrcSizeWrong);
             }
+            let loaded = &input[*ip..*ip + to_load];
+            if let Some(h) = &mut self.xxh {
+                h.update(loaded);
+            }
             let b = self.in_buf.as_mut().expect("input range");
-            b.extend_from_slice(&input[*ip..*ip + to_load]);
+            b.extend_from_slice(loaded);
             *ip += to_load;
             forward_progress = to_load > 0;
         }
@@ -876,10 +964,18 @@ impl MtCtx {
                 return Err(Error::SrcSizeWrong);
             }
             let src_size = self.filled();
+            if end && self.next_job > 0 {
+                // several jobs: the checksum follows the last one's output
+                self.trailer = self.xxh.as_ref().map(|h| h.digest() as u32);
+            }
             if src_size == 0 && self.next_job > 0 {
                 // a last empty block ends the frame
                 debug_assert!(end);
-                self.ready = Some(Ready::Done(vec![1, 0, 0]));
+                let mut v = vec![1, 0, 0];
+                if let Some(c) = self.trailer.take() {
+                    v.extend_from_slice(&c.to_le_bytes());
+                }
+                self.ready = Some(Ready::Done(v));
                 self.in_buf = None;
                 self.prev = None;
                 self.frame_ended = true;
@@ -958,7 +1054,19 @@ impl MtCtx {
         {
             match slot.take(block) {
                 None => return Ok(1), // current job not completely compressed
-                Some(Outcome::Done(v, n)) => {
+                Some(Outcome::Done(mut v, mut n)) => {
+                    if self.frame_ended
+                        && self.jobs.len() == 1
+                        && self.ready.is_none()
+                        && let Some(c) = self.trailer.take()
+                    {
+                        // the last job: add the frame checksum
+                        if v.len() < n + 4 {
+                            v.resize(n + 4, 0);
+                        }
+                        v[n..n + 4].copy_from_slice(&c.to_le_bytes());
+                        n += 4;
+                    }
                     self.out = v;
                     self.out_len = n;
                     self.out_pos = 0;
@@ -1056,7 +1164,12 @@ mod tests {
         let mut outs = Vec::new();
         for inline in [false, true] {
             let mut m = MtCtx::new();
-            m.init_frame(&p, cp, false, None, Some(data.len() as u64));
+            let fp = FrameParams {
+                checksum: true,
+                ..FrameParams::default()
+            };
+            m.init_frame(&p, cp, false, None, Some(data.len() as u64), fp)
+                .unwrap();
             if inline {
                 m.pool = Pool {
                     tx: None,
@@ -1070,5 +1183,113 @@ mod tests {
             outs.push(out);
         }
         assert_eq!(outs[0], outs[1]);
+    }
+
+    #[test]
+    fn frame_sizes_without_overflow() {
+        use super::super::params::{CParamMode, ldm_enabled};
+        const MB: usize = 1 << 20;
+        let unknown = u64::MAX;
+        // level 22, size unknown: windowLog 27, LDM on, 512 MiB jobs (on
+        // 32-bit targets too: ZSTDMT_JOBLOG_MAX is 29 there), the whole
+        // 128 MiB window as overlap
+        let cp22 = get_cparams_internal(22, unknown, 0, CParamMode::NoAttachDict);
+        assert!(ldm_enabled(&cp22));
+        let cp3 = get_cparams_internal(3, unknown, 0, CParamMode::NoAttachDict);
+        let mut p = MtParams::default();
+        p.set_workers(8);
+        let mut big = p;
+        big.set_job_size(usize::MAX); // clamped to ZSTDMT_JOBSIZE_MAX
+        assert_eq!(big.job_size, JOBSIZE_MAX);
+        big.set_job_size(512 * MB);
+        assert_eq!(big.job_size, 512 * MB);
+        let small = |workers: u32| {
+            let mut s = MtParams::default();
+            s.set_workers(workers);
+            s
+        };
+        // ordinary sizes, the same everywhere
+        assert_eq!(
+            FrameSizes::new(&small(4), &cp3, false),
+            Ok(FrameSizes {
+                target: 8 * MB,
+                prefix_size: 256 << 10,
+                out_cap: compress_bound(8 * MB),
+                ring_cap: 4 * 8 * MB + 3 * 8 * MB,
+            })
+        );
+        #[cfg(target_pointer_width = "64")]
+        {
+            // roundBuff.capacity = max(window, 8 jobs) + 3 jobs
+            let s = FrameSizes::new(&p, &cp22, true).unwrap();
+            assert_eq!((s.target, s.prefix_size), (512 * MB, 128 * MB));
+            assert_eq!(s.ring_cap, 11 * 512 * MB);
+            let s = FrameSizes::new(&big, &cp3, false).unwrap();
+            assert_eq!(s.ring_cap, 11 * 512 * MB);
+            assert_eq!(s.out_cap, compress_bound(512 * MB));
+            let s = FrameSizes::new(&small(NBWORKERS_MAX), &cp22, true).unwrap();
+            assert_eq!(s.ring_cap, (256 + 3) * 512 * MB);
+        }
+        #[cfg(target_pointer_width = "32")]
+        {
+            // 8 * 512 MiB overflows usize; 1 worker needs a 2 GiB round
+            // buffer, over isize::MAX
+            for workers in [1, 4, 5, 8, NBWORKERS_MAX] {
+                assert_eq!(
+                    FrameSizes::new(&small(workers), &cp22, true),
+                    Err(Error::MemoryAllocation)
+                );
+                let mut b = big;
+                b.set_workers(workers);
+                assert_eq!(
+                    FrameSizes::new(&b, &cp3, false),
+                    Err(Error::MemoryAllocation)
+                );
+            }
+            // the largest that fits: 256 MiB jobs, 4 workers: 7 * 256 MiB
+            let mut b = small(4);
+            b.set_job_size(256 * MB);
+            let s = FrameSizes::new(&b, &cp3, false).unwrap();
+            assert_eq!(s.ring_cap, 7 * 256 * MB);
+            b.set_workers(5);
+            assert_eq!(
+                FrameSizes::new(&b, &cp3, false),
+                Err(Error::MemoryAllocation)
+            );
+        }
+    }
+
+    // The whole path on 32-bit targets: an error before any allocation or
+    // thread, from every API, and the context still works afterwards.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn large_jobs_fail_on_32_bit() {
+        let data = vec![7u8; JOBSIZE_MIN + 1];
+        let mut c = crate::Compressor::new(3);
+        c.set_workers(8);
+        c.set_job_size(512 << 20);
+        assert_eq!(c.compress(&data), Err(Error::MemoryAllocation));
+        let mut dst = vec![0u8; compress_bound(data.len())];
+        assert_eq!(
+            c.compress_to_slice(&data, &mut dst),
+            Err(Error::MemoryAllocation)
+        );
+        c.set_job_size(0);
+        assert_eq!(
+            crate::decompress(&c.compress(&data).unwrap()).unwrap(),
+            data
+        );
+
+        let mut e = crate::StreamEncoder::new(22);
+        e.set_workers(8).unwrap();
+        let mut out = vec![0u8; 1 << 16];
+        assert_eq!(
+            e.compress(&data, &mut out, EndOp::Continue),
+            Err(Error::MemoryAllocation)
+        );
+        let mut w = crate::Encoder::new(Vec::new(), 22);
+        w.set_workers(8).unwrap();
+        let err = std::io::Write::write_all(&mut w, &data).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::OutOfMemory);
     }
 }

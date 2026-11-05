@@ -77,6 +77,10 @@ struct Params {
     overlap_log: u32,
     window_log: u32,
     ldm: bool,
+    /// `ZSTD_c_checksumFlag`, `ZSTD_c_contentSizeFlag`, `ZSTD_c_dictIDFlag`
+    checksum: bool,
+    content_size: bool,
+    dict_id: bool,
 }
 
 impl Params {
@@ -88,6 +92,9 @@ impl Params {
             overlap_log,
             window_log: 0,
             ldm: false,
+            checksum: false,
+            content_size: true,
+            dict_id: true,
         }
     }
 }
@@ -104,6 +111,11 @@ fn set_c(c: &mut CCtx<'_>, p: &Params) {
         .unwrap();
     c.set_parameter(CParameter::EnableLongDistanceMatching(p.ldm))
         .unwrap();
+    c.set_parameter(CParameter::ChecksumFlag(p.checksum))
+        .unwrap();
+    c.set_parameter(CParameter::ContentSizeFlag(p.content_size))
+        .unwrap();
+    c.set_parameter(CParameter::DictIdFlag(p.dict_id)).unwrap();
 }
 
 fn set_native(e: &mut StreamEncoder, p: &Params) {
@@ -113,6 +125,9 @@ fn set_native(e: &mut StreamEncoder, p: &Params) {
     e.set_overlap_log(p.overlap_log);
     e.set_window_log(p.window_log);
     e.set_long_distance_matching(p.ldm);
+    e.set_checksum(p.checksum).unwrap();
+    e.set_content_size_flag(p.content_size).unwrap();
+    e.set_dict_id_flag(p.dict_id).unwrap();
 }
 
 fn c_context(dict: Dict<'_>) -> CCtx<'static> {
@@ -333,6 +348,9 @@ fn native_compressor(p: &Params, dict: Dict<'_>) -> Compressor {
     c.set_workers(p.workers);
     c.set_job_size(p.job_size);
     c.set_overlap_log(p.overlap_log);
+    c.set_checksum(p.checksum);
+    c.set_content_size_flag(p.content_size);
+    c.set_dict_id_flag(p.dict_id);
     assert!(p.window_log == 0 && !p.ldm, "not settable on a Compressor");
     c
 }
@@ -795,7 +813,8 @@ fn abandoned_frames() {
 }
 
 // libzstd's level-22 multithreaded context (round buffer of window + jobs)
-// does not fit a 32-bit address space: "Allocation error: not enough memory".
+// does not fit a 32-bit address space: "Allocation error : not enough
+// memory". Both encoders fail there (the 32-bit version of this test below).
 #[cfg(target_pointer_width = "64")]
 #[test]
 fn level22_automatic_ldm() {
@@ -804,4 +823,167 @@ fn level22_automatic_ldm() {
     let data = input(1_200_000, MB, 14);
     let f = Frame::streamed(Params::new(22, 2, 0, 0), data.len(), 300_000, 0);
     check("level 22", std::slice::from_ref(&f), &data, Dict::None);
+}
+
+// On 32-bit targets the same frame fails in both: libzstd's round buffer
+// (max(window, 2 jobs) + 3 jobs of slack = 2.5 GiB) can't be allocated
+// (`memory_allocation`), and zstd-native returns
+// `Error::MemoryAllocation` before allocating anything.
+#[cfg(target_pointer_width = "32")]
+#[test]
+fn level22_automatic_ldm() {
+    let data = input(1_200_000, MB, 14);
+    let p = Params::new(22, 2, 0, 0);
+    let mut out = vec![0u8; 1 << 16];
+
+    let mut c = c_context(Dict::None);
+    set_c(&mut c, &p);
+    let mut ob = OutBuffer::around(&mut out[..]);
+    let mut ib = InBuffer::around(&data[..300_000]);
+    let r = c.compress_stream2(&mut ob, &mut ib, ZSTD_EndDirective::ZSTD_e_continue);
+    let err = r.expect_err("libzstd allocates its round buffer");
+    assert_eq!(
+        zstd::zstd_safe::get_error_name(err),
+        "Allocation error : not enough memory"
+    );
+
+    let mut e = StreamEncoder::new(3);
+    set_native(&mut e, &p);
+    assert_eq!(
+        e.compress(&data[..300_000], &mut out, EndOp::Continue),
+        Err(zstd_native::Error::MemoryAllocation)
+    );
+}
+
+/// With the content checksum (`ZSTD_c_checksumFlag`), which the
+/// multithreaded context computes as it takes the input and writes after
+/// the last job (a single job writes its own), and without the content
+/// size or dictionary ID in the header.
+#[test]
+fn frame_flags() {
+    let data = input(5 * MB, 2 * MB, 13);
+    let job = 512 * KB;
+    let flags = |mut p: Params, checksum: bool, content_size: bool, dict_id: bool| {
+        p.checksum = checksum;
+        p.content_size = content_size;
+        p.dict_id = dict_id;
+        p
+    };
+    // one-shot: several jobs, one job (the automatic job size), single-threaded
+    // (512 KiB or less); every strategy
+    let levels = [-3, 1, 3, 5, 7, 12, 16, 19];
+    for (i, &level) in levels.iter().enumerate() {
+        let n = if level >= 16 { 1_200_000 } else { 3 * MB + 7 };
+        let workers = [1, 2, 3, 4][i % 4];
+        let p = flags(Params::new(level, workers, job, 0), true, i % 2 == 0, true);
+        check_one_shot("checksum", &p, &data[..n], Dict::None, i % 3 == 0);
+        let p = flags(Params::new(level, workers, 0, 0), true, true, true);
+        check_one_shot("checksum one job", &p, &data[..n], Dict::None, false);
+        check_one_shot("checksum small", &p, &data[..job], Dict::None, false);
+    }
+    // streaming
+    let s = Frame::streamed;
+    let p = |level, workers| flags(Params::new(level, workers, job, 0), true, true, true);
+    let mut small_out = s(p(5, 2), 2 * MB, 65_536, 5);
+    small_out.out_size = 3;
+    let mut pledged = s(
+        flags(Params::new(3, 3, job, 0), true, false, true),
+        2 * MB,
+        100_000,
+        3,
+    );
+    pledged.pledged = Some(2 * MB as u64);
+    let frames = [
+        s(p(3, 2), 3 * MB, 100_000, 0),
+        s(p(1, 3), 2 * MB, 7_777, 40),
+        s(p(6, 2), 2 * MB + 5, 300_001, 2),
+        s(p(12, 4), 1_500_000, 1 << 20, 1),
+        // one job (the automatic job size)
+        s(
+            flags(Params::new(3, 2, 0, 0), true, true, true),
+            3 * MB,
+            MB,
+            0,
+        ),
+        // input ending exactly at job boundaries: a last empty block
+        s(p(4, 2), 3 * job, job, 0),
+        s(p(4, 2), 2 * job, 2 * job, 0),
+        // a flush right before the end
+        s(p(4, 2), 2 * job, job, 2),
+        small_out,
+        pledged,
+        // empty frames, and tiny ones
+        s(p(3, 2), 0, 1, 0),
+        s(p(3, 2), 5, 1, 0),
+    ];
+    for f in &frames {
+        let n = f.total();
+        check(
+            "checksum streaming",
+            std::slice::from_ref(f),
+            &data[..n],
+            Dict::None,
+        );
+    }
+    // several frames on one context, the flag switched
+    let mut fr = Vec::new();
+    for k in 0..5 {
+        let n = [2 * MB, 100, 3 * job, 0, MB + 1][k];
+        fr.push(s(
+            flags(Params::new(3, 2, job, 0), k % 2 == 0, k != 2, true),
+            n,
+            200_000,
+            3,
+        ));
+    }
+    check("checksum frames", &fr, &data, Dict::None);
+    // dictionaries, without their IDs
+    let d = trained(32 * KB);
+    for (i, level) in [1, 4, 16].into_iter().enumerate() {
+        let n = if level >= 16 { 1_100_000 } else { 2 * MB };
+        let dict = if i % 2 == 0 {
+            Dict::Loaded(&d)
+        } else {
+            Dict::Prepared(&d, level)
+        };
+        for dict_id in [true, false] {
+            let p = flags(Params::new(level, 2, job, 0), true, true, dict_id);
+            check_one_shot("checksum dict", &p, &data[..n], dict, false);
+            let f = Frame::streamed(p, n, 150_000, 4);
+            check("checksum dict", std::slice::from_ref(&f), &data[..n], dict);
+        }
+    }
+    // long distance matching (the serial step)
+    for (level, workers) in [(3, 2), (16, 3)] {
+        let mut p = flags(Params::new(level, workers, job, 0), true, true, true);
+        p.window_log = 20;
+        p.ldm = true;
+        let n = if level >= 16 { 2 * MB } else { 5 * MB };
+        let f = Frame::streamed(p, n, 400_000, 0);
+        check(
+            "checksum ldm",
+            std::slice::from_ref(&f),
+            &data[..n],
+            Dict::None,
+        );
+    }
+    // the io::Write encoder
+    let mut want = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
+    want.multithread(3).unwrap();
+    want.include_checksum(true).unwrap();
+    let mut got = zstd_native::Encoder::new(Vec::new(), 3);
+    got.set_workers(3).unwrap();
+    got.set_checksum(true).unwrap();
+    for (k, piece) in data.chunks(100_000).enumerate() {
+        want.write_all(piece).unwrap();
+        got.write_all(piece).unwrap();
+        if k % 13 == 5 {
+            want.flush().unwrap();
+            got.flush().unwrap();
+        }
+    }
+    let want = want.finish().unwrap();
+    let got = got.finish().unwrap();
+    compare("Encoder checksum", &got, &want);
+    assert!(zstd_native::decompress(&got).unwrap() == data);
 }

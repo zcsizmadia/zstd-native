@@ -129,11 +129,29 @@ impl BlockDecoder {
         self.ent.fse_ok = true;
         let tables = &self.ent.seq;
         let mut rep = self.ent.rep.map(|r| r as usize);
+        // A block regenerates at most `block_max` bytes (the format's
+        // Block_Maximum_Size). libzstd's one-shot decoder, given the room,
+        // puts the literals `block_max + WILDCOPY_OVERLENGTH` after the
+        // block and stops the sequences there; its streaming stages decode
+        // into a `block_max` buffer. Bound the sequences the same way
+        // whatever the output space, so a slice and a growing `Vec` (which
+        // reserves `block_max` per block) agree. The slack keeps valid
+        // blocks on the fast (wildcopy) path.
+        let cap = out.cap;
+        let limit = out.pos.saturating_add(block_max + WILDCOPY_OVERLENGTH);
+        let start = out.pos;
+        out.cap = cap.min(limit);
         let res = run_sequences(
             self.cpu, tables, &mut rep, seq_src, nb_seq, &lits, out, prefix, dict,
         );
+        out.cap = cap;
         self.ent.rep = rep.map(|r| r as u32);
-        res
+        match res {
+            // The limit, not the output space, stopped it.
+            Err(Error::OutputTooSmall) if limit <= cap => Err(Error::Corrupted),
+            Ok(()) if out.pos - start > block_max => Err(Error::Corrupted),
+            res => res,
+        }
     }
 
     /// Literals section (libzstd's `ZSTD_decodeLiteralsBlock`). Returns the
@@ -563,12 +581,18 @@ mod copy {
                 *(*o).add(3) = *(*m).add(3);
                 *m = (*m).add(DEC32[offset]);
                 ptr::copy_nonoverlapping(*m, (*o).add(4), 4);
-                *m = (*m).sub(sub2);
+                // `- sub2` can point before the start of the output (it is
+                // undone by the `+ 8` below: the net move `dec32 + 8 - dec64`
+                // is never negative). Wrapping arithmetic keeps that
+                // well-defined (an in-bounds `sub` there is undefined, which
+                // Miri reports); it compiles to the same code.
+                *m = (*m).wrapping_sub(sub2);
             } else {
                 copy8(*o, *m);
             }
-            *m = (*m).add(8);
+            *m = (*m).wrapping_add(8);
             *o = (*o).add(8);
+            debug_assert!(*o as usize - *m as usize >= 8);
         }
     }
 }
