@@ -453,8 +453,10 @@ fn auto_level22_streaming() {
 }
 
 /// Level 22 one-shot on more than 64 MiB: LDM on by itself, finding the
-/// copies far back (about 1.5 GiB of memory for both encoders).
+/// copies far back (about 1.5 GiB of memory for both encoders: 64-bit only,
+/// as a 32-bit process runs out of address space next to the other tests).
 #[test]
+#[cfg(target_pointer_width = "64")]
 fn auto_level22_one_shot_large() {
     let n = (64 << 20) + 100_000;
     // repeats of up to 48 MiB back: beyond the optimal parser's reach
