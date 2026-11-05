@@ -40,6 +40,48 @@ pub(crate) const ROW_HASH_TAG_BITS: u32 = 8;
 /// `ZSTD_ROW_HASH_MAX_ENTRIES`.
 const ROW_HASH_MAX_ENTRIES: usize = 64;
 
+/// `matchBuffer` of `ZSTD_RowFindBestMatch()`: the candidates of one row
+/// search, uninitialized beyond `len` like libzstd's (rather than zeroing
+/// its 256 bytes on every search) and filled without bounds checks.
+struct MatchBuffer {
+    buf: [core::mem::MaybeUninit<u32>; ROW_HASH_MAX_ENTRIES],
+    len: usize,
+}
+
+impl MatchBuffer {
+    #[inline(always)]
+    fn new() -> Self {
+        MatchBuffer {
+            buf: [core::mem::MaybeUninit::uninit(); ROW_HASH_MAX_ENTRIES],
+            len: 0,
+        }
+    }
+
+    /// Appends a candidate.
+    ///
+    /// # Safety
+    /// At most [`ROW_HASH_MAX_ENTRIES`] pushes: the searches push at most
+    /// `nbAttempts <= 1 << rowLog <= 64` candidates.
+    #[allow(unsafe_code)]
+    #[inline(always)]
+    unsafe fn push(&mut self, v: u32) {
+        debug_assert!(self.len < ROW_HASH_MAX_ENTRIES);
+        // SAFETY: `len < ROW_HASH_MAX_ENTRIES` per the caller.
+        unsafe { self.buf.get_unchecked_mut(self.len).write(v) };
+        self.len += 1;
+    }
+
+    /// The candidates pushed so far.
+    #[allow(unsafe_code)]
+    #[inline(always)]
+    fn as_slice(&self) -> &[u32] {
+        debug_assert!(self.len <= ROW_HASH_MAX_ENTRIES);
+        // SAFETY: the first `len <= ROW_HASH_MAX_ENTRIES` entries were
+        // written by `push`; `MaybeUninit<u32>` has `u32`'s layout.
+        unsafe { core::slice::from_raw_parts(self.buf.as_ptr().cast::<u32>(), self.len) }
+    }
+}
+
 /// `ZSTD_hashPtrSalted()` for `mls` 4 to 6 (5 and 6 read 8 bytes).
 ///
 /// # Safety
@@ -64,6 +106,14 @@ pub(crate) unsafe fn hash_salted<const MLS: u32>(p: *const u8, h_bits: u32, salt
     }
 }
 
+/// The slot after `head` in a row (cycling backwards through
+/// `1..rowEntries`): [`row_next_index`] without the table access.
+#[inline(always)]
+fn next_index(head: u32, row_mask: u32) -> u32 {
+    let next = head.wrapping_sub(1) & row_mask;
+    next + if next == 0 { row_mask } else { 0 } // skip first position
+}
+
 /// `ZSTD_row_nextIndex()`: the next slot to write in a row (cycling
 /// backwards through `1..rowEntries`), stored as the row's new head.
 ///
@@ -74,8 +124,7 @@ pub(crate) unsafe fn hash_salted<const MLS: u32>(p: *const u8, h_bits: u32, salt
 unsafe fn row_next_index(tag_row: *mut u8, row_mask: u32) -> u32 {
     // SAFETY: per the caller.
     unsafe {
-        let mut next = u32::from((*tag_row).wrapping_sub(1)) & row_mask;
-        next += if next == 0 { row_mask } else { 0 }; // skip first position
+        let next = next_index(u32::from(*tag_row), row_mask);
         *tag_row = next as u8;
         next
     }
@@ -161,6 +210,14 @@ unsafe fn update_internal_impl<const MLS: u32, const ROW_LOG: u32>(
     end: u32,
 ) {
     let row_mask = (1u32 << ROW_LOG) - 1;
+    // The row written last and its new head. When consecutive positions
+    // share a row (runs and short periods in repetitive data), its head is
+    // taken from here instead of being read back from the tag table: that
+    // read would wait for the previous iteration's store (store-to-load
+    // forwarding on the loop's dependency chain), which made level 5 up to
+    // 30% slower on such inputs, depending on code placement.
+    let mut last_row = usize::MAX;
+    let mut last_head = 0u32;
     for idx in start..end {
         // SAFETY: per the caller; the row (from a hash of `rowHashLog + 8`
         // bits) is within the tables of `1 << (rowHashLog + rowLog)`
@@ -173,9 +230,18 @@ unsafe fn update_internal_impl<const MLS: u32, const ROW_LOG: u32>(
             );
             let rel_row = ((hash >> ROW_HASH_TAG_BITS) << ROW_LOG) as usize;
             let tag_row = s.tag_table.add(rel_row);
-            let pos = row_next_index(tag_row, row_mask) as usize;
-            *tag_row.add(pos) = hash as u8;
-            *s.hash_table.add(rel_row + pos) = idx;
+            let head = if rel_row == last_row {
+                debug_assert_eq!(u32::from(*tag_row), last_head);
+                last_head
+            } else {
+                u32::from(*tag_row)
+            };
+            let pos = next_index(head, row_mask);
+            *tag_row = pos as u8;
+            *tag_row.add(pos as usize) = hash as u8;
+            *s.hash_table.add(rel_row + pos as usize) = idx;
+            last_row = rel_row;
+            last_head = pos;
         }
     }
 }
@@ -305,7 +371,7 @@ unsafe fn match_bits_swar<const ROW_LOG: u32>(tag_row: *const u8, tag: u8) -> u6
 /// the `lazy` module docs); the hash cache holds the hashes from
 /// `nextToUpdate`.
 #[allow(unsafe_code)]
-#[inline(never)]
+#[inline(always)]
 pub(super) unsafe fn row_find_best_match<
     const MLS: u32,
     const ROW_LOG: u32,
@@ -365,8 +431,7 @@ pub(super) unsafe fn row_find_best_match<
         let row = s.hash_table.add(rel_row);
         let tag_row = s.tag_table.add(rel_row);
         let head = u32::from(*tag_row) & row_mask;
-        let mut match_buffer = [0u32; ROW_HASH_MAX_ENTRIES];
-        let mut num_matches = 0usize;
+        let mut match_buffer = MatchBuffer::new();
         let mut matches = match_mask::<ROW_LOG>(tag_row, tag, head);
 
         // Cycle through the matches and prefetch
@@ -385,8 +450,7 @@ pub(super) unsafe fn row_find_best_match<
             } else {
                 prefetch_l1(s.pos(match_index));
             }
-            match_buffer[num_matches] = match_index;
-            num_matches += 1;
+            match_buffer.push(match_index);
             nb_attempts -= 1;
         }
 
@@ -401,7 +465,7 @@ pub(super) unsafe fn row_find_best_match<
         }
 
         // Return the longest match
-        for &match_index in &match_buffer[..num_matches] {
+        for &match_index in match_buffer.as_slice() {
             let mut current_ml = 0;
             debug_assert!(match_index < curr && match_index >= low_limit);
             if !EXT || match_index >= s.dict_limit {
@@ -437,8 +501,7 @@ pub(super) unsafe fn row_find_best_match<
             let dms_row = d.hash_table.add(dms_rel_row);
             let dms_tag_row = d.tag_table.add(dms_rel_row);
             let head = u32::from(*dms_tag_row) & row_mask;
-            let mut match_buffer = [0u32; ROW_HASH_MAX_ENTRIES];
-            let mut num_matches = 0usize;
+            let mut match_buffer = MatchBuffer::new();
             let mut matches = match_mask::<ROW_LOG>(dms_tag_row, dms_tag, head);
 
             while matches > 0 && nb_attempts > 0 {
@@ -452,13 +515,12 @@ pub(super) unsafe fn row_find_best_match<
                     break;
                 }
                 prefetch_l1(dms_base.wrapping_add(match_index as usize));
-                match_buffer[num_matches] = match_index;
-                num_matches += 1;
+                match_buffer.push(match_index);
                 nb_attempts -= 1;
             }
 
             // Return the longest match
-            for &match_index in &match_buffer[..num_matches] {
+            for &match_index in match_buffer.as_slice() {
                 let mut current_ml = 0;
                 debug_assert!(match_index >= dms_lowest_index);
                 let m = dms_base.wrapping_add(match_index as usize);

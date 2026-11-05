@@ -42,9 +42,12 @@ On this Windows machine, cargo is in `~/.cargo/bin` (not on PATH in Bash).
   `enc/block_asm.rs` (asm! block loops of `fast` and `dfast`), the
   encoder's bit writers (`enc/bitwriter.rs`, `enc/huf_enc.rs`: 8-byte
   flushes) and its run-time dispatch to `#[target_feature]` loops
-  (`enc/seq_store.rs`), the output writes in `decoder.rs`, and the
-  `align_hot_loop!` macro in `lib.rs` (an `asm!` alignment directive
-  before the hot loops). New `unsafe` needs a benchmark showing the gain.
+  (`enc/seq_store.rs`, the BMI2 lazy parsers and searches in
+  `enc/lazy.rs`), the `madvise` syscall that puts large match finder
+  tables on huge pages (`enc/table.rs`), the output writes in
+  `decoder.rs`, and the `align_hot_loop!` macro in `lib.rs` (an `asm!`
+  alignment directive before the hot loops). New `unsafe` needs a
+  benchmark showing the gain.
 - CPU-specific code goes behind run-time detection (`cpu.rs`), compiled
   with `#[target_feature]` (BMI2 today), with the generic version selected
   by the `portable` feature for testing.
