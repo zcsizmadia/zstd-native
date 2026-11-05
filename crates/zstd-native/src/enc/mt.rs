@@ -73,6 +73,8 @@ pub(crate) const JOBSIZE_MAX: usize = if usize::BITS == 32 {
 pub(crate) const NBWORKERS_MAX: u32 = if usize::BITS == 32 { 64 } else { 256 };
 /// A job is compressed in chunks of this size (`4 * ZSTD_BLOCKSIZE_MAX`).
 const CHUNK_SIZE: usize = 4 * BLOCKSIZE_MAX;
+/// The job input the larger job table may hold (see [`job_table_size`]).
+const RUN_AHEAD_BYTES: usize = 256 << 20;
 /// Bytes after the LDM copy of the round buffer, never in its window.
 const RING_SLACK: usize = 64;
 /// The room before a job's data in its input buffer, to place it at an
@@ -140,6 +142,25 @@ fn target_job_log(cp: &CParams, ldm: bool) -> u32 {
         20.max(cp.window_log + 2)
     };
     job_log.min(JOBLOG_MAX)
+}
+
+/// How many jobs may be posted and not yet written out: libzstd's job
+/// table (`ZSTDMT_createJobsTable(nbWorkers + 2)`, the power of 2 above
+/// `nbWorkers + 2`), or, with 8 workers or more, the power of 2 at or
+/// above `2 * nbWorkers + 2` if that holds at most [`RUN_AHEAD_BYTES`] of
+/// job input. Jobs are written out in order, so while the oldest job runs
+/// the later ones finish and wait in the table; with only `nbWorkers + 2`
+/// entries the queue then runs dry and workers idle (jobs of 2 to 8 MiB,
+/// levels 1 to 4, vary in duration with the data). With 4 workers the
+/// larger table measured 2-3% slower. The table size changes only the
+/// timing, never the output.
+fn job_table_size(workers: usize, target: usize) -> usize {
+    let table = 1 << ((workers + 2).ilog2() + 1);
+    if workers < 8 {
+        return table;
+    }
+    let deep = (2 * workers + 2).next_power_of_two();
+    table.max(deep.min(RUN_AHEAD_BYTES / target.max(1)))
 }
 
 /// `ZSTDMT_overlapLog_default()`.
@@ -757,8 +778,7 @@ impl MtCtx {
         self.pledged = pledged;
         self.xxh = fparams.checksum.then(Xxh64::new);
         self.trailer = None;
-        // ZSTDMT_createJobsTable(nbWorkers + 2)
-        self.max_jobs = 1 << ((workers as u32 + 2).ilog2() + 1);
+        self.max_jobs = job_table_size(workers, target);
         // a buffer per job of the table, plus the one being filled
         self.bufs
             .max_spare
@@ -1156,6 +1176,17 @@ mod tests {
         assert!(p.applies(None));
         assert!(!p.applies(Some(JOBSIZE_MIN as u64)));
         assert!(p.applies(Some(JOBSIZE_MIN as u64 + 1)));
+        // libzstd's job table, twice as large for small jobs
+        const MB: usize = 1 << 20;
+        assert_eq!(job_table_size(1, 2 * MB), 4);
+        assert_eq!(job_table_size(4, 2 * MB), 8);
+        assert_eq!(job_table_size(8, 2 * MB), 32);
+        assert_eq!(job_table_size(12, 2 * MB), 32);
+        assert_eq!(job_table_size(16, 2 * MB), 64);
+        assert_eq!(job_table_size(12, 8 * MB), 32);
+        assert_eq!(job_table_size(16, 8 * MB), 32);
+        assert_eq!(job_table_size(12, 32 * MB), 16);
+        assert_eq!(job_table_size(256, 2 * MB), 512);
     }
 
     #[test]
