@@ -171,7 +171,12 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
    table; byte-identical with libzstd, also forced on at every level
    (a hidden test hook). Not ported: the public LDM parameters
    (`ZSTD_c_enableLongDistanceMatching`, `ZSTD_c_ldm*`).
-   Next: speed (#17).
+   Speed (#17, #50, see BENCHMARK.md): at or above libzstd at every
+   level on one core of the EPYC host (Silesia geomean 1.04-1.05x at
+   levels 1-4, 1.01-1.16x at 5-15 against every C build, 1.30x at 19).
+   Remaining: the zstd C sources in 16 KB frames at levels 2 and 4
+   (0.97-0.98x; per-block table builds, the greedy parser); code
+   placement noise of ±1.5% in the encoder's hot loops.
 4. ~~Multithreaded compression~~ (done, #23, `enc/mt.rs`, with `std`): a
    port of `zstdmt_compress.c` and of how `ZSTD_compressStream2` drives it
    (`nbWorkers >= 1`; still single-threaded for known sizes up to 512
@@ -189,9 +194,12 @@ third_party/zstd/     zstd 1.5.7 source (reference only)
    decide the LDM window's segments) and gives the job external
    sequences. Byte-identical with libzstd for the same worker count, job
    size and overlap log: one-shot (`ZSTD_compress2`) and streaming,
-   every strategy, flushes, pledged sizes, dictionaries, LDM; on par with
-   libzstd's speed with 4-8 workers in first measurements (Windows
-   laptop), single-threaded speed unchanged. Not ported: `ZSTD_c_rsyncable`.
+   every strategy, flushes, pledged sizes, dictionaries, LDM. Speed
+   (#29): at or above libzstd with 1-16 workers at levels 1-19 on the
+   EPYC host (1.03-1.26x with 16 workers). The job input is placed 2 KiB
+   from the caller's input mod 4 KiB, which avoids glibc's 4K-aliasing
+   `memcpy` path. With 8+ workers the job table is twice libzstd's (up to
+   256 MiB of job input). Not ported: `ZSTD_c_rsyncable`.
    The frame parameters `ZSTD_c_checksumFlag`, `ZSTD_c_contentSizeFlag` and
    `ZSTD_c_dictIDFlag` are exposed (`set_checksum`, `set_content_size_flag`,
    `set_dict_id_flag` on `Compressor`, `StreamEncoder` and `Encoder`), in

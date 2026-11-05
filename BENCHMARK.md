@@ -4,6 +4,8 @@ zstd-native 0.1.0 (main `fecceab`) against C libzstd 1.5.7 and
 [structured-zstd](https://crates.io/crates/structured-zstd) 0.2.6, the
 fastest other pure-Rust zstd crate. [ruzstd](https://crates.io/crates/ruzstd)
 decompresses 3-7x slower than zstd-native, so it isn't in the tables.
+Later results against C (levels 1-15 and multithreading) are in
+[Since `fecceab`](#since-fecceab).
 
 ## Setup
 
@@ -49,6 +51,79 @@ level 3), in either direction.
 | Decompression, level 19 frames | 1.09x (1.05-1.13) | 1.29x (1.16-1.44) |
 
 The ranges in brackets are the slowest and fastest file.
+
+## Since `fecceab`
+
+The summary and per-file tables above and below were measured at
+`fecceab`. These later changes moved the numbers against C libzstd;
+structured-zstd wasn't measured again.
+
+### Levels 1-4
+
+No change to the code, but a more careful run (best of 2 paths × 2 reps,
+interleaved, CPU 16, main `5d6d676`, against the `zstd` crate) puts
+zstd-native at or above C on every Silesia file
+([#17](https://github.com/zcsizmadia/zstd-native/issues/17)):
+
+| | L1 | L2 | L3 | L4 |
+|---|---:|---:|---:|---:|
+| Silesia geomean vs libzstd | 1.04x | 1.05x | 1.05x | 1.04x |
+
+Below 1.00x: only the zstd C sources compressed in 16 KB frames, at L2
+(0.98x) and L4 (0.97x).
+
+### Levels 5-15 ([#53](https://github.com/zcsizmadia/zstd-native/pull/53))
+
+Three changes:
+- BMI2 builds of the lazy, row and btlazy2 parsers;
+- the row finder keeps its row head in a register;
+- match finder tables of 8 MiB and more go on transparent huge pages
+  (Linux x86-64).
+
+CPU 8, all 12 files, median over 3 copies of each binary, geomean,
+zstd-native's speed divided by each implementation's:
+
+| | `zstd` crate | libzstd, gcc -O3 | CLI clang | CLI gcc `-march=native` |
+|---|---:|---:|---:|---:|
+| L5 | 1.11x | 1.06x | 1.13x | 1.01x |
+| L7 | 1.10x | 1.06x | 1.13x | 1.01x |
+| L9 | 1.15x | 1.11x | 1.19x | 1.06x |
+| L11 | 1.09x | 1.06x | 1.15x | 1.07x |
+| L12 | 1.09x | 1.03x | 1.10x | 1.03x |
+| L15 | 1.16x | 1.14x | 1.15x | 1.13x |
+
+Single files below 1.00x:
+- against `-march=native`: nci at L5 (0.94x) and L7 (0.97x), dickens and
+  reymont at L5 (0.98-0.99x);
+- xml at L12 (0.98x).
+
+C gains as much from huge pages as zstd-native does, but only when the
+user opts in (`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`).
+
+### Multithreaded compression ([#52](https://github.com/zcsizmadia/zstd-native/pull/52))
+
+The fixes:
+- **Copy aliasing:** the calling thread's input copy no longer hits
+  glibc's 4K-aliasing `memcpy` path.
+- **Job table:** with 8+ workers, the job table is twice libzstd's.
+
+Silesia concatenated (211 MB), CPUs and memory of one socket, best of 2,
+MiB/s. Each cell is zstd-native / libzstd (ratio):
+
+| | One-shot | Streaming (128 KB writes) |
+|---|---|---|
+| L1, 4 workers | 1678 / 1503 (1.12x) | 1342 / 1318 (1.02x) |
+| L1, 8 workers | 3181 / 2810 (1.13x) | 1970 / 1763 (1.12x) |
+| L1, 16 workers | 5614 / 4519 (1.24x) | 2142 / 1847 (1.16x) |
+| L3, 8 workers | 1491 / 1318 (1.13x) | 1226 / 1014 (1.21x) |
+| L3, 16 workers | 2240 / 1780 (1.26x) | 1166 / 997 (1.17x) |
+| L9, 8 workers | 302 / 288 (1.05x) | 280 / 263 (1.06x) |
+| L9, 16 workers | 505 / 492 (1.03x) | 403 / 389 (1.03x) |
+| L19, 8 workers | 14.5 / 11.8 (1.23x) | 14.4 / 11.6 (1.24x) |
+| L19, 16 workers | 15.5 / 12.6 (1.23x) | 15.5 / 12.7 (1.22x) |
+
+Below 1.00x: streaming with 4 workers at L3 (0.98x) and L9 (0.99x),
+within run-to-run noise. The full 1-16 worker matrix is in #52.
 
 ## Per file
 
@@ -249,15 +324,15 @@ output at that level, so their compression ratio differs.
 - **Bindings** to C libzstd (Python, zstd-jni, DataDog/zstd for Go) run at
   C's speed, minus the cost of calling across the language boundary.
 
-**Where C is faster:**
-- **Level 11:** gcc-built libzstd is 2% faster, with single files at
-  0.96-1.00x.
-- **Levels 7 and 9:** a build with `-march=native` for this exact CPU is
+**Where C was faster at `fecceab`:**
+- **Level 11:** gcc-built libzstd was 2% faster.
+- **Levels 7 and 9:** a build with `-march=native` for this exact CPU was
   1-2% faster.
-- **Level 3:** it's even.
 
-The lazy and row match finders (levels 5-15) are where more work could
-close this gap.
+Both gaps are closed by
+[#53](https://github.com/zcsizmadia/zstd-native/pull/53) (see
+[Since `fecceab`](#since-fecceab)). This table is a one-time snapshot:
+the other implementations aren't re-measured routinely.
 
 ## Not measured yet
 
@@ -265,6 +340,6 @@ close this gap.
   fallbacks run. CI tests them on Linux and macOS arm64, but speed hasn't
   been measured ([#14](https://github.com/zcsizmadia/zstd-native/issues/14)).
 - **Intel.** Changes were checked main-vs-branch on an i7-12800H laptop
-  (never slower, often faster), but there's no full Intel table yet.
-- **Multithreaded compression** at many workers
-  ([#29](https://github.com/zcsizmadia/zstd-native/issues/29)).
+  (never slower, often faster), but there's no full Intel table yet
+  ([#47](https://github.com/zcsizmadia/zstd-native/issues/47)). The BMI2
+  choices and the huge-page threshold of #53 were tuned on Zen 3 only.
