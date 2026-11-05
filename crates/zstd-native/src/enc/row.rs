@@ -106,6 +106,14 @@ pub(crate) unsafe fn hash_salted<const MLS: u32>(p: *const u8, h_bits: u32, salt
     }
 }
 
+/// The slot after `head` in a row (cycling backwards through
+/// `1..rowEntries`): [`row_next_index`] without the table access.
+#[inline(always)]
+fn next_index(head: u32, row_mask: u32) -> u32 {
+    let next = head.wrapping_sub(1) & row_mask;
+    next + if next == 0 { row_mask } else { 0 } // skip first position
+}
+
 /// `ZSTD_row_nextIndex()`: the next slot to write in a row (cycling
 /// backwards through `1..rowEntries`), stored as the row's new head.
 ///
@@ -116,8 +124,7 @@ pub(crate) unsafe fn hash_salted<const MLS: u32>(p: *const u8, h_bits: u32, salt
 unsafe fn row_next_index(tag_row: *mut u8, row_mask: u32) -> u32 {
     // SAFETY: per the caller.
     unsafe {
-        let mut next = u32::from((*tag_row).wrapping_sub(1)) & row_mask;
-        next += if next == 0 { row_mask } else { 0 }; // skip first position
+        let next = next_index(u32::from(*tag_row), row_mask);
         *tag_row = next as u8;
         next
     }
@@ -203,6 +210,14 @@ unsafe fn update_internal_impl<const MLS: u32, const ROW_LOG: u32>(
     end: u32,
 ) {
     let row_mask = (1u32 << ROW_LOG) - 1;
+    // The row written last and its new head. When consecutive positions
+    // share a row (runs and short periods in repetitive data), its head is
+    // taken from here instead of being read back from the tag table: that
+    // read would wait for the previous iteration's store (store-to-load
+    // forwarding on the loop's dependency chain), which made level 5 up to
+    // 30% slower on such inputs, depending on code placement.
+    let mut last_row = usize::MAX;
+    let mut last_head = 0u32;
     for idx in start..end {
         // SAFETY: per the caller; the row (from a hash of `rowHashLog + 8`
         // bits) is within the tables of `1 << (rowHashLog + rowLog)`
@@ -215,9 +230,18 @@ unsafe fn update_internal_impl<const MLS: u32, const ROW_LOG: u32>(
             );
             let rel_row = ((hash >> ROW_HASH_TAG_BITS) << ROW_LOG) as usize;
             let tag_row = s.tag_table.add(rel_row);
-            let pos = row_next_index(tag_row, row_mask) as usize;
-            *tag_row.add(pos) = hash as u8;
-            *s.hash_table.add(rel_row + pos) = idx;
+            let head = if rel_row == last_row {
+                debug_assert_eq!(u32::from(*tag_row), last_head);
+                last_head
+            } else {
+                u32::from(*tag_row)
+            };
+            let pos = next_index(head, row_mask);
+            *tag_row = pos as u8;
+            *tag_row.add(pos as usize) = hash as u8;
+            *s.hash_table.add(rel_row + pos as usize) = idx;
+            last_row = rel_row;
+            last_head = pos;
         }
     }
 }
