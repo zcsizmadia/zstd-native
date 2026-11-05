@@ -42,7 +42,8 @@ On this Windows machine, cargo is in `~/.cargo/bin` (not on PATH in Bash).
   `enc/block_asm.rs` (asm! block loops of `fast` and `dfast`), the
   encoder's bit writers (`enc/bitwriter.rs`, `enc/huf_enc.rs`: 8-byte
   flushes) and its run-time dispatch to `#[target_feature]` loops
-  (`enc/seq_store.rs`), the output writes in `decoder.rs`, and the
+  (`enc/seq_store.rs`, the BMI2 lazy parsers and searches in
+  `enc/lazy.rs`), the output writes in `decoder.rs`, and the
   `align_hot_loop!` macro in `lib.rs` (an `asm!` alignment directive
   before the hot loops). New `unsafe` needs a benchmark showing the gain.
 - CPU-specific code goes behind run-time detection (`cpu.rs`), compiled
