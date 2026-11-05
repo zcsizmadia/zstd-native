@@ -42,6 +42,10 @@ compressed input.
   - x86-64 assembly for the Huffman decoding loops and for the level 1-4
     match finders
   - BMI2 code paths, selected at run time
+  - on Linux x86-64, match finder tables of 8 MiB and more on
+    transparent huge pages (`madvise`)
+  - multithreaded compression at or above libzstd's speed with 1-16
+    workers
   - the `portable` feature turns all of these off, to test the fallbacks
 - **Fuzzing:** cargo-fuzz targets differential against libzstd (`fuzz/`)
 - **CI:**

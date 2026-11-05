@@ -42,21 +42,27 @@ risk. Sibling of [xz-native](https://github.com/zcsizmadia/xz-native).
 
   | zstd-native speed (1.25x = 25% faster) | vs C libzstd 1.5.7 | vs [structured-zstd](https://crates.io/crates/structured-zstd) 0.2.6 |
   |---|---:|---:|
-  | Compression, level 1 | 1.02x | 1.06x |
-  | Compression, level 3 (default) | 1.00x | 1.33x |
-  | Compression, level 9 | 1.03x | 1.18x |
+  | Compression, level 1 | 1.04x | 1.06x |
+  | Compression, level 3 (default) | 1.05x | 1.33x |
+  | Compression, level 9 | 1.15x | 1.18x |
   | Compression, level 19 | 1.30x | 1.11x |
   | Decompression (frames of levels 1-19) | 1.05-1.09x | 1.20-1.29x |
+  | Compression, 16 threads (levels 1-19) | 1.03-1.26x | |
 
-  structured-zstd is the fastest other pure-Rust zstd. Its compressed
-  output differs from libzstd's. [ruzstd](https://crates.io/crates/ruzstd)
-  decompresses 3-7x slower than zstd-native.
+  The structured-zstd column was measured before the latest speedups
+  (level 9 has gained about 10% since). structured-zstd is the fastest
+  other pure-Rust zstd, and its compressed output differs from libzstd's.
+  [ruzstd](https://crates.io/crates/ruzstd) decompresses 3-7x slower than
+  zstd-native.
 
   Against every C libzstd 1.5.7 build, including upstream's own gcc and
   clang builds and `-march=native`:
   - **Decompression:** zstd-native is 1.05-1.09x faster at levels 1-19.
-  - **Compression:** it is the fastest at levels 1 and 19, and on par with
-    C libzstd at levels 3-11, within ±2%.
+  - **Compression:** it is 1.01-1.16x faster at levels 5-15 and 1.15x or
+    more at level 19. At levels 1-4 it is 1.04-1.05x faster than the
+    `zstd` crate's build.
+  - **Multithreaded:** it is 1.03-1.26x faster with 16 workers, one-shot
+    or streaming.
 
   Ports in other languages (Go, C#, Java, JavaScript) are slower at every
   level. They were measured once, as recorded in
