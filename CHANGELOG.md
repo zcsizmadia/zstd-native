@@ -35,6 +35,8 @@ compressed input.
     `ZSTD_CDict`), attached, copied or reloaded as libzstd decides
   - long distance matching
   - multithreaded compression (`set_workers`)
+  - frame options: content checksum, content size and dictionary ID
+    (`set_checksum`, `set_content_size_flag`, `set_dict_id_flag`)
 - **`no_std` + `alloc`**, with the `std` feature on by default
 - **Speed:** at or above libzstd's speed on one core (see BENCHMARK.md)
   - x86-64 assembly for the Huffman decoding loops and for the level 1-4

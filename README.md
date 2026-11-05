@@ -118,6 +118,18 @@ c.set_workers(4);
 let compressed = c.compress(&large_input)?;
 ```
 
+Frame options follow libzstd's defaults, and can be changed on
+`Compressor`, `StreamEncoder` and `Encoder`:
+- the content checksum is off by default (`ZSTD_c_checksumFlag`);
+- the content size and the dictionary ID are written (`ZSTD_c_contentSizeFlag`,
+  `ZSTD_c_dictIDFlag`).
+
+```rust
+let mut c = zstd_native::Compressor::new(3);
+c.set_checksum(true); // like `zstd` the CLI, which writes one
+let compressed = c.compress(&data)?;
+```
+
 Without `std`, the push-style
 [`StreamDecoder`](https://docs.rs/zstd-native/latest/zstd_native/struct.StreamDecoder.html)
 and
