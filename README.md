@@ -52,18 +52,15 @@ risk. Sibling of [xz-native](https://github.com/zcsizmadia/xz-native).
   output differs from libzstd's. [ruzstd](https://crates.io/crates/ruzstd)
   decompresses 3-7x slower than zstd-native.
 
-  Other zstd implementations were compared once on the same machine, with
-  the details in [BENCHMARK.md](BENCHMARK.md#other-implementations):
-  - **Decompression:** zstd-native is the fastest zstd decompressor we
-    measured.
-    It is 1.05-1.09x faster than the fastest C libzstd 1.5.7 build
-    (including upstream's own gcc and clang builds and `-march=native`) at
-    levels 1-19.
-  - **Other ports:** it is faster than the Go (klauspost), C# (ZstdSharp)
-    and Java (aircompressor) ports at every level, for both compression
-    and decompression (1.14-1.84x at decompression).
+  Against every C libzstd 1.5.7 build, including upstream's own gcc and
+  clang builds and `-march=native`:
+  - **Decompression:** zstd-native is 1.05-1.09x faster at levels 1-19.
   - **Compression:** it is the fastest at levels 1 and 19, and on par with
     C libzstd at levels 3-11, within ±2%.
+
+  Ports in other languages (Go, C#, Java, JavaScript) are slower at every
+  level. They were measured once, as recorded in
+  [BENCHMARK.md](BENCHMARK.md#other-implementations).
 - **Drop-in compatible.** It compresses to the same bytes as libzstd for
   the same parameters. That covers every level, streaming with flushes,
   dictionaries, long distance matching and multithreading. Anything it
