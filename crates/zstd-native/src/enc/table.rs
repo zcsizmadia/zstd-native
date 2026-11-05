@@ -213,6 +213,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "scans 8-12 MiB tables; huge pages are off under Miri")]
     fn large_tables_on_huge_page_boundaries() {
         let entries = huge::MIN_TABLE / 4;
         for size in [entries, entries + 7, 3 * entries / 2] {
