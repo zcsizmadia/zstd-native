@@ -316,7 +316,7 @@ unsafe fn insert_and_find_first_index<const MLS: u32>(s: &mut Searcher, ip: *con
 /// # Safety
 /// `ip + 8 <= ilimit`, `ilimit` the block end (see the module docs).
 #[allow(unsafe_code)]
-#[inline(never)]
+#[inline(always)]
 unsafe fn hc_find_best_match<const MLS: u32, const EXT: bool, const DMS: bool>(
     s: &mut Searcher,
     ip: *const u8,
@@ -693,7 +693,7 @@ unsafe fn dubt_find_best_match<const MLS: u32, const EXT: bool, const DMS: bool>
 /// # Safety
 /// `ip + 8 <= iend`, `iend` the block end.
 #[allow(unsafe_code)]
-#[inline(never)]
+#[inline(always)]
 unsafe fn bt_find_best_match<const MLS: u32, const EXT: bool, const DMS: bool>(
     s: &mut Searcher,
     ip: *const u8,
@@ -810,13 +810,95 @@ unsafe fn dubt_find_better_dict_match<const MLS: u32>(
 // ---------------------------------------------------------------------------
 // Parser
 
-/// `ZSTD_searchMax()`: the longest match at `ip` with the block's method.
+/// `ZSTD_searchMax()`: the longest match at `ip` with the block's method,
+/// through a search function that is not inlined (`FORCE_NOINLINE`), the
+/// BMI2 build of it with `BMI2`, except for the row finder with 64-entry
+/// rows (levels 11 and 12): its BMI2 build measured 3% slower there on the
+/// EPYC host (Zen 3), and 3-4% faster with 16-entry rows (levels 5-9).
+///
+/// # Safety
+/// `ip + 8 <= iend` (`+ 16` for the row finder), `iend` the block end;
+/// with `BMI2`, the CPU has BMI1, BMI2 and LZCNT.
+#[allow(unsafe_code)]
+#[inline(always)]
+unsafe fn search_max<
+    const MLS: u32,
+    const METHOD: u8,
+    const ROW_LOG: u32,
+    const EXT: bool,
+    const DMS: bool,
+    const BMI2: bool,
+>(
+    s: &mut Searcher,
+    ip: *const u8,
+    iend: *const u8,
+    offset_ptr: &mut u32,
+) -> usize {
+    #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+    if BMI2 && !(METHOD == SEARCH_ROW_HASH && ROW_LOG == 6) {
+        // SAFETY: per the caller, including the CPU features.
+        return unsafe { search_bmi2::<MLS, METHOD, ROW_LOG, EXT, DMS>(s, ip, iend, offset_ptr) };
+    }
+    // SAFETY: per the caller.
+    unsafe { search_generic::<MLS, METHOD, ROW_LOG, EXT, DMS>(s, ip, iend, offset_ptr) }
+}
+
+/// [`search_body`], not inlined.
+///
+/// # Safety
+/// As [`search_body`].
+#[allow(unsafe_code)]
+#[inline(never)]
+unsafe fn search_generic<
+    const MLS: u32,
+    const METHOD: u8,
+    const ROW_LOG: u32,
+    const EXT: bool,
+    const DMS: bool,
+>(
+    s: &mut Searcher,
+    ip: *const u8,
+    iend: *const u8,
+    offset_ptr: &mut u32,
+) -> usize {
+    // SAFETY: per the caller.
+    unsafe { search_body::<MLS, METHOD, ROW_LOG, EXT, DMS>(s, ip, iend, offset_ptr) }
+}
+
+/// [`search_body`] compiled with BMI1, BMI2 and LZCNT (`shrx`/`shlx` for
+/// the hash and row shifts, `blsr`/`tzcnt` for the match masks), not
+/// inlined.
+///
+/// # Safety
+/// As [`search_body`], and the CPU has BMI1, BMI2 and LZCNT.
+#[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+#[allow(unsafe_code)]
+#[inline(never)]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+unsafe fn search_bmi2<
+    const MLS: u32,
+    const METHOD: u8,
+    const ROW_LOG: u32,
+    const EXT: bool,
+    const DMS: bool,
+>(
+    s: &mut Searcher,
+    ip: *const u8,
+    iend: *const u8,
+    offset_ptr: &mut u32,
+) -> usize {
+    // SAFETY: per the caller.
+    unsafe { search_body::<MLS, METHOD, ROW_LOG, EXT, DMS>(s, ip, iend, offset_ptr) }
+}
+
+/// The search of the block's method (`ZSTD_HcFindBestMatch`,
+/// `ZSTD_BtFindBestMatch` or `ZSTD_RowFindBestMatch`).
 ///
 /// # Safety
 /// `ip + 8 <= iend` (`+ 16` for the row finder), `iend` the block end.
 #[allow(unsafe_code)]
 #[inline(always)]
-unsafe fn search_max<
+unsafe fn search_body<
     const MLS: u32,
     const METHOD: u8,
     const ROW_LOG: u32,
@@ -838,6 +920,15 @@ unsafe fn search_max<
     }
 }
 
+/// Whether the block's parser and search run their BMI2 builds: the row
+/// finder and btlazy2 measured 2-4% faster with them on the EPYC host
+/// (Zen 3), the hash chain (greedy to lazy2 with `windowLog <= 14`, small
+/// inputs) 1% slower, so it keeps the generic build.
+#[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+fn bmi2_pays(ms: &MatchState) -> bool {
+    ms.use_row_match_finder || ms.cparams.strategy == Strategy::BtLazy2
+}
+
 /// `ZSTD_compressBlock_<strategy>[_row]()` (noDict): finds the sequences
 /// of the block `buf[start..end]`; the same contract as
 /// [`compress_block_fast`](super::fast::compress_block_fast). Picks the
@@ -853,21 +944,74 @@ pub(crate) fn compress_block_lazy(
     start: usize,
     end: usize,
 ) -> usize {
+    #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+    if crate::cpu::Features::detect().bmi2 && bmi2_pays(ms) {
+        // SAFETY: BMI2 (with BMI1 and LZCNT) was detected on this CPU.
+        #[allow(unsafe_code)]
+        return unsafe { compress_block_lazy_bmi2(ms, ss, rep, buf, start, end) };
+    }
+    compress_block_lazy_impl::<false>(ms, ss, rep, buf, start, end)
+}
+
+/// [`compress_block_lazy`] compiled with BMI1, BMI2 and LZCNT, the parser and its
+/// search functions.
+#[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+#[inline(never)]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+fn compress_block_lazy_bmi2(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
+    compress_block_lazy_impl::<true>(ms, ss, rep, buf, start, end)
+}
+
+/// [`compress_block_lazy`] with the search functions of [`search_max`]'s `BMI2`.
+#[inline(always)]
+fn compress_block_lazy_impl<const BMI2: bool>(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
     macro_rules! go {
         ($method:expr, $depth:literal) => {
             match (
                 ms.cparams.min_match.clamp(4, 6),
                 ms.cparams.search_log.clamp(4, 6),
             ) {
-                (4, 4) => lazy_generic::<4, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
-                (4, 5) => lazy_generic::<4, { $method }, 5, $depth>(ms, ss, rep, buf, start, end),
-                (4, _) => lazy_generic::<4, { $method }, 6, $depth>(ms, ss, rep, buf, start, end),
-                (5, 4) => lazy_generic::<5, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
-                (5, 5) => lazy_generic::<5, { $method }, 5, $depth>(ms, ss, rep, buf, start, end),
-                (5, _) => lazy_generic::<5, { $method }, 6, $depth>(ms, ss, rep, buf, start, end),
-                (_, 4) => lazy_generic::<6, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
-                (_, 5) => lazy_generic::<6, { $method }, 5, $depth>(ms, ss, rep, buf, start, end),
-                (_, _) => lazy_generic::<6, { $method }, 6, $depth>(ms, ss, rep, buf, start, end),
+                (4, 4) => {
+                    lazy_generic::<4, { $method }, 4, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (4, 5) => {
+                    lazy_generic::<4, { $method }, 5, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (4, _) => {
+                    lazy_generic::<4, { $method }, 6, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (5, 4) => {
+                    lazy_generic::<5, { $method }, 4, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (5, 5) => {
+                    lazy_generic::<5, { $method }, 5, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (5, _) => {
+                    lazy_generic::<5, { $method }, 6, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (_, 4) => {
+                    lazy_generic::<6, { $method }, 4, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (_, 5) => {
+                    lazy_generic::<6, { $method }, 5, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (_, _) => {
+                    lazy_generic::<6, { $method }, 6, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
             }
         };
     }
@@ -875,9 +1019,9 @@ pub(crate) fn compress_block_lazy(
     macro_rules! go_mls {
         ($method:expr, $depth:literal) => {
             match ms.cparams.min_match.clamp(4, 6) {
-                4 => lazy_generic::<4, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
-                5 => lazy_generic::<5, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
-                _ => lazy_generic::<6, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
+                4 => lazy_generic::<4, { $method }, 4, $depth, BMI2>(ms, ss, rep, buf, start, end),
+                5 => lazy_generic::<5, { $method }, 4, $depth, BMI2>(ms, ss, rep, buf, start, end),
+                _ => lazy_generic::<6, { $method }, 4, $depth, BMI2>(ms, ss, rep, buf, start, end),
             }
         };
     }
@@ -897,7 +1041,13 @@ pub(crate) fn compress_block_lazy(
 /// `ZSTD_compressBlock_lazy_generic()` with `dictMode == ZSTD_noDict`.
 #[allow(unsafe_code)]
 #[inline(always)]
-fn lazy_generic<const MLS: u32, const METHOD: u8, const ROW_LOG: u32, const DEPTH: u32>(
+fn lazy_generic<
+    const MLS: u32,
+    const METHOD: u8,
+    const ROW_LOG: u32,
+    const DEPTH: u32,
+    const BMI2: bool,
+>(
     ms: &mut MatchState,
     ss: &mut SeqStore,
     rep: &mut [u32; 3],
@@ -1029,7 +1179,7 @@ fn lazy_generic<const MLS: u32, const METHOD: u8, const ROW_LOG: u32, const DEPT
                 // first search (depth 0)
                 {
                     let mut offbase_found = OFFBASE_UNSET;
-                    let ml2 = search_max::<MLS, METHOD, ROW_LOG, false, false>(
+                    let ml2 = search_max::<MLS, METHOD, ROW_LOG, false, false, BMI2>(
                         &mut s,
                         ip,
                         iend,
@@ -1074,7 +1224,7 @@ fn lazy_generic<const MLS: u32, const METHOD: u8, const ROW_LOG: u32, const DEPT
                         }
                         {
                             let mut ofb_candidate = OFFBASE_UNSET;
-                            let ml2 = search_max::<MLS, METHOD, ROW_LOG, false, false>(
+                            let ml2 = search_max::<MLS, METHOD, ROW_LOG, false, false, BMI2>(
                                 &mut s,
                                 ip,
                                 iend,
@@ -1112,7 +1262,7 @@ fn lazy_generic<const MLS: u32, const METHOD: u8, const ROW_LOG: u32, const DEPT
                             }
                             {
                                 let mut ofb_candidate = OFFBASE_UNSET;
-                                let ml2 = search_max::<MLS, METHOD, ROW_LOG, false, false>(
+                                let ml2 = search_max::<MLS, METHOD, ROW_LOG, false, false, BMI2>(
                                     &mut s,
                                     ip,
                                     iend,
@@ -1241,30 +1391,83 @@ pub(crate) fn compress_block_lazy_dict_match_state(
     start: usize,
     end: usize,
 ) -> usize {
+    #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+    if crate::cpu::Features::detect().bmi2 && bmi2_pays(ms) {
+        // SAFETY: BMI2 (with BMI1 and LZCNT) was detected on this CPU.
+        #[allow(unsafe_code)]
+        return unsafe { compress_block_lazy_dict_match_state_bmi2(ms, ss, rep, buf, start, end) };
+    }
+    compress_block_lazy_dict_match_state_impl::<false>(ms, ss, rep, buf, start, end)
+}
+
+/// [`compress_block_lazy_dict_match_state`] compiled with BMI1, BMI2 and LZCNT, the parser and its
+/// search functions.
+#[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+#[inline(never)]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+fn compress_block_lazy_dict_match_state_bmi2(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
+    compress_block_lazy_dict_match_state_impl::<true>(ms, ss, rep, buf, start, end)
+}
+
+/// [`compress_block_lazy_dict_match_state`] with the search functions of [`search_max`]'s `BMI2`.
+#[inline(always)]
+fn compress_block_lazy_dict_match_state_impl<const BMI2: bool>(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
     macro_rules! go {
         ($method:expr, $depth:literal) => {
             match (
                 ms.cparams.min_match.clamp(4, 6),
                 ms.cparams.search_log.clamp(4, 6),
             ) {
-                (4, 4) => dms_generic::<4, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
-                (4, 5) => dms_generic::<4, { $method }, 5, $depth>(ms, ss, rep, buf, start, end),
-                (4, _) => dms_generic::<4, { $method }, 6, $depth>(ms, ss, rep, buf, start, end),
-                (5, 4) => dms_generic::<5, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
-                (5, 5) => dms_generic::<5, { $method }, 5, $depth>(ms, ss, rep, buf, start, end),
-                (5, _) => dms_generic::<5, { $method }, 6, $depth>(ms, ss, rep, buf, start, end),
-                (_, 4) => dms_generic::<6, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
-                (_, 5) => dms_generic::<6, { $method }, 5, $depth>(ms, ss, rep, buf, start, end),
-                (_, _) => dms_generic::<6, { $method }, 6, $depth>(ms, ss, rep, buf, start, end),
+                (4, 4) => {
+                    dms_generic::<4, { $method }, 4, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (4, 5) => {
+                    dms_generic::<4, { $method }, 5, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (4, _) => {
+                    dms_generic::<4, { $method }, 6, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (5, 4) => {
+                    dms_generic::<5, { $method }, 4, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (5, 5) => {
+                    dms_generic::<5, { $method }, 5, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (5, _) => {
+                    dms_generic::<5, { $method }, 6, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (_, 4) => {
+                    dms_generic::<6, { $method }, 4, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (_, 5) => {
+                    dms_generic::<6, { $method }, 5, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (_, _) => {
+                    dms_generic::<6, { $method }, 6, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
             }
         };
     }
     macro_rules! go_mls {
         ($method:expr, $depth:literal) => {
             match ms.cparams.min_match.clamp(4, 6) {
-                4 => dms_generic::<4, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
-                5 => dms_generic::<5, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
-                _ => dms_generic::<6, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
+                4 => dms_generic::<4, { $method }, 4, $depth, BMI2>(ms, ss, rep, buf, start, end),
+                5 => dms_generic::<5, { $method }, 4, $depth, BMI2>(ms, ss, rep, buf, start, end),
+                _ => dms_generic::<6, { $method }, 4, $depth, BMI2>(ms, ss, rep, buf, start, end),
             }
         };
     }
@@ -1294,7 +1497,13 @@ pub(crate) fn compress_block_lazy_dict_match_state(
 /// and matches are counted across with `ZSTD_count_2segments`.
 #[allow(unsafe_code)]
 #[inline(always)]
-fn dms_generic<const MLS: u32, const METHOD: u8, const ROW_LOG: u32, const DEPTH: u32>(
+fn dms_generic<
+    const MLS: u32,
+    const METHOD: u8,
+    const ROW_LOG: u32,
+    const DEPTH: u32,
+    const BMI2: bool,
+>(
     ms: &mut MatchState,
     ss: &mut SeqStore,
     rep: &mut [u32; 3],
@@ -1467,7 +1676,7 @@ fn dms_generic<const MLS: u32, const METHOD: u8, const ROW_LOG: u32, const DEPTH
                 // first search (depth 0)
                 {
                     let mut offbase_found = OFFBASE_UNSET;
-                    let ml2 = search_max::<MLS, METHOD, ROW_LOG, false, true>(
+                    let ml2 = search_max::<MLS, METHOD, ROW_LOG, false, true, BMI2>(
                         &mut s,
                         ip,
                         iend,
@@ -1505,7 +1714,7 @@ fn dms_generic<const MLS: u32, const METHOD: u8, const ROW_LOG: u32, const DEPTH
                         }
                         {
                             let mut ofb_candidate = OFFBASE_UNSET;
-                            let ml2 = search_max::<MLS, METHOD, ROW_LOG, false, true>(
+                            let ml2 = search_max::<MLS, METHOD, ROW_LOG, false, true, BMI2>(
                                 &mut s,
                                 ip,
                                 iend,
@@ -1539,7 +1748,7 @@ fn dms_generic<const MLS: u32, const METHOD: u8, const ROW_LOG: u32, const DEPTH
                             }
                             {
                                 let mut ofb_candidate = OFFBASE_UNSET;
-                                let ml2 = search_max::<MLS, METHOD, ROW_LOG, false, true>(
+                                let ml2 = search_max::<MLS, METHOD, ROW_LOG, false, true, BMI2>(
                                     &mut s,
                                     ip,
                                     iend,
@@ -1658,30 +1867,83 @@ pub(crate) fn compress_block_lazy_ext_dict(
     start: usize,
     end: usize,
 ) -> usize {
+    #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+    if crate::cpu::Features::detect().bmi2 && bmi2_pays(ms) {
+        // SAFETY: BMI2 (with BMI1 and LZCNT) was detected on this CPU.
+        #[allow(unsafe_code)]
+        return unsafe { compress_block_lazy_ext_dict_bmi2(ms, ss, rep, buf, start, end) };
+    }
+    compress_block_lazy_ext_dict_impl::<false>(ms, ss, rep, buf, start, end)
+}
+
+/// [`compress_block_lazy_ext_dict`] compiled with BMI1, BMI2 and LZCNT, the parser and its
+/// search functions.
+#[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+#[inline(never)]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+fn compress_block_lazy_ext_dict_bmi2(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
+    compress_block_lazy_ext_dict_impl::<true>(ms, ss, rep, buf, start, end)
+}
+
+/// [`compress_block_lazy_ext_dict`] with the search functions of [`search_max`]'s `BMI2`.
+#[inline(always)]
+fn compress_block_lazy_ext_dict_impl<const BMI2: bool>(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
     macro_rules! go {
         ($method:expr, $depth:literal) => {
             match (
                 ms.cparams.min_match.clamp(4, 6),
                 ms.cparams.search_log.clamp(4, 6),
             ) {
-                (4, 4) => ext_generic::<4, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
-                (4, 5) => ext_generic::<4, { $method }, 5, $depth>(ms, ss, rep, buf, start, end),
-                (4, _) => ext_generic::<4, { $method }, 6, $depth>(ms, ss, rep, buf, start, end),
-                (5, 4) => ext_generic::<5, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
-                (5, 5) => ext_generic::<5, { $method }, 5, $depth>(ms, ss, rep, buf, start, end),
-                (5, _) => ext_generic::<5, { $method }, 6, $depth>(ms, ss, rep, buf, start, end),
-                (_, 4) => ext_generic::<6, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
-                (_, 5) => ext_generic::<6, { $method }, 5, $depth>(ms, ss, rep, buf, start, end),
-                (_, _) => ext_generic::<6, { $method }, 6, $depth>(ms, ss, rep, buf, start, end),
+                (4, 4) => {
+                    ext_generic::<4, { $method }, 4, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (4, 5) => {
+                    ext_generic::<4, { $method }, 5, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (4, _) => {
+                    ext_generic::<4, { $method }, 6, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (5, 4) => {
+                    ext_generic::<5, { $method }, 4, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (5, 5) => {
+                    ext_generic::<5, { $method }, 5, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (5, _) => {
+                    ext_generic::<5, { $method }, 6, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (_, 4) => {
+                    ext_generic::<6, { $method }, 4, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (_, 5) => {
+                    ext_generic::<6, { $method }, 5, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
+                (_, _) => {
+                    ext_generic::<6, { $method }, 6, $depth, BMI2>(ms, ss, rep, buf, start, end)
+                }
             }
         };
     }
     macro_rules! go_mls {
         ($method:expr, $depth:literal) => {
             match ms.cparams.min_match.clamp(4, 6) {
-                4 => ext_generic::<4, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
-                5 => ext_generic::<5, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
-                _ => ext_generic::<6, { $method }, 4, $depth>(ms, ss, rep, buf, start, end),
+                4 => ext_generic::<4, { $method }, 4, $depth, BMI2>(ms, ss, rep, buf, start, end),
+                5 => ext_generic::<5, { $method }, 4, $depth, BMI2>(ms, ss, rep, buf, start, end),
+                _ => ext_generic::<6, { $method }, 4, $depth, BMI2>(ms, ss, rep, buf, start, end),
             }
         };
     }
@@ -1709,7 +1971,13 @@ pub(crate) fn compress_block_lazy_ext_dict(
 /// the extDict end, then on in the prefix (`ZSTD_count_2segments`).
 #[allow(unsafe_code)]
 #[inline(always)]
-fn ext_generic<const MLS: u32, const METHOD: u8, const ROW_LOG: u32, const DEPTH: u32>(
+fn ext_generic<
+    const MLS: u32,
+    const METHOD: u8,
+    const ROW_LOG: u32,
+    const DEPTH: u32,
+    const BMI2: bool,
+>(
     ms: &mut MatchState,
     ss: &mut SeqStore,
     rep: &mut [u32; 3],
@@ -1860,7 +2128,7 @@ fn ext_generic<const MLS: u32, const METHOD: u8, const ROW_LOG: u32, const DEPTH
                 // first search (depth 0)
                 {
                     let mut ofb_candidate = OFFBASE_UNSET;
-                    let ml2 = search_max::<MLS, METHOD, ROW_LOG, true, false>(
+                    let ml2 = search_max::<MLS, METHOD, ROW_LOG, true, false, BMI2>(
                         &mut s,
                         ip,
                         iend,
@@ -1903,7 +2171,7 @@ fn ext_generic<const MLS: u32, const METHOD: u8, const ROW_LOG: u32, const DEPTH
                         // search match, depth 1
                         {
                             let mut ofb_candidate = OFFBASE_UNSET;
-                            let ml2 = search_max::<MLS, METHOD, ROW_LOG, true, false>(
+                            let ml2 = search_max::<MLS, METHOD, ROW_LOG, true, false, BMI2>(
                                 &mut s,
                                 ip,
                                 iend,
@@ -1940,7 +2208,7 @@ fn ext_generic<const MLS: u32, const METHOD: u8, const ROW_LOG: u32, const DEPTH
                             // search match, depth 2
                             {
                                 let mut ofb_candidate = OFFBASE_UNSET;
-                                let ml2 = search_max::<MLS, METHOD, ROW_LOG, true, false>(
+                                let ml2 = search_max::<MLS, METHOD, ROW_LOG, true, false, BMI2>(
                                     &mut s,
                                     ip,
                                     iend,
