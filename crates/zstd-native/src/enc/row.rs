@@ -210,38 +210,53 @@ unsafe fn update_internal_impl<const MLS: u32, const ROW_LOG: u32>(
     end: u32,
 ) {
     let row_mask = (1u32 << ROW_LOG) - 1;
-    // The row written last and its new head. When consecutive positions
-    // share a row (runs and short periods in repetitive data), its head is
-    // taken from here instead of being read back from the tag table: that
-    // read would wait for the previous iteration's store (store-to-load
-    // forwarding on the loop's dependency chain), which made level 5 up to
-    // 30% slower on such inputs, depending on code placement.
-    let mut last_row = usize::MAX;
-    let mut last_head = 0u32;
-    for idx in start..end {
-        // SAFETY: per the caller; the row (from a hash of `rowHashLog + 8`
-        // bits) is within the tables of `1 << (rowHashLog + rowLog)`
-        // entries (asserted by the parser).
-        unsafe {
-            let hash = next_cached_hash::<MLS, ROW_LOG>(s, idx);
+    if start >= end {
+        return;
+    }
+    // Software-pipelined by one position: the next position's hash and
+    // row head are read *before* this position's tag and index stores.
+    // Read after them, the loads queue behind those stores, whose
+    // addresses come from this position's head load: when the CPU's
+    // memory dependence prediction makes them wait (on Zen 3 that depends
+    // on where the code lands in physical memory, so it changed from one
+    // byte-identical copy of a binary to the next), the loop became a
+    // chain of head loads, up to 25% slower on repetitive inputs at level
+    // 5, for libzstd alike. When the next position shares the row (runs
+    // and short periods), its head is the one written here, kept in a
+    // register.
+    // SAFETY: per the caller; the rows (from hashes of `rowHashLog + 8`
+    // bits) are within the tables of `1 << (rowHashLog + rowLog)` entries
+    // (asserted by the parser).
+    unsafe {
+        let mut hash = next_cached_hash::<MLS, ROW_LOG>(s, start);
+        let mut rel_row = ((hash >> ROW_HASH_TAG_BITS) << ROW_LOG) as usize;
+        let mut head = u32::from(*s.tag_table.add(rel_row));
+        let mut idx = start;
+        loop {
             debug_assert_eq!(
                 hash,
                 hash_salted::<MLS>(s.pos(idx), s.row_hash_log + ROW_HASH_TAG_BITS, s.hash_salt)
             );
-            let rel_row = ((hash >> ROW_HASH_TAG_BITS) << ROW_LOG) as usize;
             let tag_row = s.tag_table.add(rel_row);
-            let head = if rel_row == last_row {
-                debug_assert_eq!(u32::from(*tag_row), last_head);
-                last_head
-            } else {
-                u32::from(*tag_row)
-            };
             let pos = next_index(head, row_mask);
+            let next = idx + 1;
+            if next == end {
+                *tag_row = pos as u8;
+                *tag_row.add(pos as usize) = hash as u8;
+                *s.hash_table.add(rel_row + pos as usize) = idx;
+                break;
+            }
+            let next_hash = next_cached_hash::<MLS, ROW_LOG>(s, next);
+            let next_row = ((next_hash >> ROW_HASH_TAG_BITS) << ROW_LOG) as usize;
+            let next_head = u32::from(*s.tag_table.add(next_row));
             *tag_row = pos as u8;
             *tag_row.add(pos as usize) = hash as u8;
             *s.hash_table.add(rel_row + pos as usize) = idx;
-            last_row = rel_row;
-            last_head = pos;
+            head = if next_row == rel_row { pos } else { next_head };
+            debug_assert_eq!(u32::from(*s.tag_table.add(next_row)), head);
+            hash = next_hash;
+            rel_row = next_row;
+            idx = next;
         }
     }
 }

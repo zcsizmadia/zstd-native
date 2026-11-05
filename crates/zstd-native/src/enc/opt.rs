@@ -1844,6 +1844,18 @@ fn opt_generic<
                     opt[pos as usize].price = MAX_PRICE;
                 }
 
+                // Pins the match length loop below (`while mlen >=
+                // start_ml`), the hottest of btultra and btultra2 (levels
+                // 18-22): its speed moved up to 4% with its placement mod
+                // 64 (#34). The pad puts its first instruction at 16 mod
+                // 64, the only placement measured at or above main's at
+                // both levels 18 and 19 (at 0 mod 64, level 19 gains 3-4%
+                // more but level 18 loses 1.5%). Not for btopt (levels 16-17),
+                // which measured 0.5% slower with it and did not move
+                // without it.
+                if OPT_LEVEL == 2 {
+                    align_hot_loop!(32);
+                }
                 // check further positions
                 cur = 1;
                 while cur <= last_pos {

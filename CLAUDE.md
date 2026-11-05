@@ -48,6 +48,12 @@ On this Windows machine, cargo is in `~/.cargo/bin` (not on PATH in Bash).
   `decoder.rs`, and the `align_hot_loop!` macro in `lib.rs` (an `asm!`
   alignment directive before the hot loops). New `unsafe` needs a
   benchmark showing the gain.
+- Every performance-related change, however small (a prefetch, an
+  alignment directive, a refactor of hot code), is benchmarked on the
+  EPYC host before it's committed: several binary copies run interleaved,
+  medians and `perf stat`, against main and C libzstd 1.5.7, on every
+  level and file it can affect. The numbers go in the commit or PR, and a
+  change that regresses beyond noise isn't kept.
 - CPU-specific code goes behind run-time detection (`cpu.rs`), compiled
   with `#[target_feature]` (BMI2 today), with the generic version selected
   by the `portable` feature for testing.
