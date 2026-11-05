@@ -9,6 +9,31 @@ section.
 
 ## [Unreleased]
 
+## [0.1.1+zstd.1.5.7]
+
+Speed only: no API change, and the compressed output is the same bytes as
+0.1.0 (and libzstd 1.5.7). Numbers are for an AMD EPYC 7543 (Zen 3), one
+core, Silesia; see BENCHMARK.md.
+
+### Changed
+- **Levels 5-12:** 3.7-5.6% faster compression (Silesia geomean), from a
+  port of meta/zstd#4841 to the row match finder: the head slot is masked
+  out once, the first 16 bytes of a candidate are compared without
+  branches, and the BMI2 search is inlined into the parser (#61).
+- **Steadier encoder speed:** speed no longer depends on where the code
+  lands in memory or on the size of the environment (#34, #66).
+  - The row finder's update loop reads the next row head before the
+    current stores, which also makes repetitive inputs faster at levels
+    5-12. For example, nci at level 5 went from 182-221 to 232-239 MiB/s
+    across binary copies.
+  - The level 1-2 asm loop is aligned to 64 bytes.
+  - The optimal parser's hottest loop is pinned to one alignment.
+- **FSE tables** are built in one fused pass (port of meta/zstd#4836),
+  for both decoding and encoding. Small frames (1-64 KB) decompress
+  1.3-3.8% faster (#59).
+- **Huffman asm decoding loops** use `tzcnt` instead of `bsf`: 0.7-1.8%
+  faster where those loops run (#57).
+
 ## [0.1.0+zstd.1.5.7]
 
 The first release. It is compatible with libzstd 1.5.7: the same compressed
@@ -54,5 +79,6 @@ compressed input.
   - MSRV 1.89
   - fuzzing, Miri, cargo-deny and OpenSSF Scorecard
 
-[Unreleased]: https://github.com/zcsizmadia/zstd-native/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/zcsizmadia/zstd-native/compare/v0.1.1...HEAD
+[0.1.1+zstd.1.5.7]: https://github.com/zcsizmadia/zstd-native/releases/tag/v0.1.1
 [0.1.0+zstd.1.5.7]: https://github.com/zcsizmadia/zstd-native/releases/tag/v0.1.0
