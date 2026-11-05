@@ -113,6 +113,36 @@ fn next_index(head: u32, row_mask: u32) -> u32 {
     next + if next == 0 { row_mask } else { 0 } // skip first position
 }
 
+/// `ZSTD_countShort()` (meta/zstd#4841): [`count`] with the first 16
+/// bytes resolved by selects rather than data-dependent branches, which
+/// mispredict when match lengths are short and unpredictable (most row
+/// finder candidates' are under 16). Same result as [`count`].
+///
+/// # Safety
+/// As [`count`].
+#[allow(unsafe_code)]
+#[inline(always)]
+unsafe fn count_short(p_in: *const u8, p_match: *const u8, p_in_limit: *const u8) -> usize {
+    // SAFETY: with 16 bytes left before `p_in_limit`, the reads are of
+    // `p_in..p_in + 16` and `p_match..p_match + 16`, readable per the
+    // caller; the rest is `count`'s contract.
+    unsafe {
+        if (p_in_limit as usize).saturating_sub(p_in as usize) >= 16 {
+            let d0 = read_le64(p_match) ^ read_le64(p_in);
+            let d1 = read_le64(p_match.add(8)) ^ read_le64(p_in.add(8));
+            if d0 | d1 != 0 {
+                // the first differing word (nonzero) and its byte offset;
+                // bit 63 doesn't change its trailing zeros, and lets a
+                // build without `tzcnt` skip `bsf`'s zero case
+                let (m, base) = if d0 != 0 { (d0, 0) } else { (d1, 8) };
+                return base + ((m | 1 << 63).trailing_zeros() >> 3) as usize;
+            }
+            return 16 + count(p_in.add(16), p_match.add(16), p_in_limit);
+        }
+        count(p_in, p_match, p_in_limit)
+    }
+}
+
 /// `ZSTD_row_prefetch()`.
 #[inline(always)]
 fn row_prefetch<const ROW_LOG: u32>(hash_table: *const u32, tag_table: *const u8, rel_row: u32) {
@@ -481,7 +511,7 @@ pub(super) unsafe fn row_find_best_match<
                 s.chk(m.wrapping_add(ml - 3), 4);
                 // read 4B starting from (match + ml + 1 - sizeof(U32))
                 if read32(m.add(ml - 3)) == read32(ip.add(ml - 3)) {
-                    current_ml = count(ip, m, ilimit);
+                    current_ml = count_short(ip, m, ilimit);
                 }
             } else {
                 let m = s.dict_base.wrapping_add(match_index as usize);
@@ -620,5 +650,28 @@ mod tests {
         }
         let want: alloc::vec::Vec<u32> = (1..=15).rev().cycle().take(31).collect();
         assert_eq!(seen, want);
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn count_short_matches_count() {
+        // every first difference (or none) around the 8- and 16-byte
+        // steps, for every input length around them
+        let step = if cfg!(miri) { 7 } else { 1 };
+        let a: alloc::vec::Vec<u8> = (0..48u8).map(|i| i.wrapping_mul(37)).collect();
+        for diff in (0..=40).step_by(step) {
+            let mut b = a.clone();
+            if diff < 40 {
+                b[diff] ^= 0x10;
+            }
+            for len in (0..=40).step_by(step) {
+                let (pi, pm) = (a.as_ptr(), b.as_ptr());
+                // SAFETY: `len <= 40` bytes of both 48-byte buffers.
+                let (got, want) =
+                    unsafe { (count_short(pi, pm, pi.add(len)), count(pi, pm, pi.add(len))) };
+                assert_eq!(got, want, "diff {diff}, len {len}");
+                assert_eq!(want, diff.min(len));
+            }
+        }
     }
 }
