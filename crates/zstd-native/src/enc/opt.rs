@@ -690,15 +690,19 @@ impl Bt {
     /// head only wastes the fetch.
     ///
     /// # Safety
-    /// `ip + 8 <= iend` (the hashes read up to 8 bytes at `ip + 1` and
-    /// `ip + 2`, checked against `iend` here).
+    /// `ip` and `iend` point into (or one past) the same block; the hashes
+    /// read up to 8 bytes at `ip + 1` and `ip + 2`, which is checked
+    /// against `iend` here.
     #[allow(unsafe_code)]
     #[inline(always)]
     unsafe fn prefetch_next<const MLS: u32>(&self, ip: *const u8, iend: *const u8) {
+        // Compare lengths, not pointers: `ip.add(n)` past the end of the
+        // allocation is undefined even when it is only compared (Miri).
+        let left = (iend as usize).saturating_sub(ip as usize);
         // SAFETY: the reads are inside the block (checked), the hash table
         // read is masked into the table; prefetches never fault.
         unsafe {
-            if ip.add(1 + HASH_READ_SIZE) > iend {
+            if left < 1 + HASH_READ_SIZE {
                 return;
             }
             let nip = ip.add(1);
@@ -710,7 +714,7 @@ impl Bt {
             if MLS == 3 {
                 prefetch_l1(self.hash_table3.add(hash3_ptr(nip, self.hash_log3)).cast());
             }
-            if ip.add(2 + HASH_READ_SIZE) <= iend {
+            if left >= 2 + HASH_READ_SIZE {
                 prefetch_l1(
                     self.hash_table
                         .add(hash_mls::<MLS>(ip.add(2), self.hash_log))

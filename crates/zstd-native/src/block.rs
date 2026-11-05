@@ -563,12 +563,18 @@ mod copy {
                 *(*o).add(3) = *(*m).add(3);
                 *m = (*m).add(DEC32[offset]);
                 ptr::copy_nonoverlapping(*m, (*o).add(4), 4);
-                *m = (*m).sub(sub2);
+                // `- sub2` can point before the start of the output (it is
+                // undone by the `+ 8` below: the net move `dec32 + 8 - dec64`
+                // is never negative). Wrapping arithmetic keeps that
+                // well-defined (an in-bounds `sub` there is undefined, which
+                // Miri reports); it compiles to the same code.
+                *m = (*m).wrapping_sub(sub2);
             } else {
                 copy8(*o, *m);
             }
-            *m = (*m).add(8);
+            *m = (*m).wrapping_add(8);
             *o = (*o).add(8);
+            debug_assert!(*o as usize - *m as usize >= 8);
         }
     }
 }
