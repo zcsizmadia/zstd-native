@@ -454,6 +454,36 @@ fn overlap_logs() {
 }
 
 #[test]
+fn source_alignment() {
+    // where the input sits relative to a page (which decides where each
+    // job's data starts in its buffer) changes nothing in the output
+    let data = input(3 * MB + 4096, 1 << 20, 5);
+    for (i, off) in [0, 1, 15, 255, 2047, 2048, 2049, 4095]
+        .into_iter()
+        .enumerate()
+    {
+        let p = Params::new([1, 3][i % 2], 3, 512 * KB, [0, 6][i / 4]);
+        let src = &data[off..off + 3 * MB - 7];
+        check_one_shot("alignment", &p, src, Dict::None, i % 4 == 0);
+    }
+    // and streaming, with writes of odd sizes
+    let mut w = zstd_native::Encoder::new(Vec::new(), 1);
+    w.set_workers(2).unwrap();
+    for piece in data[3..].chunks(100_003) {
+        std::io::Write::write_all(&mut w, piece).unwrap();
+    }
+    let got = w.finish().unwrap();
+    let mut want = Vec::new();
+    let mut e = zstd::stream::write::Encoder::new(&mut want, 1).unwrap();
+    e.multithread(2).unwrap();
+    for piece in data[3..].chunks(100_003) {
+        std::io::Write::write_all(&mut e, piece).unwrap();
+    }
+    e.finish().unwrap();
+    compare("alignment streaming", &got, &want);
+}
+
+#[test]
 fn output_does_not_depend_on_worker_count() {
     // without LDM, only the jobs matter, not who compresses them
     let data = input(4 * MB, 1 << 20, 4);
