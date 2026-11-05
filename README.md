@@ -47,7 +47,7 @@ risk. Sibling of [xz-native](https://github.com/zcsizmadia/xz-native).
   | Compression, level 9 | 1.13x | 1.28x |
   | Compression, level 19 | 1.38x | 1.17x |
   | Decompression (frames of levels 1-19) | 1.07-1.11x | 1.20-1.29x |
-  | Compression, 16 threads (levels 1-19) | 1.03-1.26x | |
+  | Compression, 16 threads (levels 1-19) | 1.03-1.26x | no multithreading |
 
   zstd-native is faster than both on every Silesia file, level and
   direction. structured-zstd is the fastest other pure-Rust zstd, and its
