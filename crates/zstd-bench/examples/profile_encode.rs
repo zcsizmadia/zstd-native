@@ -47,7 +47,12 @@ fn main() {
     let mut n = 0u64;
     let mut size = 0;
     let t = Instant::now();
-    while t.elapsed().as_secs_f64() < secs {
+    // `ZSTD_BENCH_ITERS=n` runs exactly n iterations instead of `secs`
+    // (fixed work for `perf stat` instruction counts).
+    let iters: Option<u64> = std::env::var("ZSTD_BENCH_ITERS")
+        .ok()
+        .map(|s| s.parse().unwrap());
+    while iters.map_or_else(|| t.elapsed().as_secs_f64() < secs, |i| n < i) {
         size = 0;
         let pieces: Vec<&[u8]> = if chunk > 0 {
             data.chunks(chunk).collect()

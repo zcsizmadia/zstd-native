@@ -5,7 +5,14 @@
 //! The asm only runs the inner loop until `op[3]` reaches `olimit`; the
 //! caller (`huf::fast_loop_asm`) computes `olimit` from the input and output
 //! room exactly like the Rust loops, so the asm never needs bounds checks.
-//! Uses BMI2 (`shrx`/`shlx`): call only when the CPU has it.
+//! Uses BMI2 (`shrx`/`shlx`) and BMI1 (`tzcnt`): call only when the CPU
+//! has them (`cpu::Features::bmi2` checks both).
+//!
+//! The bit reload counts the consumed bits with `tzcnt` where libzstd
+//! 1.5.7 uses `bsf` (as meta/zstd#4888 does): the register always holds
+//! the sentinel bit, so it is never zero and both give the same result,
+//! but `bsf` has a false dependency on its destination and is slower on
+//! AMD Zen 3.
 //!
 //! `rbx` and `rbp` can't be `asm!` operands, so the templates save and
 //! restore them (and use the stack for spills, so no `nostack`).
@@ -174,7 +181,7 @@ macro_rules! x1_loop {
             "movq 0(%rsp), %r9\n",
             "movq 8(%rsp), %r10\n",
             "movq 16(%rsp), %r11\n",
-            "bsfq %rbp, %rbp\n",
+            "tzcntq %rbp, %rbp\n",
             "movq %rbp, %rax\n",
             "andq $7, %rax\n",
             "shrq $3, %rbp\n",
@@ -186,7 +193,7 @@ macro_rules! x1_loop {
             "movq $53, %r15\n",
             "shrxq %r15, %rbp, %r15\n",
             "movzwl (%r14,%r15,2), %r15d\n",
-            "bsfq %rdx, %rdx\n",
+            "tzcntq %rdx, %rdx\n",
             "movq %rdx, %rax\n",
             "andq $7, %rax\n",
             "shrq $3, %rdx\n",
@@ -199,7 +206,7 @@ macro_rules! x1_loop {
             "movq $53, %r9\n",
             "shrxq %r9, %rdx, %r9\n",
             "movzwl (%r14,%r9,2), %r9d\n",
-            "bsfq %r12, %r12\n",
+            "tzcntq %r12, %r12\n",
             "movq %r12, %rax\n",
             "andq $7, %rax\n",
             "shrq $3, %r12\n",
@@ -212,7 +219,7 @@ macro_rules! x1_loop {
             "movq $53, %r10\n",
             "shrxq %r10, %r12, %r10\n",
             "movzwl (%r14,%r10,2), %r10d\n",
-            "bsfq %r13, %r13\n",
+            "tzcntq %r13, %r13\n",
             "movq %r13, %rax\n",
             "andq $7, %rax\n",
             "shrq $3, %r13\n",
@@ -436,7 +443,7 @@ macro_rules! x2_loop {
             "shlxq %r15, %r13, %r13\n",
             "addq %rax, %rdi\n",
             "movq 0(%rsp), %r8\n",
-            "bsfq %rbp, %rbp\n",
+            "tzcntq %rbp, %rbp\n",
             "movq %rbp, %rax\n",
             "shrq $3, %rbp\n",
             "andq $7, %rax\n",
@@ -444,7 +451,7 @@ macro_rules! x2_loop {
             "movq (%r8), %rbp\n",
             "orq $1, %rbp\n",
             "shlxq %rax, %rbp, %rbp\n",
-            "bsfq %rdx, %rdx\n",
+            "tzcntq %rdx, %rdx\n",
             "movq %rdx, %rax\n",
             "shrq $3, %rdx\n",
             "andq $7, %rax\n",
@@ -452,7 +459,7 @@ macro_rules! x2_loop {
             "movq (%r9), %rdx\n",
             "orq $1, %rdx\n",
             "shlxq %rax, %rdx, %rdx\n",
-            "bsfq %r12, %r12\n",
+            "tzcntq %r12, %r12\n",
             "movq %r12, %rax\n",
             "shrq $3, %r12\n",
             "andq $7, %rax\n",
@@ -460,7 +467,7 @@ macro_rules! x2_loop {
             "movq (%r10), %r12\n",
             "orq $1, %r12\n",
             "shlxq %rax, %r12, %r12\n",
-            "bsfq %r13, %r13\n",
+            "tzcntq %r13, %r13\n",
             "movq %r13, %rax\n",
             "shrq $3, %r13\n",
             "andq $7, %rax\n",

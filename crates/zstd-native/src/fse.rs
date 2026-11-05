@@ -117,6 +117,33 @@ pub(crate) fn read_ncount(
     Ok((sym - 1, table_log, consumed))
 }
 
+/// libzstd's `FSE_TABLESTEP`: the stride of the symbol spread.
+#[inline(always)]
+pub(crate) const fn table_step(table_size: u32) -> u32 {
+    (table_size >> 1) + (table_size >> 3) + 3
+}
+
+/// The inverse of [`table_step`] modulo `table_size` (meta/zstd#4836's
+/// `FSE_invTableStep`). The step is odd for every table of 16 states or
+/// more, so the spread without low-probability symbols, which puts the
+/// `i`-th symbol of the sorted layout at `(i * step) & mask`, is a
+/// permutation: cell `u` holds sorted symbol `(u * inv) & mask`. Walking
+/// the cells in order and reading the sorted layout with stride `inv`
+/// fuses the spread with the table build (no scattered writes, no
+/// read-back), with the same table.
+#[inline(always)]
+pub(crate) const fn inv_table_step(table_size: u32) -> u32 {
+    let step = table_step(table_size);
+    // odd * odd == 1 (mod 8): 3 correct low bits; each Newton step doubles
+    // them (6, 12, 24 >= FSE_TABLELOG_ABSOLUTE_MAX).
+    let mut inv = step;
+    inv = inv.wrapping_mul(2u32.wrapping_sub(step.wrapping_mul(inv)));
+    inv = inv.wrapping_mul(2u32.wrapping_sub(step.wrapping_mul(inv)));
+    inv = inv.wrapping_mul(2u32.wrapping_sub(step.wrapping_mul(inv)));
+    debug_assert!(step.wrapping_mul(inv) & (table_size - 1) == 1);
+    inv & (table_size - 1)
+}
+
 /// Lays the symbols out over the table (libzstd's spread), writing the
 /// symbol of every cell to `cells` and each symbol's first state to `next`.
 const fn spread(norm: &[i16], max_sv1: usize, table_log: u32, cells: &mut [u8], next: &mut [u16]) {
@@ -345,7 +372,8 @@ pub(crate) const fn build_seq_table(
 
 /// Run-time version of [`build_seq_table`] with libzstd's fast spread for
 /// tables without low-probability (-1) symbols: lay the symbols down in
-/// order 8 bytes at a time, then walk the positions with no inner loop.
+/// order 8 bytes at a time, then build the cells in order, reading that
+/// layout with the inverse stride ([`inv_table_step`], meta/zstd#4836).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_seq_table_fast(
     dt: &mut [SeqSymbol],
@@ -402,7 +430,6 @@ fn build_fast_body(
     }
     let table_size = 1usize << table_log;
     let mask = table_size - 1;
-    let step = (table_size >> 1) + (table_size >> 3) + 3;
     let mut spread = [0u8; (1 << LL_FSE_LOG) + 8];
     let mut pos = 0usize;
     for (s, &n) in norm.iter().enumerate() {
@@ -419,13 +446,6 @@ fn build_fast_body(
         pos += n;
     }
     debug_assert_eq!(pos, table_size);
-    let mut cells = [0u8; 1 << LL_FSE_LOG];
-    let mut position = 0usize;
-    for s in (0..table_size).step_by(2) {
-        cells[position] = spread[s];
-        cells[(position + step) & mask] = spread[s + 1];
-        position = (position + 2 * step) & mask;
-    }
     // 64-entry local tables indexed with `s & 63` (every code is under 53):
     // no bounds checks in the per-cell loop.
     let mut next = [0u16; 64];
@@ -436,8 +456,14 @@ fn build_fast_body(
         sym_base[s] = base[s];
         sym_bits[s] = bits[s];
     }
-    for (&c, d) in cells[..table_size].iter().zip(dt[..table_size].iter_mut()) {
-        let s = (c & 63) as usize;
+    // Fused spread and build (meta/zstd#4836): cell `u` holds the sorted
+    // symbol at `(u * inv) & mask` (see `inv_table_step`).
+    let inv = inv_table_step(table_size as u32) as usize;
+    let mut si = 0usize;
+    for d in dt[..table_size].iter_mut() {
+        // `si <= mask < 512`: the `& 511` only drops the bounds check.
+        let s = (spread[si & ((1 << LL_FSE_LOG) - 1)] & 63) as usize;
+        si = (si + inv) & mask;
         let ns = u32::from(next[s]);
         next[s] += 1;
         let nb = table_log - highbit32(ns);
@@ -448,6 +474,7 @@ fn build_fast_body(
             base: sym_base[s],
         };
     }
+    debug_assert_eq!(si, 0, "visited every cell");
 }
 
 /// The three tables live in one array, so the sequence loop needs a single
@@ -722,6 +749,87 @@ mod build_tests {
                     (b[u].next_state, b[u].nb_bits, b[u].base, b[u].nb_add_bits),
                     "case {case} cell {u}"
                 );
+            }
+        }
+    }
+
+    /// `inv_table_step` inverts the spread stride for every table log.
+    #[test]
+    fn inv_table_step_inverts_step() {
+        for log in FSE_MIN_TABLELOG..=FSE_TABLELOG_ABSOLUTE_MAX {
+            let size = 1u32 << log;
+            let inv = inv_table_step(size);
+            assert!(inv < size);
+            assert_eq!(
+                table_step(size).wrapping_mul(inv) & (size - 1),
+                1,
+                "log {log}"
+            );
+        }
+    }
+
+    /// The fused build gives the reference table for every table log of
+    /// each code kind, over many distributions (flat, skewed, with and
+    /// without -1 symbols; meta/zstd#4836's `FUZ_genNormalizedCount`).
+    #[test]
+    fn fused_build_matches_reference_every_kind() {
+        let mut r = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rand = move |n: u64| {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            (r >> 16) % n
+        };
+        for kind in [LL_KIND, OF_KIND, ML_KIND] {
+            for log in FSE_MIN_TABLELOG..=kind.max_log {
+                for low in [false, true] {
+                    for case in 0..if cfg!(miri) { 2 } else { 200 } {
+                        let max_sv1 = 2 + rand(kind.max as u64) as usize;
+                        let mut norm = [0i16; MAX_ML + 1];
+                        let mut remaining = 1u32 << log;
+                        if low {
+                            for n in norm[1..max_sv1].iter_mut() {
+                                if remaining > 1 && rand(4) == 0 {
+                                    *n = -1;
+                                    remaining -= 1;
+                                }
+                            }
+                        }
+                        let hot = 1 + rand(max_sv1 as u64);
+                        while remaining > 0 {
+                            let s = if rand(2) == 0 {
+                                rand(hot)
+                            } else {
+                                rand(max_sv1 as u64)
+                            } as usize;
+                            if norm[s] >= 0 {
+                                norm[s] += 1;
+                                remaining -= 1;
+                            }
+                        }
+                        let off = kind.region as u16;
+                        let mut a = [ZERO; 512];
+                        let mut b = [ZERO; 512];
+                        build_seq_table(&mut a, &norm, max_sv1, log, kind.base, kind.bits, off);
+                        build_seq_table_fast(
+                            &mut b,
+                            &norm,
+                            max_sv1,
+                            log,
+                            kind.base,
+                            kind.bits,
+                            off,
+                            Features::detect(),
+                        );
+                        for u in 0..1 << log {
+                            assert_eq!(
+                                (a[u].next_state, a[u].nb_bits, a[u].base, a[u].nb_add_bits),
+                                (b[u].next_state, b[u].nb_bits, b[u].base, b[u].nb_add_bits),
+                                "log {log} low {low} case {case} cell {u}"
+                            );
+                        }
+                    }
+                }
             }
         }
     }

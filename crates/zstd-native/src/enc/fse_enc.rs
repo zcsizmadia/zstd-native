@@ -13,6 +13,7 @@
 
 use super::bitwriter::BitWriter;
 use crate::error::{Error, Result};
+use crate::fse::inv_table_step;
 
 /// libzstd's `FSE_MAX_TABLELOG` (`FSE_MAX_MEMORY_USAGE - 2`, default 14 - 2).
 pub(crate) const FSE_MAX_TABLELOG: u32 = 12;
@@ -527,11 +528,15 @@ impl<const STATES: usize, const SYMBOLS: usize> FseCTable<STATES, SYMBOLS> {
         }
         cumul[max_sv1] = table_size + 1;
 
-        // Spread symbols.
+        // Spread symbols and build the table: next state values, sorted by
+        // symbol.
         if high_threshold == table_size - 1 {
-            // No low-probability symbols: lay the symbols out in order,
-            // then scatter (libzstd's fast path; same result as the loop
-            // below).
+            // No low-probability symbols: lay the symbols out in order
+            // (libzstd's fast path), then build the table straight from
+            // that layout (meta/zstd#4836): cell `u` holds the sorted
+            // symbol at `(u * inv) & mask` (see `fse::inv_table_step`), so
+            // the cells are walked in order instead of scattering the
+            // symbols and reading them back. Same table as the loop below.
             let mut spread = [0u8; STATES];
             let mut pos = 0usize;
             for (s, &n) in norm[..max_sv1].iter().enumerate() {
@@ -539,14 +544,16 @@ impl<const STATES: usize, const SYMBOLS: usize> FseCTable<STATES, SYMBOLS> {
                 spread[pos..pos + n].fill(s as u8);
                 pos += n;
             }
-            let mut position = 0usize;
-            let step = step as usize;
+            let inv = inv_table_step(table_size) as usize;
             let mask = table_mask as usize;
-            for &sym in &spread[..ts] {
-                table_symbol[position] = sym;
-                position = (position + step) & mask;
+            let mut si = 0usize;
+            for u in 0..table_size {
+                let c = &mut cumul[usize::from(spread[si])];
+                si = (si + inv) & mask;
+                self.state_table[*c as usize] = (table_size + u) as u16;
+                *c += 1;
             }
-            debug_assert_eq!(position, 0);
+            debug_assert_eq!(si, 0, "visited every cell");
         } else {
             let mut position = 0u32;
             for (symbol, &freq) in norm[..max_sv1].iter().enumerate() {
@@ -559,13 +566,11 @@ impl<const STATES: usize, const SYMBOLS: usize> FseCTable<STATES, SYMBOLS> {
                 }
             }
             debug_assert_eq!(position, 0);
-        }
-
-        // Build the table: next state values, sorted by symbol.
-        for (u, &s) in table_symbol[..ts].iter().enumerate() {
-            let c = &mut cumul[s as usize];
-            self.state_table[*c as usize] = (table_size + u as u32) as u16;
-            *c += 1;
+            for (u, &s) in table_symbol[..ts].iter().enumerate() {
+                let c = &mut cumul[s as usize];
+                self.state_table[*c as usize] = (table_size + u as u32) as u16;
+                *c += 1;
+            }
         }
 
         // Symbol transformation table.
@@ -830,6 +835,110 @@ mod tests {
         count[nsym - 1] += 1;
         let total = count.iter().map(|&c| c as usize).sum();
         (count, total)
+    }
+
+    /// A random normalized distribution of `max_sv1` symbols summing to
+    /// `1 << log`, with some -1 (low-probability) symbols when `low`
+    /// (never symbol 0), as meta/zstd#4836's `FUZ_genNormalizedCount`.
+    fn random_norm(r: &mut Rng, max_sv1: usize, log: u32, low: bool) -> Vec<i16> {
+        let mut norm = alloc::vec![0i16; max_sv1];
+        let mut remaining = 1u32 << log;
+        if low {
+            for n in norm.iter_mut().skip(1) {
+                if remaining > 1 && r.below(4) == 0 {
+                    *n = -1;
+                    remaining -= 1;
+                }
+            }
+        }
+        // Skewed or flat: add to a few symbols or to any.
+        let hot = 1 + r.below(max_sv1 as u64) as usize;
+        while remaining > 0 {
+            let s = if r.below(2) == 0 {
+                r.below(hot as u64) as usize
+            } else {
+                r.below(max_sv1 as u64) as usize
+            };
+            if norm[s] >= 0 {
+                norm[s] += 1;
+                remaining -= 1;
+            }
+        }
+        norm
+    }
+
+    /// The plain construction (libzstd's spread, then the read-back in
+    /// cell order): the state table every build must reproduce.
+    fn reference_state_table(norm: &[i16], log: u32) -> Vec<u16> {
+        let size = 1u32 << log;
+        let mask = size - 1;
+        let step = table_step(size);
+        let mut cells = alloc::vec![0u8; size as usize];
+        let mut high = size - 1;
+        for (s, &n) in norm.iter().enumerate() {
+            if n == -1 {
+                cells[high as usize] = s as u8;
+                high = high.wrapping_sub(1);
+            }
+        }
+        let mut pos = 0u32;
+        for (s, &n) in norm.iter().enumerate() {
+            for _ in 0..n.max(0) {
+                cells[pos as usize] = s as u8;
+                pos = (pos + step) & mask;
+                while pos > high {
+                    pos = (pos + step) & mask;
+                }
+            }
+        }
+        assert_eq!(pos, 0);
+        let mut cumul = alloc::vec![0u32; norm.len()];
+        let mut c = 0;
+        for (s, &n) in norm.iter().enumerate() {
+            cumul[s] = c;
+            c += if n == -1 { 1 } else { n as u32 };
+        }
+        let mut table = alloc::vec![0u16; size as usize];
+        for (u, &s) in cells.iter().enumerate() {
+            table[cumul[s as usize] as usize] = (size + u as u32) as u16;
+            cumul[s as usize] += 1;
+        }
+        table
+    }
+
+    /// Both spread paths (the fast one without -1 symbols, and the general one)
+    /// build exactly the reference table, for every table log and many
+    /// distributions, in the table types the encoder uses.
+    #[test]
+    fn build_matches_reference_spread() {
+        fn check<const N: usize, const S: usize>(
+            r: &mut Rng,
+            logs: core::ops::RangeInclusive<u32>,
+        ) {
+            let mut ct = FseCTable::<N, S>::new();
+            for log in logs {
+                for low in [false, true] {
+                    for _ in 0..if cfg!(miri) { 2 } else { 300 } {
+                        let max_sv1 = 2 + r.below(S as u64 - 1) as usize;
+                        let norm = random_norm(r, max_sv1, log, low);
+                        ct.build(&norm, max_sv1 as u32 - 1, log).unwrap();
+                        let size = 1usize << log;
+                        assert_eq!(
+                            &ct.state_table[..size],
+                            &reference_state_table(&norm, log)[..],
+                            "log {log} norm {norm:?}"
+                        );
+                    }
+                }
+            }
+        }
+        let mut r = Rng(0x2545_F491_4F6C_DD1D);
+        // Sequence codes (literal lengths, match lengths, offsets).
+        check::<512, 64>(&mut r, 5..=9);
+        // Huffman weights.
+        check::<64, 13>(&mut r, 5..=6);
+        // Every table log the encoder supports.
+        check::<4096, 256>(&mut r, 5..=FSE_MAX_TABLELOG);
     }
 
     #[test]

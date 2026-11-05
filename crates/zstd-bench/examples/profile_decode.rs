@@ -45,7 +45,12 @@ fn main() {
     let mut native = zstd_native::Decompressor::new();
     let mut c = zstd::bulk::Decompressor::new().unwrap();
     let mut sd = structured_zstd::decoding::FrameDecoder::new();
-    while t.elapsed().as_secs_f64() < secs {
+    // `ZSTD_BENCH_ITERS=n` runs exactly n iterations instead of `secs`
+    // (fixed work for `perf stat` instruction counts).
+    let iters: Option<u64> = std::env::var("ZSTD_BENCH_ITERS")
+        .ok()
+        .map(|s| s.parse().unwrap());
+    while iters.map_or_else(|| t.elapsed().as_secs_f64() < secs, |i| n < i) {
         let len = match lib {
             "native-stream" => {
                 use std::io::Read;
