@@ -196,6 +196,69 @@ The ranges in brackets are the slowest and fastest file.
 | x-ray | 664 | 586 | 463 | 1.13x | 1.43x |
 | **geometric mean** | | | | **1.09x** | **1.29x** |
 
+## Other implementations
+
+The same machine and corpus, on CPU 8. The figures are zstd-native's speed
+divided by each implementation's: above 1.00x, zstd-native is faster.
+
+**Method:**
+- Each implementation ran single-threaded on whole files in memory, with
+  reused contexts and preallocated buffers.
+- Each measurement ran at least 2 s for compression (8 s at level 19) and
+  1.5 s for decompression. Java, C# and Node were warmed up for 3 s first.
+- Every implementation decoded the same libzstd-made frames, and each
+  decode was checked against the original file.
+
+**The C builds:**
+- **libzstd, gcc -O3:** libzstd 1.5.7 built with upstream's Makefile and
+  timed with the same loop as the Rust benches.
+- **CLI:** upstream's `zstd --single-thread -b`, which reports its fastest
+  round and so slightly favours C.
+
+| | `zstd` crate | libzstd, gcc -O3 | CLI gcc | CLI clang | CLI gcc `-march=native` | ZstdSharp 0.8.8 (C#) | klauspost/compress (Go) | aircompressor 3.14 (Java) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Compress L1 | 1.03x | 1.02x | 1.03x | 1.08x | 1.02x | 1.16x | 1.42x* | |
+| Compress L3 | 1.00x | 0.99x | 1.00x | 1.02x | 1.07x | 1.18x | 1.20x* | 1.84x* |
+| Compress L7 | 1.04x | 1.03x | 1.04x | 1.05x | 0.99x | | 0.62x* | |
+| Compress L9 | 1.03x | 1.02x | 1.01x | 1.06x | 0.98x | 1.24x | | |
+| Compress L11 | 0.98x | 0.98x | 0.98x | 1.06x | 0.99x | | 1.29x* | |
+| Compress L19 | 1.30x | 1.30x | 1.31x | 1.33x | 1.15x | 1.38x | | |
+| Decompress L1 | 1.05x | 1.05x | 1.05x | 1.07x | 1.09x | 1.27x | 1.14x | 1.84x |
+| Decompress L3 | 1.09x | 1.08x | 1.08x | 1.11x | 1.14x | 1.22x | 1.15x | 1.75x |
+| Decompress L9 | 1.08x | 1.08x | 1.08x | 1.12x | 1.15x | 1.21x | 1.17x | 1.78x |
+| Decompress L19 | 1.10x | 1.09x | 1.09x | 1.13x | 1.15x | 1.20x | 1.15x | 1.77x |
+
+\* **Different output:** these implementations don't produce libzstd's
+output at that level, so their compression ratio differs.
+- Go has presets, not levels. They are listed at the nearest level:
+  Fastest at 1, Default at 3, Better at 7, Best at 11.
+- Compared at equal compression ratio, zstd-native is 1.42x faster than
+  Fastest, 1.41x faster than Default, 1.25x faster than Better and 2.36x
+  faster than Best. Better compresses less than level 7, which is why it
+  shows 0.62x.
+- aircompressor's pure-Java compressor (`ZstdJavaCompressor`) is fixed at
+  level 3. Its default `ZstdCompressor` uses a bundled native libzstd when
+  one is present.
+
+**Notes:**
+- **ZstdSharp** produces libzstd's output (it is a C# port of libzstd
+  1.5.7). It ran on .NET 10.
+- **JavaScript:** both pure-JavaScript ports are about 10x slower at
+  decompression (xml: fzstd 0.1.1 at 207 MiB/s, zstdify 1.4.0 at 246 MiB/s,
+  against zstd-native's 2196 MiB/s), so they weren't measured further.
+- **Bindings** to C libzstd (Python, zstd-jni, DataDog/zstd for Go) run at
+  C's speed, minus the cost of calling across the language boundary.
+
+**Where C is faster:**
+- **Level 11:** gcc-built libzstd is 2% faster, with single files at
+  0.96-1.00x.
+- **Levels 7 and 9:** a build with `-march=native` for this exact CPU is
+  1-2% faster.
+- **Level 3:** it's even.
+
+The lazy and row match finders (levels 5-15) are where more work could
+close this gap.
+
 ## Not measured yet
 
 - **AArch64.** All hand-written assembly is x86-64; on ARM the Rust
