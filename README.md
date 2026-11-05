@@ -42,16 +42,16 @@ risk. Sibling of [xz-native](https://github.com/zcsizmadia/xz-native).
 
   | zstd-native speed (1.25x = 25% faster) | vs C libzstd 1.5.7 | vs [structured-zstd](https://crates.io/crates/structured-zstd) 0.2.6 |
   |---|---:|---:|
-  | Compression, level 1 | 1.04x | 1.06x |
+  | Compression, level 1 | 1.04x | 1.07x |
   | Compression, level 3 (default) | 1.05x | 1.33x |
-  | Compression, level 9 | 1.15x | 1.18x |
-  | Compression, level 19 | 1.30x | 1.11x |
-  | Decompression (frames of levels 1-19) | 1.05-1.09x | 1.20-1.29x |
+  | Compression, level 9 | 1.13x | 1.28x |
+  | Compression, level 19 | 1.38x | 1.17x |
+  | Decompression (frames of levels 1-19) | 1.07-1.11x | 1.20-1.29x |
   | Compression, 16 threads (levels 1-19) | 1.03-1.26x | |
 
-  The structured-zstd column was measured before the latest speedups
-  (level 9 has gained about 10% since). structured-zstd is the fastest
-  other pure-Rust zstd, and its compressed output differs from libzstd's.
+  zstd-native is faster than both on every Silesia file, level and
+  direction. structured-zstd is the fastest other pure-Rust zstd, and its
+  compressed output differs from libzstd's.
   [ruzstd](https://crates.io/crates/ruzstd) decompresses 3-7x slower than
   zstd-native.
 

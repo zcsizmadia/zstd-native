@@ -1,11 +1,11 @@
 # Benchmarks
 
-zstd-native 0.1.0 (main `fecceab`) against C libzstd 1.5.7 and
+zstd-native 0.1.0 (main `ecc11d4`) against C libzstd 1.5.7 and
 [structured-zstd](https://crates.io/crates/structured-zstd) 0.2.6, the
 fastest other pure-Rust zstd crate. [ruzstd](https://crates.io/crates/ruzstd)
 decompresses 3-7x slower than zstd-native, so it isn't in the tables.
-Later results against C (levels 1-15 and multithreading) are in
-[Since `fecceab`](#since-fecceab).
+Other levels and multithreading, measured against C only, are in
+[More levels and multithreading](#more-levels-and-multithreading).
 
 ## Setup
 
@@ -41,29 +41,28 @@ level 3), in either direction.
 
 | | vs libzstd 1.5.7 | vs structured-zstd 0.2.6 |
 |---|---:|---:|
-| Compression, level 1 | 1.02x (0.99-1.18) | 1.06x (1.01-1.22) |
-| Compression, level 3 | 1.00x (0.99-1.02) | 1.33x (1.18-1.48) |
-| Compression, level 9 | 1.03x (1.01-1.06) | 1.18x (1.10-1.25) |
-| Compression, level 19 | 1.30x (1.11-1.66) | 1.11x (1.06-1.23) |
-| Decompression, level 1 frames | 1.05x (1.03-1.11) | 1.20x (1.03-1.43) |
-| Decompression, level 3 frames | 1.09x (1.04-1.18) | 1.25x (1.15-1.42) |
-| Decompression, level 9 frames | 1.09x (1.05-1.14) | 1.28x (1.14-1.43) |
-| Decompression, level 19 frames | 1.09x (1.05-1.13) | 1.29x (1.16-1.44) |
+| Compression, level 1 | 1.04x (1.01-1.20) | 1.07x (1.02-1.23) |
+| Compression, level 3 | 1.05x (1.02-1.08) | 1.33x (1.21-1.50) |
+| Compression, level 9 | 1.13x (1.09-1.20) | 1.28x (1.19-1.33) |
+| Compression, level 19 | 1.38x (1.19-1.69) | 1.17x (1.09-1.33) |
+| Decompression, level 1 frames | 1.07x (1.02-1.14) | 1.20x (1.04-1.44) |
+| Decompression, level 3 frames | 1.10x (1.05-1.18) | 1.24x (1.14-1.42) |
+| Decompression, level 9 frames | 1.11x (1.07-1.17) | 1.27x (1.11-1.44) |
+| Decompression, level 19 frames | 1.11x (1.06-1.19) | 1.29x (1.12-1.45) |
 
-The ranges in brackets are the slowest and fastest file.
+The ranges in brackets are the slowest and fastest file. zstd-native is
+faster than both on every file, level and direction. Level 19 compression
+speeds have one decimal (2.6-6.4 MiB/s), so single-file ratios there are
+±2-4%.
 
-## Since `fecceab`
+## More levels and multithreading
 
-The summary and per-file tables above and below were measured at
-`fecceab`. These later changes moved the numbers against C libzstd;
-structured-zstd wasn't measured again.
+Measured against C libzstd only.
 
 ### Levels 1-4
 
-No change to the code, but a more careful run (best of 2 paths × 2 reps,
-interleaved, CPU 16, main `5d6d676`, against the `zstd` crate) puts
-zstd-native at or above C on every Silesia file
-([#17](https://github.com/zcsizmadia/zstd-native/issues/17)):
+Best of 2 paths × 2 reps, interleaved, CPU 16, main `5d6d676`, against
+the `zstd` crate ([#17](https://github.com/zcsizmadia/zstd-native/issues/17)):
 
 | | L1 | L2 | L3 | L4 |
 |---|---:|---:|---:|---:|
@@ -131,150 +130,152 @@ within run-to-run noise. The full 1-16 worker matrix is in #52.
 
 | File | zstd-native | libzstd | structured-zstd | vs libzstd | vs structured-zstd | Ratio (native = libzstd) | Ratio (structured-zstd) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| dickens | 301.5 | 302.6 | 292.6 | 1.00x | 1.03x | 2.392 | 2.392 |
-| mozilla | 432.5 | 430.3 | 401.8 | 1.00x | 1.08x | 2.565 | 2.555 |
-| mr | 406.1 | 400.4 | 388.1 | 1.01x | 1.05x | 2.615 | 2.615 |
-| nci | 878.0 | 852.1 | 788.3 | 1.03x | 1.11x | 11.779 | 11.788 |
-| ooffice | 378.8 | 371.6 | 366.2 | 1.02x | 1.03x | 1.712 | 1.712 |
-| osdb | 441.9 | 437.5 | 433.8 | 1.01x | 1.02x | 2.704 | 2.706 |
-| reymont | 301.1 | 304.8 | 286.5 | 0.99x | 1.05x | 3.084 | 3.084 |
-| samba | 506.0 | 513.1 | 489.5 | 0.99x | 1.03x | 3.937 | 3.917 |
-| sao | 369.1 | 356.3 | 361.1 | 1.04x | 1.02x | 1.160 | 1.160 |
-| webster | 341.0 | 344.7 | 337.2 | 0.99x | 1.01x | 3.035 | 3.036 |
-| xml | 716.0 | 707.1 | 662.6 | 1.01x | 1.08x | 7.710 | 7.713 |
-| x-ray | 826.7 | 699.7 | 675.4 | 1.18x | 1.22x | 1.251 | 1.251 |
-| **geometric mean** | | | | **1.02x** | **1.06x** | | |
+| dickens | 308.5 | 301.4 | 298.2 | 1.02x | 1.03x | 2.392 | 2.392 |
+| mozilla | 442.5 | 430.5 | 410.2 | 1.03x | 1.08x | 2.565 | 2.555 |
+| mr | 412.0 | 395.9 | 392.9 | 1.04x | 1.05x | 2.615 | 2.615 |
+| nci | 890.9 | 852.8 | 798.5 | 1.04x | 1.12x | 11.779 | 11.788 |
+| ooffice | 385.8 | 370.3 | 369.4 | 1.04x | 1.04x | 1.712 | 1.712 |
+| osdb | 448.3 | 436.1 | 439.8 | 1.03x | 1.02x | 2.704 | 2.706 |
+| reymont | 305.7 | 302.3 | 291.3 | 1.01x | 1.05x | 3.084 | 3.084 |
+| samba | 516.6 | 511.5 | 496.0 | 1.01x | 1.04x | 3.937 | 3.917 |
+| sao | 375.9 | 359.1 | 366.1 | 1.05x | 1.03x | 1.160 | 1.160 |
+| webster | 348.5 | 345.1 | 339.5 | 1.01x | 1.03x | 3.035 | 3.036 |
+| xml | 724.1 | 709.9 | 670.5 | 1.02x | 1.08x | 7.710 | 7.713 |
+| x-ray | 841.9 | 699.5 | 683.7 | 1.20x | 1.23x | 1.251 | 1.251 |
+| **geometric mean** | | | | **1.04x** | **1.07x** | | |
 
 ### Compression, level 3
 
 | File | zstd-native | libzstd | structured-zstd | vs libzstd | vs structured-zstd | Ratio (native = libzstd) | Ratio (structured-zstd) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| dickens | 159.3 | 157.6 | 124.6 | 1.01x | 1.28x | 2.782 | 2.785 |
-| mozilla | 239.3 | 241.8 | 164.2 | 0.99x | 1.46x | 2.810 | 2.809 |
-| mr | 193.5 | 193.6 | 149.5 | 1.00x | 1.29x | 2.811 | 2.784 |
-| nci | 669.2 | 658.6 | 452.1 | 1.02x | 1.48x | 11.840 | 11.888 |
-| ooffice | 174.5 | 175.3 | 132.1 | 0.99x | 1.32x | 1.968 | 1.970 |
-| osdb | 239.0 | 240.1 | 191.6 | 0.99x | 1.25x | 2.880 | 2.882 |
-| reymont | 205.4 | 203.8 | 157.8 | 1.01x | 1.30x | 3.420 | 3.419 |
-| samba | 323.5 | 321.8 | 234.5 | 1.00x | 1.38x | 4.360 | 4.376 |
-| sao | 135.3 | 136.5 | 107.4 | 0.99x | 1.26x | 1.312 | 1.312 |
-| webster | 193.1 | 191.7 | 144.5 | 1.01x | 1.34x | 3.427 | 3.430 |
-| xml | 511.5 | 504.2 | 362.2 | 1.01x | 1.41x | 8.414 | 8.416 |
-| x-ray | 130.4 | 129.8 | 110.3 | 1.00x | 1.18x | 1.393 | 1.357 |
-| **geometric mean** | | | | **1.00x** | **1.33x** | | |
+| dickens | 161.5 | 157.3 | 126.4 | 1.03x | 1.28x | 2.782 | 2.785 |
+| mozilla | 244.2 | 230.2 | 166.8 | 1.06x | 1.46x | 2.810 | 2.809 |
+| mr | 196.8 | 187.1 | 153.0 | 1.05x | 1.29x | 2.811 | 2.784 |
+| nci | 687.4 | 657.7 | 458.8 | 1.05x | 1.50x | 11.840 | 11.888 |
+| ooffice | 176.4 | 164.7 | 134.1 | 1.07x | 1.32x | 1.968 | 1.970 |
+| osdb | 241.6 | 229.7 | 192.7 | 1.05x | 1.25x | 2.880 | 2.882 |
+| reymont | 207.6 | 203.0 | 161.2 | 1.02x | 1.29x | 3.420 | 3.419 |
+| samba | 326.8 | 315.4 | 236.2 | 1.04x | 1.38x | 4.360 | 4.376 |
+| sao | 136.6 | 128.8 | 109.3 | 1.06x | 1.25x | 1.312 | 1.312 |
+| webster | 197.6 | 190.3 | 145.7 | 1.04x | 1.36x | 3.427 | 3.430 |
+| xml | 519.5 | 500.0 | 368.3 | 1.04x | 1.41x | 8.414 | 8.416 |
+| x-ray | 133.5 | 123.3 | 110.7 | 1.08x | 1.21x | 1.393 | 1.357 |
+| **geometric mean** | | | | **1.05x** | **1.33x** | | |
 
 ### Compression, level 9
 
 | File | zstd-native | libzstd | structured-zstd | vs libzstd | vs structured-zstd | Ratio (native = libzstd) | Ratio (structured-zstd) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| dickens | 43.2 | 42.5 | 34.8 | 1.02x | 1.24x | 3.105 | 3.088 |
-| mozilla | 68.0 | 65.9 | 57.5 | 1.03x | 1.18x | 3.073 | 3.055 |
-| mr | 54.8 | 53.6 | 44.5 | 1.02x | 1.23x | 3.006 | 2.987 |
-| nci | 107.3 | 105.6 | 93.9 | 1.02x | 1.14x | 14.935 | 14.970 |
-| ooffice | 55.2 | 53.3 | 48.5 | 1.04x | 1.14x | 2.155 | 2.139 |
-| osdb | 64.9 | 64.0 | 55.1 | 1.01x | 1.18x | 3.017 | 3.011 |
-| reymont | 50.0 | 49.0 | 39.9 | 1.02x | 1.25x | 3.967 | 3.952 |
-| samba | 82.4 | 78.7 | 68.6 | 1.05x | 1.20x | 4.967 | 4.932 |
-| sao | 51.0 | 49.6 | 46.3 | 1.03x | 1.10x | 1.390 | 1.393 |
-| webster | 52.5 | 52.2 | 44.1 | 1.01x | 1.19x | 4.041 | 4.014 |
-| xml | 105.6 | 99.4 | 90.7 | 1.06x | 1.16x | 10.340 | 10.342 |
-| x-ray | 52.1 | 49.5 | 46.9 | 1.05x | 1.11x | 1.581 | 1.559 |
-| **geometric mean** | | | | **1.03x** | **1.18x** | | |
+| dickens | 46.6 | 42.4 | 35.5 | 1.10x | 1.31x | 3.105 | 3.088 |
+| mozilla | 73.7 | 65.5 | 58.0 | 1.13x | 1.27x | 3.073 | 3.055 |
+| mr | 59.4 | 53.3 | 45.3 | 1.11x | 1.31x | 3.006 | 2.987 |
+| nci | 121.8 | 111.3 | 96.2 | 1.09x | 1.27x | 14.935 | 14.970 |
+| ooffice | 59.9 | 52.8 | 48.8 | 1.13x | 1.23x | 2.155 | 2.139 |
+| osdb | 72.5 | 63.8 | 56.1 | 1.14x | 1.29x | 3.017 | 3.011 |
+| reymont | 53.9 | 49.4 | 40.5 | 1.09x | 1.33x | 3.967 | 3.952 |
+| samba | 91.5 | 81.4 | 70.0 | 1.12x | 1.31x | 4.967 | 4.932 |
+| sao | 58.0 | 48.9 | 47.1 | 1.19x | 1.23x | 1.390 | 1.393 |
+| webster | 57.1 | 52.4 | 44.4 | 1.09x | 1.29x | 4.041 | 4.014 |
+| xml | 120.4 | 104.4 | 91.0 | 1.15x | 1.32x | 10.340 | 10.342 |
+| x-ray | 57.4 | 47.8 | 48.4 | 1.20x | 1.19x | 1.581 | 1.559 |
+| **geometric mean** | | | | **1.13x** | **1.28x** | | |
 
 ### Compression, level 19
 
 | File | zstd-native | libzstd | structured-zstd | vs libzstd | vs structured-zstd | Ratio (native = libzstd) | Ratio (structured-zstd) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| dickens | 2.9 | 2.6 | 2.7 | 1.11x | 1.07x | 3.576 | 3.576 |
-| mozilla | 4.8 | 3.6 | 4.4 | 1.33x | 1.09x | 3.400 | 3.392 |
-| mr | 4.9 | 4.2 | 4.4 | 1.17x | 1.11x | 3.209 | 3.209 |
-| nci | 3.6 | 2.3 | 3.3 | 1.56x | 1.09x | 20.152 | 20.134 |
-| ooffice | 5.4 | 4.5 | 4.8 | 1.20x | 1.12x | 2.371 | 2.371 |
-| osdb | 4.4 | 3.3 | 3.9 | 1.33x | 1.13x | 3.253 | 3.253 |
-| reymont | 3.2 | 2.6 | 2.8 | 1.23x | 1.14x | 4.915 | 4.915 |
-| samba | 4.9 | 3.6 | 4.6 | 1.36x | 1.06x | 5.543 | 5.533 |
-| sao | 5.2 | 4.6 | 4.8 | 1.13x | 1.08x | 1.450 | 1.450 |
-| webster | 2.9 | 2.4 | 2.7 | 1.21x | 1.07x | 4.777 | 4.775 |
-| xml | 5.3 | 3.2 | 4.7 | 1.66x | 1.13x | 11.801 | 11.803 |
-| x-ray | 5.9 | 4.3 | 4.8 | 1.37x | 1.23x | 1.652 | 1.652 |
-| **geometric mean** | | | | **1.30x** | **1.11x** | | |
+| dickens | 3.3 | 2.6 | 2.7 | 1.27x | 1.22x | 3.576 | 3.576 |
+| mozilla | 5.1 | 3.6 | 4.4 | 1.42x | 1.16x | 3.400 | 3.392 |
+| mr | 5.4 | 4.2 | 4.5 | 1.29x | 1.20x | 3.209 | 3.209 |
+| nci | 3.7 | 2.3 | 3.4 | 1.61x | 1.09x | 20.152 | 20.134 |
+| ooffice | 5.8 | 4.6 | 5.0 | 1.26x | 1.16x | 2.371 | 2.371 |
+| osdb | 4.6 | 3.3 | 4.0 | 1.39x | 1.15x | 3.253 | 3.253 |
+| reymont | 3.4 | 2.7 | 2.9 | 1.26x | 1.17x | 4.915 | 4.915 |
+| samba | 5.2 | 3.6 | 4.6 | 1.44x | 1.13x | 5.543 | 5.533 |
+| sao | 5.7 | 4.8 | 5.0 | 1.19x | 1.14x | 1.450 | 1.450 |
+| webster | 3.2 | 2.4 | 2.7 | 1.33x | 1.19x | 4.777 | 4.775 |
+| xml | 5.4 | 3.2 | 4.8 | 1.69x | 1.13x | 11.801 | 11.803 |
+| x-ray | 6.4 | 4.3 | 4.8 | 1.49x | 1.33x | 1.652 | 1.652 |
+| **geometric mean** | | | | **1.38x** | **1.17x** | | |
 
 ### Decompression, level 1
 
 | File | zstd-native | libzstd | structured-zstd | vs libzstd | vs structured-zstd |
 |---|---:|---:|---:|---:|---:|
-| dickens | 1315 | 1190 | 918 | 1.10x | 1.43x |
-| mozilla | 1160 | 1112 | 991 | 1.04x | 1.17x |
-| mr | 1360 | 1313 | 1081 | 1.04x | 1.26x |
-| nci | 2298 | 2212 | 1990 | 1.04x | 1.16x |
-| ooffice | 991 | 965 | 870 | 1.03x | 1.14x |
-| osdb | 1453 | 1389 | 1289 | 1.05x | 1.13x |
-| reymont | 1357 | 1222 | 1001 | 1.11x | 1.36x |
-| samba | 1787 | 1704 | 1483 | 1.05x | 1.21x |
-| sao | 997 | 970 | 909 | 1.03x | 1.10x |
-| webster | 1369 | 1280 | 1072 | 1.07x | 1.28x |
-| xml | 2201 | 2126 | 1914 | 1.03x | 1.15x |
-| x-ray | 1107 | 1049 | 1074 | 1.05x | 1.03x |
-| **geometric mean** | | | | **1.05x** | **1.20x** |
+| dickens | 1338 | 1188 | 932 | 1.13x | 1.44x |
+| mozilla | 1178 | 1121 | 1007 | 1.05x | 1.17x |
+| mr | 1379 | 1321 | 1101 | 1.04x | 1.25x |
+| nci | 2327 | 2195 | 2020 | 1.06x | 1.15x |
+| ooffice | 1005 | 981 | 878 | 1.02x | 1.14x |
+| osdb | 1471 | 1396 | 1302 | 1.05x | 1.13x |
+| reymont | 1377 | 1206 | 1013 | 1.14x | 1.36x |
+| samba | 1812 | 1705 | 1511 | 1.06x | 1.20x |
+| sao | 1006 | 979 | 919 | 1.03x | 1.09x |
+| webster | 1392 | 1284 | 1088 | 1.08x | 1.28x |
+| xml | 2231 | 2119 | 1939 | 1.05x | 1.15x |
+| x-ray | 1125 | 1063 | 1084 | 1.06x | 1.04x |
+| **geometric mean** | | | | **1.07x** | **1.20x** |
 
 ### Decompression, level 3
 
 | File | zstd-native | libzstd | structured-zstd | vs libzstd | vs structured-zstd |
 |---|---:|---:|---:|---:|---:|
-| dickens | 1083 | 949 | 761 | 1.14x | 1.42x |
-| mozilla | 1096 | 1033 | 900 | 1.06x | 1.22x |
-| mr | 1199 | 1070 | 881 | 1.12x | 1.36x |
-| nci | 2218 | 2122 | 1932 | 1.04x | 1.15x |
-| ooffice | 916 | 861 | 751 | 1.06x | 1.22x |
-| osdb | 1470 | 1385 | 1254 | 1.06x | 1.17x |
-| reymont | 1237 | 1099 | 910 | 1.13x | 1.36x |
-| samba | 1724 | 1606 | 1385 | 1.07x | 1.25x |
-| sao | 822 | 779 | 682 | 1.05x | 1.21x |
-| webster | 1172 | 997 | 852 | 1.18x | 1.38x |
-| xml | 2163 | 2061 | 1879 | 1.05x | 1.15x |
-| x-ray | 835 | 764 | 710 | 1.09x | 1.18x |
-| **geometric mean** | | | | **1.09x** | **1.25x** |
+| dickens | 1102 | 933 | 775 | 1.18x | 1.42x |
+| mozilla | 1116 | 1044 | 917 | 1.07x | 1.22x |
+| mr | 1212 | 1058 | 900 | 1.15x | 1.35x |
+| nci | 2274 | 2122 | 1996 | 1.07x | 1.14x |
+| ooffice | 932 | 872 | 760 | 1.07x | 1.23x |
+| osdb | 1498 | 1386 | 1273 | 1.08x | 1.18x |
+| reymont | 1258 | 1087 | 927 | 1.16x | 1.36x |
+| samba | 1755 | 1591 | 1410 | 1.10x | 1.24x |
+| sao | 834 | 791 | 692 | 1.05x | 1.21x |
+| webster | 1131 | 1070 | 922 | 1.06x | 1.23x |
+| xml | 2194 | 2051 | 1904 | 1.07x | 1.15x |
+| x-ray | 849 | 767 | 719 | 1.11x | 1.18x |
+| **geometric mean** | | | | **1.10x** | **1.24x** |
 
 ### Decompression, level 9
 
 | File | zstd-native | libzstd | structured-zstd | vs libzstd | vs structured-zstd |
 |---|---:|---:|---:|---:|---:|
-| dickens | 1193 | 1054 | 837 | 1.13x | 1.43x |
-| mozilla | 1076 | 1014 | 870 | 1.06x | 1.24x |
-| mr | 1210 | 1064 | 846 | 1.14x | 1.43x |
-| nci | 2982 | 2798 | 2616 | 1.07x | 1.14x |
-| ooffice | 917 | 853 | 716 | 1.07x | 1.28x |
-| osdb | 1523 | 1413 | 1269 | 1.08x | 1.20x |
-| reymont | 1416 | 1297 | 1086 | 1.09x | 1.30x |
-| samba | 1870 | 1768 | 1537 | 1.06x | 1.22x |
-| sao | 957 | 891 | 768 | 1.07x | 1.25x |
-| webster | 1371 | 1238 | 1056 | 1.11x | 1.30x |
-| xml | 2760 | 2616 | 2390 | 1.05x | 1.16x |
-| x-ray | 730 | 648 | 509 | 1.13x | 1.43x |
-| **geometric mean** | | | | **1.09x** | **1.28x** |
+| dickens | 1214 | 1039 | 854 | 1.17x | 1.42x |
+| mozilla | 1101 | 1025 | 932 | 1.07x | 1.18x |
+| mr | 1225 | 1051 | 867 | 1.17x | 1.41x |
+| nci | 3041 | 2838 | 2731 | 1.07x | 1.11x |
+| ooffice | 931 | 855 | 731 | 1.09x | 1.27x |
+| osdb | 1560 | 1413 | 1285 | 1.10x | 1.21x |
+| reymont | 1448 | 1287 | 1112 | 1.13x | 1.30x |
+| samba | 1919 | 1764 | 1565 | 1.09x | 1.23x |
+| sao | 978 | 892 | 779 | 1.10x | 1.26x |
+| webster | 1400 | 1242 | 1073 | 1.13x | 1.30x |
+| xml | 2806 | 2604 | 2420 | 1.08x | 1.16x |
+| x-ray | 748 | 638 | 521 | 1.17x | 1.44x |
+| **geometric mean** | | | | **1.11x** | **1.27x** |
 
 ### Decompression, level 19
 
 | File | zstd-native | libzstd | structured-zstd | vs libzstd | vs structured-zstd |
 |---|---:|---:|---:|---:|---:|
-| dickens | 1249 | 1105 | 870 | 1.13x | 1.44x |
-| mozilla | 885 | 842 | 747 | 1.05x | 1.19x |
-| mr | 1156 | 1040 | 829 | 1.11x | 1.39x |
-| nci | 3388 | 3237 | 2860 | 1.05x | 1.19x |
-| ooffice | 750 | 681 | 571 | 1.10x | 1.31x |
-| osdb | 1528 | 1386 | 1193 | 1.10x | 1.28x |
-| reymont | 1472 | 1385 | 1165 | 1.06x | 1.26x |
-| samba | 1774 | 1657 | 1449 | 1.07x | 1.22x |
-| sao | 902 | 815 | 660 | 1.11x | 1.37x |
-| webster | 1419 | 1279 | 1077 | 1.11x | 1.32x |
-| xml | 2885 | 2729 | 2491 | 1.06x | 1.16x |
-| x-ray | 664 | 586 | 463 | 1.13x | 1.43x |
-| **geometric mean** | | | | **1.09x** | **1.29x** |
+| dickens | 1272 | 1089 | 884 | 1.17x | 1.44x |
+| mozilla | 913 | 855 | 771 | 1.07x | 1.18x |
+| mr | 1178 | 1034 | 842 | 1.14x | 1.40x |
+| nci | 3464 | 3260 | 3080 | 1.06x | 1.12x |
+| ooffice | 760 | 684 | 582 | 1.11x | 1.31x |
+| osdb | 1547 | 1386 | 1224 | 1.12x | 1.26x |
+| reymont | 1502 | 1368 | 1189 | 1.10x | 1.26x |
+| samba | 1807 | 1669 | 1475 | 1.08x | 1.23x |
+| sao | 915 | 806 | 672 | 1.14x | 1.36x |
+| webster | 1448 | 1281 | 1106 | 1.13x | 1.31x |
+| xml | 2935 | 2736 | 2517 | 1.07x | 1.17x |
+| x-ray | 684 | 577 | 472 | 1.19x | 1.45x |
+| **geometric mean** | | | | **1.11x** | **1.29x** |
 
 ## Other implementations
 
-The same machine and corpus, on CPU 8. The figures are zstd-native's speed
-divided by each implementation's: above 1.00x, zstd-native is faster.
+A one-time snapshot at main `fecceab`, before the speedups of #52 and #53:
+the other implementations aren't re-measured routinely. The same machine
+and corpus, on CPU 8. The figures are zstd-native's speed divided by each
+implementation's: above 1.00x, zstd-native is faster.
 
 **Method:**
 - Each implementation ran single-threaded on whole files in memory, with
@@ -331,8 +332,7 @@ output at that level, so their compression ratio differs.
 
 Both gaps are closed by
 [#53](https://github.com/zcsizmadia/zstd-native/pull/53) (see
-[Since `fecceab`](#since-fecceab)). This table is a one-time snapshot:
-the other implementations aren't re-measured routinely.
+[More levels and multithreading](#more-levels-and-multithreading)).
 
 ## Not measured yet
 
