@@ -464,7 +464,10 @@ pub(super) unsafe fn fast_block(
             // r9: hash1, r10: matchIdx (of ip0), r11: hashTable, r12: base,
             // r13: prefixStartIndex, r14: -rep_offset1, r15: 64 - hashLog,
             // rbx: DUMMY, rcx: ctx. Two positions per iteration (libzstd).
-            ".p2align 5",
+            // The loop is 127 bytes: on a 64-byte boundary it spans two
+            // lines; 32 bytes off (`.p2align 5`, as the linker happened to
+            // place it) three, and level 1 was 1.5-2% slower (#34).
+            ".p2align 6",
             "2:",
             // load repcode match for ip[2]
             "mov eax, dword ptr [rsi + r14]",
