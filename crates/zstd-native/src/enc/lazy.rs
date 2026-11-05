@@ -14,7 +14,8 @@
 //! (`searchLog` bounded to 4..=6), and the search functions on `EXT`
 //! (extDict) and `DMS` (dictMatchState: after the window's candidates, the
 //! attached dictionary's, with the attempts or compares left); they are
-//! not inlined (`FORCE_NOINLINE` in libzstd).
+//! not inlined (`FORCE_NOINLINE` in libzstd), except the BMI2 noDict row
+//! search with 16- and 32-entry rows (see `search_max`).
 //!
 //! It shares the match state, window and block loop with `fast` (see that
 //! module's docs). Table use: `hashTable` holds `minMatch`-byte hashes
@@ -815,6 +816,10 @@ unsafe fn dubt_find_better_dict_match<const MLS: u32>(
 /// BMI2 build of it with `BMI2`, except for the row finder with 64-entry
 /// rows (levels 11 and 12): its BMI2 build measured 3% slower there on the
 /// EPYC host (Zen 3), and 3-4% faster with 16-entry rows (levels 5-9).
+/// The BMI2 noDict row search with 16- or 32-entry rows is inlined into
+/// the parser instead (meta/zstd#4841, x86-64 only there too): the call
+/// (callee-saved spills, re-deriving the constants) measured 1-2% at
+/// levels 5-7 on the EPYC host, for 79 KB of code.
 ///
 /// # Safety
 /// `ip + 8 <= iend` (`+ 16` for the row finder), `iend` the block end;
@@ -834,6 +839,11 @@ unsafe fn search_max<
     iend: *const u8,
     offset_ptr: &mut u32,
 ) -> usize {
+    #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+    if BMI2 && METHOD == SEARCH_ROW_HASH && ROW_LOG != 6 && !EXT && !DMS {
+        // SAFETY: per the caller; the parser is the BMI2 build.
+        return unsafe { search_body::<MLS, METHOD, ROW_LOG, EXT, DMS>(s, ip, iend, offset_ptr) };
+    }
     #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
     if BMI2 && !(METHOD == SEARCH_ROW_HASH && ROW_LOG == 6) {
         // SAFETY: per the caller, including the CPU features.
