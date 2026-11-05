@@ -75,6 +75,14 @@ pub(crate) const NBWORKERS_MAX: u32 = if usize::BITS == 32 { 64 } else { 256 };
 const CHUNK_SIZE: usize = 4 * BLOCKSIZE_MAX;
 /// Bytes after the LDM copy of the round buffer, never in its window.
 const RING_SLACK: usize = 64;
+/// The room before a job's data in its input buffer, to place it at an
+/// offset of [`COPY_SKEW`] (mod 4 KiB) from the caller's input.
+const PAGE: usize = 4096;
+/// Where the input buffer starts relative to the caller's input, mod
+/// [`PAGE`]: glibc's `memcpy` takes a much slower (non-temporal) path when
+/// the destination is within a few hundred bytes of the source mod 4 KiB
+/// (4K aliasing; 1.8x slower overall at level 1 with 16 workers on Zen 3).
+const COPY_SKEW: usize = PAGE / 2;
 
 /// The multithreading parameters (libzstd's `ZSTD_c_nbWorkers`,
 /// `ZSTD_c_jobSize`, `ZSTD_c_overlapLog`).
@@ -364,8 +372,10 @@ struct Job {
     frame: Arc<Frame>,
     /// `jobID`
     id: u64,
-    /// The prefix (the overlap with the previous job), then the input.
+    /// Padding (`base` bytes), the prefix (the overlap with the previous
+    /// job), then the input (from `prefix`).
     data: Arc<Vec<u8>>,
+    base: usize,
     prefix: usize,
     /// Where the input is in libzstd's round buffer (for the LDM window).
     ring_pos: usize,
@@ -437,8 +447,8 @@ fn run_job(fc: &mut Option<Box<FrameCompressor>>, job: &Job) -> Result<(Vec<u8>,
     if cancelled() {
         return Err(Error::StageWrong);
     }
-    let buf = &job.data[..];
-    let src_start = job.prefix;
+    let buf = &job.data[job.base..];
+    let src_start = job.prefix - job.base;
     let size = buf.len() - src_start;
     let fc = if job.id == 0 {
         // the frame's parameters and size, the dictionary
@@ -613,9 +623,10 @@ pub(crate) struct MtCtx {
     /// `roundBuff.capacity` and `roundBuff.pos`.
     ring_cap: usize,
     ring_pos: usize,
-    /// `inBuff`: the prefix then the input loaded so far; `None` when no
-    /// input range is held.
+    /// `inBuff`: padding (`in_base` bytes), the prefix, then the input
+    /// loaded so far (from `in_prefix`); `None` when no input range is held.
     in_buf: Option<Vec<u8>>,
+    in_base: usize,
     in_prefix: usize,
     in_ring_pos: usize,
     /// The next job's prefix: the end of the previous job's data.
@@ -681,6 +692,7 @@ impl MtCtx {
             ring_cap: 0,
             ring_pos: 0,
             in_buf: None,
+            in_base: 0,
             in_prefix: 0,
             in_ring_pos: 0,
             prev: None,
@@ -735,6 +747,7 @@ impl MtCtx {
         self.ring_cap = sizes.ring_cap;
         self.ring_pos = 0;
         self.in_buf = None;
+        self.in_base = 0;
         self.in_prefix = 0;
         self.in_ring_pos = 0;
         self.prev = None;
@@ -894,7 +907,7 @@ impl MtCtx {
         // fill input buffer
         if self.ready.is_none() && *ip < input.len() {
             if self.in_buf.is_none() {
-                self.get_input_range();
+                self.get_input_range(input[*ip..].as_ptr() as usize);
             }
             let filled = self.filled();
             let to_load = (input.len() - *ip).min(self.target - filled);
@@ -931,8 +944,9 @@ impl MtCtx {
     /// `ZSTDMT_tryGetInputRange()`, which here always succeeds: the next
     /// input buffer, starting with the prefix, at the round buffer's
     /// position (back at the start, after the prefix, when the rest of the
-    /// round buffer is too small for a job).
-    fn get_input_range(&mut self) {
+    /// round buffer is too small for a job). The input is placed at
+    /// [`COPY_SKEW`] from `src` (the address it is loaded from) mod 4 KiB.
+    fn get_input_range(&mut self, src: usize) {
         let prefix = self.prev.as_ref().map_or(0, |p| p.2);
         if self.ring_cap - self.ring_pos < self.target {
             self.ring_pos = prefix;
@@ -943,7 +957,12 @@ impl MtCtx {
             .pledged
             .map_or(u64::MAX, |p| p.saturating_sub(self.consumed));
         let size = (self.target as u64).min(rest.max(1)) as usize;
-        let mut b = self.bufs.input(prefix + size);
+        let mut b = self.bufs.input(PAGE + prefix + size);
+        let base = src
+            .wrapping_add(COPY_SKEW)
+            .wrapping_sub(b.as_ptr() as usize + prefix)
+            % PAGE;
+        b.resize(base, 0);
         // the prefix is copied: the previous job's buffer is no longer
         // needed here
         if let Some((data, start, len)) = self.prev.take() {
@@ -951,7 +970,8 @@ impl MtCtx {
             self.bufs.put_shared_input(data);
         }
         self.in_buf = Some(b);
-        self.in_prefix = prefix;
+        self.in_base = base;
+        self.in_prefix = base + prefix;
     }
 
     /// `ZSTDMT_createCompressionJob()`: makes the loaded input a job (the
@@ -983,7 +1003,7 @@ impl MtCtx {
             } else {
                 let frame = Arc::clone(self.frame.as_ref().expect("frame started"));
                 let data = Arc::new(self.in_buf.take().unwrap_or_default());
-                let prefix = self.in_prefix;
+                let (base, prefix) = (self.in_base, self.in_prefix);
                 // Update the round buffer pos and clear the input buffer
                 self.ring_pos += src_size;
                 if end {
@@ -998,12 +1018,14 @@ impl MtCtx {
                     frame,
                     id: self.next_job,
                     data,
+                    base,
                     prefix,
                     ring_pos: self.in_ring_pos,
                     last: end,
                     out_cap: self.out_cap,
                     slot: Arc::new(Slot::default()),
                 }));
+                self.in_base = 0;
                 self.in_prefix = 0;
                 self.next_job += 1;
             }
