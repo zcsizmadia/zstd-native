@@ -1,6 +1,6 @@
 [package]
 name = "zstd-native"
-description = "Pure Rust Zstandard (zstd) compression and decompression, built to match or beat C libzstd in speed. No C code."
+description = "Fastest pure Rust Zstandard (zstd) compression and decompression: byte-identical with libzstd 1.5.7 and faster than C. No C code, no_std."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
