@@ -2,9 +2,10 @@
 //!
 //! `cargo run --profile bench -p zstd-bench --example profile_encode -- <dataset> <level> <native|c|structured|native-stream|c-stream> <seconds> [chunk]`
 //!
-//! `ZSTD_BENCH_WORKERS=n` compresses with n worker threads (one-shot modes),
-//! and `ZSTD_BENCH_REPEAT=k` repeats the dataset k times (multithreading
-//! needs inputs of several jobs).
+//! `ZSTD_BENCH_WORKERS=n` compresses with n worker threads (one-shot and
+//! streaming modes), and `ZSTD_BENCH_REPEAT=k` repeats the dataset k times
+//! (multithreading needs inputs of several jobs). The dataset `silesia` is
+//! every file of `ZSTD_BENCH_CORPUS` concatenated (in name order).
 
 use std::time::Instant;
 
@@ -14,11 +15,17 @@ fn main() {
     let level: i32 = args.get(2).map_or(1, |s| s.parse().unwrap());
     let lib = args.get(3).map_or("native", |s| s);
     let secs: f64 = args.get(4).map_or(3.0, |s| s.parse().unwrap());
-    let mut data = zstd_bench::datasets()
-        .into_iter()
-        .find(|(n, _)| n == ds)
-        .expect("dataset")
-        .1;
+    let all = zstd_bench::datasets();
+    let mut data = if ds == "silesia" {
+        // the corpus files follow the five built-in datasets
+        all.into_iter()
+            .skip(5)
+            .map(|(_, d)| d)
+            .collect::<Vec<_>>()
+            .concat()
+    } else {
+        all.into_iter().find(|(n, _)| n == ds).expect("dataset").1
+    };
     let repeat: usize = std::env::var("ZSTD_BENCH_REPEAT").map_or(1, |s| s.parse().unwrap());
     data = data.repeat(repeat);
     let workers: u32 = std::env::var("ZSTD_BENCH_WORKERS").map_or(0, |s| s.parse().unwrap());
@@ -35,6 +42,8 @@ fn main() {
             .unwrap();
         nc.set_workers(workers);
     }
+    // Optional start offset into the data (alignment experiments).
+    let off: usize = std::env::var("ZSTD_BENCH_OFFSET").map_or(0, |s| s.parse().unwrap());
     let mut n = 0u64;
     let mut size = 0;
     let t = Instant::now();
@@ -43,7 +52,7 @@ fn main() {
         let pieces: Vec<&[u8]> = if chunk > 0 {
             data.chunks(chunk).collect()
         } else {
-            vec![&data[..]]
+            vec![&data[off..]]
         };
         for p in pieces {
             size += match lib {
@@ -52,6 +61,9 @@ fn main() {
                 "native-stream" => {
                     use std::io::Write;
                     let mut e = zstd_native::Encoder::new(Vec::new(), level);
+                    if workers > 0 {
+                        e.set_workers(workers).unwrap();
+                    }
                     for w in p.chunks(128 << 10) {
                         e.write_all(w).unwrap();
                     }
@@ -60,6 +72,9 @@ fn main() {
                 "c-stream" => {
                     use std::io::Write;
                     let mut e = zstd::stream::write::Encoder::new(Vec::new(), level).unwrap();
+                    if workers > 0 {
+                        e.multithread(workers).unwrap();
+                    }
                     for w in p.chunks(128 << 10) {
                         e.write_all(w).unwrap();
                     }
