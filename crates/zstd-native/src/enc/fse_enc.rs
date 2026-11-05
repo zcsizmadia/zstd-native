@@ -918,7 +918,7 @@ mod tests {
             let mut ct = FseCTable::<N, S>::new();
             for log in logs {
                 for low in [false, true] {
-                    for _ in 0..300 {
+                    for _ in 0..if cfg!(miri) { 2 } else { 300 } {
                         let max_sv1 = 2 + r.below(S as u64 - 1) as usize;
                         let norm = random_norm(r, max_sv1, log, low);
                         ct.build(&norm, max_sv1 as u32 - 1, log).unwrap();

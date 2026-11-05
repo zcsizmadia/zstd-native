@@ -783,7 +783,7 @@ mod build_tests {
         for kind in [LL_KIND, OF_KIND, ML_KIND] {
             for log in FSE_MIN_TABLELOG..=kind.max_log {
                 for low in [false, true] {
-                    for case in 0..200 {
+                    for case in 0..if cfg!(miri) { 2 } else { 200 } {
                         let max_sv1 = 2 + rand(kind.max as u64) as usize;
                         let mut norm = [0i16; MAX_ML + 1];
                         let mut remaining = 1u32 << log;
