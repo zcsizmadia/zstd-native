@@ -1,118 +1,267 @@
 # zstd-native
 
-Pure Rust [Zstandard](https://facebook.github.io/zstd/) (RFC 8878), built
-to match or beat C libzstd 1.5.7 in speed. No C code, `no_std` + `alloc`.
+**Zstandard (libzstd 1.5.7), rewritten in Rust:** the same compressed bytes
+as libzstd at every level, the same strictness on bad input, at or above
+libzstd's speed, without the C, the build scripts or the memory-safety
+risk. Sibling of [xz-native](https://github.com/zcsizmadia/xz-native).
 
-**Status: early development.** The decoder is complete: one-shot and
-streaming (`std::io::Read` and a `no_std` push API), all frame and block
-types, dictionaries, checksums, concatenated and skippable frames, tested
-against libzstd.
+[![CI](https://github.com/zcsizmadia/zstd-native/actions/workflows/ci.yml/badge.svg)](https://github.com/zcsizmadia/zstd-native/actions/workflows/ci.yml)
+[![Fuzz](https://github.com/zcsizmadia/zstd-native/actions/workflows/fuzz.yml/badge.svg)](https://github.com/zcsizmadia/zstd-native/actions/workflows/fuzz.yml)
+[![Miri](https://github.com/zcsizmadia/zstd-native/actions/workflows/miri.yml/badge.svg)](https://github.com/zcsizmadia/zstd-native/actions/workflows/miri.yml)
+[![crates.io](https://img.shields.io/crates/v/zstd-native)](https://crates.io/crates/zstd-native)
+[![docs.rs](https://img.shields.io/docsrs/zstd-native)](https://docs.rs/zstd-native)
+[![MSRV](https://img.shields.io/crates/msrv/zstd-native)](https://crates.io/crates/zstd-native)
+[![License](https://img.shields.io/crates/l/zstd-native)](LICENSE)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/zcsizmadia/zstd-native/badge)](https://scorecard.dev/viewer/?uri=github.com/zcsizmadia/zstd-native)
 
-The encoder is in progress: its output is byte-identical to libzstd's for
-the same input and level, one-shot and streaming (`std::io::Write` and a
-`no_std` push API matching `ZSTD_compressStream2` call for call, flushes
-included). All levels work (negative and 1 to 22: every strategy from
-`fast` to `btultra2`, with libzstd's block splitters), at about
-0.9-0.96x libzstd's speed for `fast`/`dfast`, on par for the lazy
-strategies and 0.9-1.05x for the optimal parser (first measurements).
-Dictionaries work too, zstd-format (as made by `zstd --train`) and raw
-content, loaded into a compressor (`ZSTD_CCtx_loadDictionary`) or
-prepared once (`EncoderDictionary`, libzstd's `ZSTD_CDict`), byte-identical
-with libzstd's attached, copied or reloaded dictionary tables at every
-level, one-shot and streaming. So is long distance matching, which
-libzstd turns on by itself at level 22 for inputs over 64 MiB or of
-unknown size (and with a 128 MiB window from level 16). So is
-multithreaded compression (with `std`: `Compressor::set_workers`,
-`StreamEncoder::set_workers`, `Encoder::set_workers`), byte-identical
-with libzstd's for the same worker count (`ZSTD_c_nbWorkers`), on par
-with libzstd's speed in first measurements.
+> **Status:** 0.1, the first release. Decompression and compression are
+> complete and heavily tested; the encoder output is byte-identical to
+> libzstd 1.5.7 for the same parameters. The API may still change before
+> 1.0 (see [Versioning](#versioning)). See the
+> [roadmap](docs/PROPOSAL.md) and the
+> [issues](https://github.com/zcsizmadia/zstd-native/issues).
+
+## Why zstd-native
+
+- **A supply chain you can audit.** No C code, no build scripts and no
+  binary blobs in the library: one dependency-free crate. C libzstd is
+  used only by the benchmark and fuzz crates, as a speed and behaviour
+  reference.
+- **Memory safety on untrusted input.** Decompressors parse hostile data.
+  `unsafe` is limited to benchmarked hot loops (bit readers, Huffman and
+  sequence decoding, match finders) and the x86-64 assembly, each with a
+  SAFETY argument, debug assertions and a safe fallback that the
+  `portable` feature selects. It's fuzzed against libzstd and checked
+  with Miri.
+- **As fast as libzstd, or faster, and the fastest Rust zstd.** One core
+  of an AMD EPYC 7543, geometric mean over the
+  [Silesia corpus](https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia),
+  against the `zstd` crate's libzstd build (`-O3`, BMI2, asm Huffman
+  decoder). Machines, methods and per-file tables are in
+  [BENCHMARK.md](BENCHMARK.md):
+
+  | zstd-native speed (1.25x = 25% faster) | vs C libzstd 1.5.7 | vs [structured-zstd](https://crates.io/crates/structured-zstd) 0.2.6 |
+  |---|---:|---:|
+  | Compression, level 1 | 1.02x | 1.06x |
+  | Compression, level 3 (default) | 1.00x | 1.33x |
+  | Compression, level 9 | 1.03x | 1.18x |
+  | Compression, level 19 | 1.30x | 1.11x |
+  | Decompression (frames of levels 1-19) | 1.05-1.09x | 1.20-1.29x |
+
+  structured-zstd is the fastest other pure-Rust zstd. Its compressed
+  output differs from libzstd's. [ruzstd](https://crates.io/crates/ruzstd)
+  decompresses 3-7x slower than zstd-native.
+
+  Other zstd implementations were compared on the same machine, with the
+  details in [BENCHMARK.md](BENCHMARK.md#other-implementations):
+  - **Decompression:** zstd-native is the fastest decompressor measured.
+    It is 1.05-1.09x faster than the fastest C libzstd 1.5.7 build
+    (including upstream's own gcc and clang builds and `-march=native`) at
+    levels 1-19.
+  - **Other ports:** it is 1.14-1.84x faster than the Go (klauspost), C#
+    (ZstdSharp) and Java (aircompressor) ports at decompression.
+  - **Compression:** it is the fastest at levels 1 and 19, and on par with
+    C libzstd at levels 3-11, within ±2%.
+- **Drop-in compatible.** It compresses to the same bytes as libzstd for
+  the same parameters. That covers every level, streaming with flushes,
+  dictionaries, long distance matching and multithreading. Anything it
+  decompresses, libzstd decompresses to the same output.
+- **Builds anywhere.** `cargo add` and done: no C compiler, simple
+  cross-compilation, wasm, and `no_std` + `alloc`.
+
+## Usage
+
+```toml
+[dependencies]
+zstd-native = "0.1"
+```
+
+The full API reference is on [docs.rs](https://docs.rs/zstd-native);
+changes are in [CHANGELOG.md](CHANGELOG.md).
 
 ```rust
-let compressed = zstd_native::compress(&data, 1)?; // same bytes as libzstd
+let compressed = zstd_native::compress(&data, 3)?; // same bytes as libzstd level 3
 let data = zstd_native::decompress(&compressed)?;
+```
 
-// Reuse tables and buffers across calls, optionally with a dictionary:
-let mut d = zstd_native::Decompressor::with_dictionary(zstd_native::Dictionary::new(&dict_bytes)?);
+Reuse tables and buffers across calls, and write into your own buffer:
+
+```rust
+let mut c = zstd_native::Compressor::new(3);
+let compressed = c.compress(&message)?;
+
+let mut d = zstd_native::Decompressor::new();
 let n = d.decompress_to_slice(&compressed, &mut buffer)?;
+```
 
-// Streaming from any reader:
+Streaming with `std::io`. The `Encoder` writes the same bytes as libzstd's
+`ZSTD_compressStream2` for the same writes and flushes:
+
+```rust
 let mut out = Vec::new();
 std::io::copy(&mut zstd_native::Decoder::new(file), &mut out)?;
 
-// Streaming compression into any writer (same bytes as libzstd's
-// ZSTD_compressStream2 for the same writes and flushes):
-let mut enc = zstd_native::Encoder::new(Vec::new(), 3);
-std::io::copy(&mut file, &mut enc)?;
-let compressed = enc.finish()?;
+let mut enc = zstd_native::Encoder::new(std::fs::File::create("out.zst")?, 3);
+std::io::copy(&mut input, &mut enc)?;
+enc.finish()?;
+```
 
-// Compression with a dictionary (same bytes as the zstd crate's
-// `bulk::Compressor::with_dictionary` / `with_prepared_dictionary`):
+Dictionaries, zstd-format (`zstd --train`) or raw content. They can be
+loaded into a compressor, or prepared once and shared (libzstd's
+`ZSTD_CDict`):
+
+```rust
 let mut c = zstd_native::Compressor::with_dictionary(3, &dict_bytes)?;
 let compressed = c.compress(&message)?;
-let prepared = zstd_native::EncoderDictionary::new(&dict_bytes, 3)?;
-let mut enc = zstd_native::Encoder::with_prepared_dictionary(Vec::new(), &prepared);
 
-// Multithreaded compression (same bytes as libzstd with ZSTD_c_nbWorkers 4):
+let prepared = zstd_native::EncoderDictionary::new(&dict_bytes, 3)?;
+let enc = zstd_native::Encoder::with_prepared_dictionary(Vec::new(), &prepared);
+
+let mut d = zstd_native::Decompressor::with_dictionary(zstd_native::Dictionary::new(&dict_bytes)?);
+```
+
+Multithreaded compression, with `std`. The output is the same as libzstd's
+with `ZSTD_c_nbWorkers` set to the same number:
+
+```rust
 let mut c = zstd_native::Compressor::new(3);
 c.set_workers(4);
 let compressed = c.compress(&large_input)?;
 ```
 
-## Speed
+Frame options follow libzstd's defaults, and can be changed on
+`Compressor`, `StreamEncoder` and `Encoder`:
+- the content checksum is off by default (`ZSTD_c_checksumFlag`);
+- the content size and the dictionary ID are written (`ZSTD_c_contentSizeFlag`,
+  `ZSTD_c_dictIDFlag`).
 
-Decompression on one core of an AMD EPYC 7543 (Zen 3), MiB/s of output,
-every library reusing its context and decoding into a preallocated buffer.
-libzstd is the `zstd` crate's build (libzstd 1.5.7, `-O3`, run-time BMI2,
-the x86-64 asm Huffman decoder).
+```rust
+let mut c = zstd_native::Compressor::new(3);
+c.set_checksum(true); // like `zstd` the CLI, which writes one
+let compressed = c.compress(&data)?;
+```
 
-| Data | Level | zstd-native | libzstd | structured-zstd | ruzstd | zstd-native / libzstd |
-|---|---:|---:|---:|---:|---:|---:|
-| source | 1 | 1367 | 1416 | 1303 | 354 | 0.96x |
-| source | 3 | 1262 | 1327 | 1225 | 388 | 0.95x |
-| source | 9 | 1425 | 1509 | 1427 | 426 | 0.94x |
-| source | 19 | 1398 | 1479 | 1381 | 468 | 0.95x |
-| log | 1 | 1249 | 1309 | 1196 | 354 | 0.95x |
-| log | 3 | 1243 | 1337 | 1203 | 398 | 0.93x |
-| log | 9 | 1432 | 1548 | 1386 | 446 | 0.93x |
-| log | 19 | 1572 | 1713 | 1528 | 479 | 0.92x |
-| numeric | 1 | 784 | 803 | 695 | 214 | 0.98x |
-| numeric | 3 | 689 | 713 | 629 | 185 | 0.97x |
-| numeric | 9 | 772 | 791 | 687 | 205 | 0.98x |
-| numeric | 19 | 800 | 811 | 706 | 248 | 0.99x |
-| skewed | 1 | 1462 | 1405 | 1108 | 217 | 1.04x |
-| skewed | 3 | 1462 | 1405 | 1108 | 215 | 1.04x |
-| skewed | 9 | 1460 | 1389 | 1104 | 216 | 1.05x |
-| skewed | 19 | 1429 | 1363 | 1077 | 220 | 1.05x |
-| random | 1 | 16930 | 16884 | 16906 | 6368 | 1.00x |
-| random | 3 | 10444 | 10403 | 10433 | 6374 | 1.00x |
-| random | 9 | 10442 | 10422 | 10434 | 6298 | 1.00x |
-| random | 19 | 10442 | 10418 | 10432 | 6217 | 1.00x |
+Without `std`, the push-style
+[`StreamDecoder`](https://docs.rs/zstd-native/latest/zstd_native/struct.StreamDecoder.html)
+and
+[`StreamEncoder`](https://docs.rs/zstd-native/latest/zstd_native/struct.StreamEncoder.html)
+take input and output in pieces of any size, like `ZSTD_decompressStream`
+and `ZSTD_compressStream2`.
 
-Datasets: `source` = the zstd C sources, `log` = synthetic server logs, `numeric` = integer series, `skewed` = skewed random bytes (nearly all Huffman-coded literals), `random` = incompressible (raw blocks: memcpy speed).
+### Byte identity
 
-zstd-native is 4-5% faster than libzstd on literal-heavy data (`skewed`), 97-99% on `numeric` and 92-96% on `source` and `log`, where the sequence loop is the remaining gap. It is ahead of or level with structured-zstd everywhere (within noise on `source` L9) and 3-7x faster than ruzstd.
+For the same input and parameters, zstd-native writes the same bytes as
+libzstd 1.5.7. That holds one-shot and streaming, for every write and
+flush pattern, and covers:
 
-How: the hot loops (sequence decoding and execution, 4-stream Huffman
-decoding with single- and double-symbol tables) are compiled generic and
-with BMI2 and picked at run time; the sequence loop is organized so its
-state stays in registers (one combined FSE table, thin pointers, cold
-dictionary path). Details in [docs/PROPOSAL.md](docs/PROPOSAL.md).
+- every level from the negative ones to 22 and every strategy, with
+  libzstd's block splitters;
+- dictionaries, attached, copied or reloaded as libzstd would;
+- long distance matching, including where libzstd turns it on by itself
+  (levels 16 and up, with large inputs);
+- multithreaded compression, for the same worker count, job size and
+  overlap.
 
-## Correctness
+It's tested on every dataset and size edge, and fuzzed with arbitrary
+parameters (see [How it's tested](#how-its-tested)). Not ported yet:
+prefix dictionaries (`ZSTD_CCtx_refPrefix`). Another libzstd release
+can change libzstd's output, which is why the version names the release
+it matches.
 
-- Differential tests: everything libzstd produces at levels -5 to 22, with
-  long-distance matching, dictionaries, checksums, every block-size edge,
-  decodes to identical bytes.
-- Corrupt input returns an error, never panics; anything zstd-native
-  accepts, libzstd accepts with the same output (tested on hundreds of
-  thousands of mutated frames with debug assertions on).
-- `unsafe` is confined to the hot paths, each with a SAFETY argument and
-  debug assertions; the `portable` feature runs the generic code paths.
-- Fuzzed with cargo-fuzz against libzstd (`fuzz/`: arbitrary bytes into
-  every decoder, libzstd's output with arbitrary parameters, arbitrary
-  data and parameters through the encoder), see
-  [docs/PROPOSAL.md](docs/PROPOSAL.md#fuzzing).
+### Untrusted input
+
+Corrupt input returns an `Error` and never panics. zstd-native is never
+more lenient than libzstd: anything it accepts, libzstd 1.5.7 accepts
+with the same output. Where libzstd's own decoders disagree, it follows
+the stricter one. Streaming decompression refuses frames that need a
+window over 2^27 bytes (128 MiB), libzstd's default; `set_window_log_max`
+changes the limit.
+
+## Supported
+
+| Feature | Decode | Encode |
+|---|---|---|
+| Zstandard frames (RFC 8878): every block type, checksums, concatenated and skippable frames | yes | yes (byte-identical to libzstd) |
+| Levels -131072 to 22, every strategy (`fast` to `btultra2`), block splitters | - | yes |
+| Dictionaries: zstd format and raw content, prepared (`ZSTD_DDict` / `ZSTD_CDict`) | yes | yes |
+| Long distance matching | yes | yes |
+| Multithreaded compression (`ZSTD_c_nbWorkers`) | - | yes |
+| Streaming: `std::io::Read` / `Write`, push API without `std` | yes | yes |
+| `no_std` + `alloc` | yes | yes |
+| Prefix dictionaries (`refPrefix`) | yes, as a raw-content `Dictionary` | not yet |
+| Legacy formats (zstd 0.x) | no | no |
+
+## How it's tested
+
+The ports follow libzstd 1.5.7's sources, kept read-only in `third_party/zstd`.
+
+| Layer | What it checks |
+|---|---|
+| **Encoder byte identity** | Compressed output is compared byte for byte with C libzstd 1.5.7 on every dataset and size edge. It covers every level and strategy, streaming with flushes and pledged sizes, reused contexts, dictionaries (loaded and prepared), long distance matching and multithreading. Every frame must decode with both libraries. |
+| **Differential decoding** | Everything libzstd produces at levels -5 to 22, with long distance matching, dictionaries, checksums and every block-size edge, must decode to identical bytes. That holds through every API: one-shot, streaming with 1-byte buffers, and `io::Read`. |
+| **Corruption** | Hundreds of thousands of mutated frames (bit flips, truncation, header damage), with debug assertions on. Each must return an error or the same output as libzstd, never panic, and never be accepted when libzstd rejects it. |
+| **Fuzzing** | cargo-fuzz with libFuzzer, differential against libzstd. Four targets: arbitrary bytes into every decoder, streaming with arbitrary piece sizes and dictionaries, libzstd's output with arbitrary parameters, and arbitrary data and parameters through the encoder. They run on every push and PR and nightly. Before the release they ran for 3 hours on 56 cores, under AddressSanitizer and with the portable fallbacks. |
+| **SIMD and assembly paths** | The whole suite also runs with `--features portable`, which turns off the BMI2 and assembly paths, so the safe fallbacks are tested on every platform. Hot-path `unsafe` has debug assertions, which the CI-profile tests and the fuzzers run with. |
+| **Miri** | On x86-64 and big-endian s390x, over the portable code paths: a fast set on every push and PR, and every test weekly. |
+
+**CI** (GitHub Actions, every PR):
+
+- fmt, clippy with `-D warnings` (also for aarch64 and the fuzz crate),
+  docs with `-D warnings`
+- tests (run-time CPU selection and `portable`) on Linux x64/arm64,
+  Windows x64 and macOS arm64, plus 32-bit Windows (i686)
+- builds for `no_std` (thumbv7em), wasm32, i686 and aarch64
+- MSRV (Rust 1.89)
+- the four fuzz targets and Miri
+- cargo-deny (RustSec advisories, licenses, sources)
+
+The OpenSSF Scorecard watches the workflows themselves: actions are
+pinned by SHA and tokens are read-only.
+
+## Versioning
+
+The crate follows SemVer for its own API. The build metadata names the
+libzstd release whose output and behaviour it matches: `0.1.0+zstd.1.5.7`
+is release 0.1.0, compatible with libzstd 1.5.7. Depend on it as
+`zstd-native = "0.1"`; Cargo ignores the metadata.
+
+Before 1.0, a minor release (0.2) may break code, and a patch release
+(0.1.1) adds API or fixes bugs. Following a new libzstd release that
+changes the compressed output is at least a minor release, with new
+metadata (for example `0.2.0+zstd.1.5.8`), never a patch. The minimum
+Rust version (1.89) is raised only in minor releases. Git tags are
+`vX.Y.Z`.
+
+## Development
+
+```sh
+git clone --recurse-submodules https://github.com/zcsizmadia/zstd-native
+cargo test --workspace --profile ci                               # all tests
+cargo test -p zstd-bench --profile ci --features zstd-native/portable # without the BMI2/asm paths
+cargo bench -p zstd-bench --bench decode                          # vs libzstd, structured-zstd, ruzstd
+cargo +nightly fuzz run decode                                    # in fuzz/
+```
+
+`third_party/zstd` is the libzstd 1.5.7 source, the reference for
+porting. It is never compiled into this crate. C libzstd (the `zstd`
+crate) is used only by the benchmark and fuzz crates. Design notes and
+the roadmap are in [docs/PROPOSAL.md](docs/PROPOSAL.md).
+
+## Sibling project
+
+[xz-native](https://github.com/zcsizmadia/xz-native)
+([crates.io](https://crates.io/crates/xz-native)) applies the same approach
+to xz/liblzma 5.8.4:
+- pure Rust;
+- `.xz`, `.lzma` and `.lz` decoding, and `.xz` and `.lzma` encoding
+  byte-identical to liblzma;
+- the same strictness on bad input;
+- at or above liblzma's speed.
+
+The two crates share their design: run-time CPU dispatch with a `portable`
+fallback, differential tests and fuzzing against the C library, and
+versions that name the upstream release they match.
 
 ## License
 
-BSD-3-Clause, like zstd (this is a port of parts of it).
+[BSD-3-Clause](LICENSE), like zstd. zstd-native is a port of parts of it.
