@@ -73,8 +73,18 @@ pub(crate) const JOBSIZE_MAX: usize = if usize::BITS == 32 {
 pub(crate) const NBWORKERS_MAX: u32 = if usize::BITS == 32 { 64 } else { 256 };
 /// A job is compressed in chunks of this size (`4 * ZSTD_BLOCKSIZE_MAX`).
 const CHUNK_SIZE: usize = 4 * BLOCKSIZE_MAX;
+/// The job input the larger job table may hold (see [`job_table_size`]).
+const RUN_AHEAD_BYTES: usize = 256 << 20;
 /// Bytes after the LDM copy of the round buffer, never in its window.
 const RING_SLACK: usize = 64;
+/// The room before a job's data in its input buffer, to place it at an
+/// offset of [`COPY_SKEW`] (mod 4 KiB) from the caller's input.
+const PAGE: usize = 4096;
+/// Where the input buffer starts relative to the caller's input, mod
+/// [`PAGE`]: glibc's `memcpy` takes a much slower (non-temporal) path when
+/// the destination is within a few hundred bytes of the source mod 4 KiB
+/// (4K aliasing; 1.8x slower overall at level 1 with 16 workers on Zen 3).
+const COPY_SKEW: usize = PAGE / 2;
 
 /// The multithreading parameters (libzstd's `ZSTD_c_nbWorkers`,
 /// `ZSTD_c_jobSize`, `ZSTD_c_overlapLog`).
@@ -132,6 +142,25 @@ fn target_job_log(cp: &CParams, ldm: bool) -> u32 {
         20.max(cp.window_log + 2)
     };
     job_log.min(JOBLOG_MAX)
+}
+
+/// How many jobs may be posted and not yet written out: libzstd's job
+/// table (`ZSTDMT_createJobsTable(nbWorkers + 2)`, the power of 2 above
+/// `nbWorkers + 2`), or, with 8 workers or more, the power of 2 at or
+/// above `2 * nbWorkers + 2` if that holds at most [`RUN_AHEAD_BYTES`] of
+/// job input. Jobs are written out in order, so while the oldest job runs
+/// the later ones finish and wait in the table; with only `nbWorkers + 2`
+/// entries the queue then runs dry and workers idle (jobs of 2 to 8 MiB,
+/// levels 1 to 4, vary in duration with the data). With 4 workers the
+/// larger table measured 2-3% slower. The table size changes only the
+/// timing, never the output.
+fn job_table_size(workers: usize, target: usize) -> usize {
+    let table = 1 << ((workers + 2).ilog2() + 1);
+    if workers < 8 {
+        return table;
+    }
+    let deep = (2 * workers + 2).next_power_of_two();
+    table.max(deep.min(RUN_AHEAD_BYTES / target.max(1)))
 }
 
 /// `ZSTDMT_overlapLog_default()`.
@@ -364,8 +393,10 @@ struct Job {
     frame: Arc<Frame>,
     /// `jobID`
     id: u64,
-    /// The prefix (the overlap with the previous job), then the input.
+    /// Padding (`base` bytes), the prefix (the overlap with the previous
+    /// job), then the input (from `prefix`).
     data: Arc<Vec<u8>>,
+    base: usize,
     prefix: usize,
     /// Where the input is in libzstd's round buffer (for the LDM window).
     ring_pos: usize,
@@ -437,8 +468,8 @@ fn run_job(fc: &mut Option<Box<FrameCompressor>>, job: &Job) -> Result<(Vec<u8>,
     if cancelled() {
         return Err(Error::StageWrong);
     }
-    let buf = &job.data[..];
-    let src_start = job.prefix;
+    let buf = &job.data[job.base..];
+    let src_start = job.prefix - job.base;
     let size = buf.len() - src_start;
     let fc = if job.id == 0 {
         // the frame's parameters and size, the dictionary
@@ -613,9 +644,10 @@ pub(crate) struct MtCtx {
     /// `roundBuff.capacity` and `roundBuff.pos`.
     ring_cap: usize,
     ring_pos: usize,
-    /// `inBuff`: the prefix then the input loaded so far; `None` when no
-    /// input range is held.
+    /// `inBuff`: padding (`in_base` bytes), the prefix, then the input
+    /// loaded so far (from `in_prefix`); `None` when no input range is held.
     in_buf: Option<Vec<u8>>,
+    in_base: usize,
     in_prefix: usize,
     in_ring_pos: usize,
     /// The next job's prefix: the end of the previous job's data.
@@ -681,6 +713,7 @@ impl MtCtx {
             ring_cap: 0,
             ring_pos: 0,
             in_buf: None,
+            in_base: 0,
             in_prefix: 0,
             in_ring_pos: 0,
             prev: None,
@@ -735,6 +768,7 @@ impl MtCtx {
         self.ring_cap = sizes.ring_cap;
         self.ring_pos = 0;
         self.in_buf = None;
+        self.in_base = 0;
         self.in_prefix = 0;
         self.in_ring_pos = 0;
         self.prev = None;
@@ -744,8 +778,7 @@ impl MtCtx {
         self.pledged = pledged;
         self.xxh = fparams.checksum.then(Xxh64::new);
         self.trailer = None;
-        // ZSTDMT_createJobsTable(nbWorkers + 2)
-        self.max_jobs = 1 << ((workers as u32 + 2).ilog2() + 1);
+        self.max_jobs = job_table_size(workers, target);
         // a buffer per job of the table, plus the one being filled
         self.bufs
             .max_spare
@@ -894,7 +927,7 @@ impl MtCtx {
         // fill input buffer
         if self.ready.is_none() && *ip < input.len() {
             if self.in_buf.is_none() {
-                self.get_input_range();
+                self.get_input_range(input[*ip..].as_ptr() as usize);
             }
             let filled = self.filled();
             let to_load = (input.len() - *ip).min(self.target - filled);
@@ -931,8 +964,9 @@ impl MtCtx {
     /// `ZSTDMT_tryGetInputRange()`, which here always succeeds: the next
     /// input buffer, starting with the prefix, at the round buffer's
     /// position (back at the start, after the prefix, when the rest of the
-    /// round buffer is too small for a job).
-    fn get_input_range(&mut self) {
+    /// round buffer is too small for a job). The input is placed at
+    /// [`COPY_SKEW`] from `src` (the address it is loaded from) mod 4 KiB.
+    fn get_input_range(&mut self, src: usize) {
         let prefix = self.prev.as_ref().map_or(0, |p| p.2);
         if self.ring_cap - self.ring_pos < self.target {
             self.ring_pos = prefix;
@@ -943,7 +977,12 @@ impl MtCtx {
             .pledged
             .map_or(u64::MAX, |p| p.saturating_sub(self.consumed));
         let size = (self.target as u64).min(rest.max(1)) as usize;
-        let mut b = self.bufs.input(prefix + size);
+        let mut b = self.bufs.input(PAGE + prefix + size);
+        let base = src
+            .wrapping_add(COPY_SKEW)
+            .wrapping_sub(b.as_ptr() as usize + prefix)
+            % PAGE;
+        b.resize(base, 0);
         // the prefix is copied: the previous job's buffer is no longer
         // needed here
         if let Some((data, start, len)) = self.prev.take() {
@@ -951,7 +990,8 @@ impl MtCtx {
             self.bufs.put_shared_input(data);
         }
         self.in_buf = Some(b);
-        self.in_prefix = prefix;
+        self.in_base = base;
+        self.in_prefix = base + prefix;
     }
 
     /// `ZSTDMT_createCompressionJob()`: makes the loaded input a job (the
@@ -983,7 +1023,7 @@ impl MtCtx {
             } else {
                 let frame = Arc::clone(self.frame.as_ref().expect("frame started"));
                 let data = Arc::new(self.in_buf.take().unwrap_or_default());
-                let prefix = self.in_prefix;
+                let (base, prefix) = (self.in_base, self.in_prefix);
                 // Update the round buffer pos and clear the input buffer
                 self.ring_pos += src_size;
                 if end {
@@ -998,12 +1038,14 @@ impl MtCtx {
                     frame,
                     id: self.next_job,
                     data,
+                    base,
                     prefix,
                     ring_pos: self.in_ring_pos,
                     last: end,
                     out_cap: self.out_cap,
                     slot: Arc::new(Slot::default()),
                 }));
+                self.in_base = 0;
                 self.in_prefix = 0;
                 self.next_job += 1;
             }
@@ -1134,6 +1176,17 @@ mod tests {
         assert!(p.applies(None));
         assert!(!p.applies(Some(JOBSIZE_MIN as u64)));
         assert!(p.applies(Some(JOBSIZE_MIN as u64 + 1)));
+        // libzstd's job table, twice as large for small jobs
+        const MB: usize = 1 << 20;
+        assert_eq!(job_table_size(1, 2 * MB), 4);
+        assert_eq!(job_table_size(4, 2 * MB), 8);
+        assert_eq!(job_table_size(8, 2 * MB), 32);
+        assert_eq!(job_table_size(12, 2 * MB), 32);
+        assert_eq!(job_table_size(16, 2 * MB), 64);
+        assert_eq!(job_table_size(12, 8 * MB), 32);
+        assert_eq!(job_table_size(16, 8 * MB), 32);
+        assert_eq!(job_table_size(12, 32 * MB), 16);
+        assert_eq!(job_table_size(256, 2 * MB), 512);
     }
 
     #[test]
