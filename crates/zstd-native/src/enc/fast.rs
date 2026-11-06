@@ -1525,7 +1525,7 @@ unsafe fn offset_match(
 /// window with an extDict segment (a stream whose input buffer wrapped,
 /// see the `stream` module). Picks `ZSTD_compressBlock_fast_extDict_<mls>_0`
 /// like libzstd (3 and other values use 4).
-#[inline(never)]
+#[inline(always)]
 pub(crate) fn compress_block_fast_ext_dict(
     ms: &mut MatchState,
     ss: &mut SeqStore,
@@ -1535,11 +1535,81 @@ pub(crate) fn compress_block_fast_ext_dict(
     end: usize,
 ) -> usize {
     debug_assert!(ms.cparams.strategy == Strategy::Fast);
+    // Valid indexes span at most 64 KiB: candidates checked with `cmov`s
+    // (meta/zstd#4764), with a BMI2 build. 3-11% faster there (small
+    // windows, small copied dictionaries: many stale entries), 1-3% slower
+    // from 128 KiB up (a 64 KiB dictionary copied into the tables, windows
+    // of 128 KiB and more), where libzstd's branches stay.
+    let end_index = ms.window.index(end);
+    let low_limit = ms.lowest_match_index(end_index, ms.cparams.window_log);
+    if end_index - low_limit <= 1 << 16 {
+        return ext_dict_cmov(ms, ss, rep, buf, start, end);
+    }
+    ext_dict_branch(ms, ss, rep, buf, start, end)
+}
+
+/// [`compress_block_fast_ext_dict`] for larger windows, libzstd's checks.
+#[inline(never)]
+fn ext_dict_branch(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
+    ext_dict_mls::<false>(ms, ss, rep, buf, start, end)
+}
+
+/// [`compress_block_fast_ext_dict`] for windows of at most 64 KiB.
+#[inline(never)]
+fn ext_dict_cmov(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
+    #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+    if crate::cpu::Features::detect().bmi2 {
+        // SAFETY: BMI2 (with BMI1 and LZCNT) was detected on this CPU.
+        #[allow(unsafe_code)]
+        return unsafe { ext_dict_bmi2(ms, ss, rep, buf, start, end) };
+    }
+    ext_dict_mls::<true>(ms, ss, rep, buf, start, end)
+}
+
+/// [`ext_dict_cmov`] compiled with BMI1, BMI2 and LZCNT.
+#[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+#[inline(never)]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+fn ext_dict_bmi2(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
+    ext_dict_mls::<true>(ms, ss, rep, buf, start, end)
+}
+
+/// The `ZSTD_compressBlock_fast_extDict_<mls>_0` variant.
+#[inline(always)]
+fn ext_dict_mls<const CMOV: bool>(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
     match ms.cparams.min_match {
-        5 => ext_dict_generic::<5>(ms, ss, rep, buf, start, end),
-        6 => ext_dict_generic::<6>(ms, ss, rep, buf, start, end),
-        7 => ext_dict_generic::<7>(ms, ss, rep, buf, start, end),
-        _ => ext_dict_generic::<4>(ms, ss, rep, buf, start, end),
+        5 => ext_dict_generic::<5, CMOV>(ms, ss, rep, buf, start, end),
+        6 => ext_dict_generic::<6, CMOV>(ms, ss, rep, buf, start, end),
+        7 => ext_dict_generic::<7, CMOV>(ms, ss, rep, buf, start, end),
+        _ => ext_dict_generic::<4, CMOV>(ms, ss, rep, buf, start, end),
     }
 }
 
@@ -1677,7 +1747,7 @@ impl ExtWindow {
 /// prefix (`ZSTD_count_2segments`). Debug builds check reads with `chk`.
 #[allow(unsafe_code)]
 #[inline(always)]
-fn ext_dict_generic<const MLS: u32>(
+fn ext_dict_generic<const MLS: u32, const CMOV: bool>(
     ms: &mut MatchState,
     ss: &mut SeqStore,
     rep: &mut [u32; 3],
@@ -1740,6 +1810,24 @@ fn ext_dict_generic<const MLS: u32>(
             offset_1 = 0;
         }
     }
+
+    // Whether table candidate `idx` matches at `ip0` (see [`cand_match`];
+    // with `CMOV` the segment is selected without a branch too).
+    let (dict_base, base_) = (w.dict_base, w.base);
+    let cand = |idx: u32, ip0: *const u8| {
+        let m = if CMOV {
+            core::hint::select_unpredictable(idx < prefix_start_index, dict_base, base_)
+                .wrapping_add(idx as usize)
+        } else {
+            w.pos(idx)
+        };
+        let valid = idx >= dict_start_index;
+        if valid {
+            w.chk(m, 4);
+        }
+        // SAFETY: `m` is in its segment if valid, `ip0` below `ilimit`.
+        unsafe { cand_match::<CMOV, false>(valid, m, ip0) }
+    };
 
     // SAFETY (whole block): see the function docs. Hash table writes use
     // hashes of `hlog` bits into a table of `1 << hlog` entries.
@@ -1805,11 +1893,7 @@ fn ext_dict_generic<const MLS: u32>(
                     }
 
                     // load match for ip[0], check it
-                    if idx >= dict_start_index && {
-                        let m = w.pos(idx);
-                        w.chk(m, 4);
-                        read32(m) == read32(ip0)
-                    } {
+                    if cand(idx, ip0) {
                         current0 = c0;
                         (match0, m_length, offcode, match_end) = ext_offset_match(
                             &w,
@@ -1841,11 +1925,7 @@ fn ext_dict_generic<const MLS: u32>(
                 *ht.add(hash0) = c0;
 
                 // load match for ip[0], check it
-                if idx >= dict_start_index && {
-                    let m = w.pos(idx);
-                    w.chk(m, 4);
-                    read32(m) == read32(ip0)
-                } {
+                if cand(idx, ip0) {
                     current0 = c0;
                     (match0, m_length, offcode, match_end) = ext_offset_match(
                         &w,
