@@ -2168,6 +2168,41 @@ pub(crate) fn compress_block_fast_dict_match_state(
     end: usize,
 ) -> usize {
     debug_assert!(ms.cparams.strategy == Strategy::Fast);
+    #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+    if crate::cpu::Features::detect().bmi2 {
+        // SAFETY: BMI2 (with BMI1 and LZCNT) was detected on this CPU.
+        #[allow(unsafe_code)]
+        return unsafe { dms_bmi2(ms, ss, rep, buf, start, end) };
+    }
+    dms_mls(ms, ss, rep, buf, start, end)
+}
+
+/// [`compress_block_fast_dict_match_state`] compiled with BMI1, BMI2 and
+/// LZCNT.
+#[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+#[inline(never)]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+fn dms_bmi2(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
+    dms_mls(ms, ss, rep, buf, start, end)
+}
+
+/// The `ZSTD_compressBlock_fast_dictMatchState_<mls>_0` variant.
+#[inline(always)]
+fn dms_mls(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
     match ms.cparams.min_match {
         5 => dms_generic::<5>(ms, ss, rep, buf, start, end),
         6 => dms_generic::<6>(ms, ss, rep, buf, start, end),
@@ -2378,10 +2413,13 @@ fn dms_generic<const MLS: u32>(
                     }
                 }
 
-                if match_index >= prefix_start_index && {
+                // ZSTD_match4Found_cmov: with a short prefix (small inputs),
+                // many candidates are below it, an unpredictable branch
+                if then_valid(
+                    read32(ip0) == read32(select_addr(match_index >= prefix_start_index, mtch)),
+                    match_index >= prefix_start_index,
+                ) {
                     chk(mtch, 4);
-                    read32(ip0) == read32(mtch)
-                } {
                     // found a regular match of size >= 4
                     let mut mtch = mtch;
                     let offset = (ip0 as usize - mtch as usize) as u32;
