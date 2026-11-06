@@ -358,13 +358,6 @@ const RANK_POSITION_LOG_BUCKETS_BEGIN: u32 =
 const RANK_POSITION_DISTINCT_COUNT_CUTOFF: u32 =
     RANK_POSITION_LOG_BUCKETS_BEGIN + highbit32(RANK_POSITION_LOG_BUCKETS_BEGIN);
 
-/// libzstd's `rankPos`.
-#[derive(Clone, Copy, Default)]
-struct RankPos {
-    base: u16,
-    curr: u16,
-}
-
 /// libzstd's `HUF_getIndex`: bucket of a count.
 #[inline(always)]
 fn get_index(count: u32) -> u32 {
@@ -426,51 +419,87 @@ fn simple_quick_sort(arr: &mut [NodeElt], mut low: i32, mut high: i32) {
     }
 }
 
-/// libzstd's `HUF_sort`: symbols `0..=max_symbol_value` by decreasing count
-/// into `huff_node` (only `count` and `byte` set). Bucket sort: one bucket
-/// per count below 165 (symbol order kept), log2 buckets above, each sorted
-/// with libzstd's (unstable) quick sort.
-fn huf_sort(huff_node: &mut [NodeElt], count: &[u32; 256], max_symbol_value: u32) {
-    let max_sv1 = max_symbol_value as usize + 1;
-    let mut rank_position = [RankPos::default(); RANK_POSITION_TABLE_SIZE];
-
-    for &c in &count[..max_sv1] {
-        let lower_rank = get_index(c) as usize;
-        debug_assert!(lower_rank < RANK_POSITION_TABLE_SIZE - 1);
-        rank_position[lower_rank].base += 1;
+/// libzstd's `HUF_sort` for the symbols of `nz[..k]` (the symbols with a
+/// non-zero count, in symbol order): sorted by decreasing count into
+/// `huff_node[..k]` (`count` and `byte` set, `parent` and `nb_bits` 0).
+/// Bucket sort: one bucket per count below 165 (symbol order kept), log2
+/// buckets above, each sorted with libzstd's (unstable) quick sort.
+///
+/// libzstd sorts every symbol up to `maxSymbolValue`; those with a zero
+/// count all go to the last bucket, after the others, and get no code. The
+/// order of the others is the same without them, and on a small block most
+/// of the work: zero counts pile into one bucket, whose counter is then a
+/// chain of dependent increments through memory. The running sum of the
+/// bucket starts is kept in a register (libzstd's prefix sum reads each
+/// sum back from memory) and stops at the largest count's bucket.
+fn huf_sort(huff_node: &mut [NodeElt], count: &[u32; 256], nz: &[u8]) {
+    let k = nz.len();
+    // Bucket sizes, counted in two tables (symbols of equal counts, common
+    // on small blocks, would otherwise make a chain of increments of one
+    // counter), then the bucket starts.
+    let mut size = [[0u16; RANK_POSITION_TABLE_SIZE]; 2];
+    let mut max_index = 0;
+    let (pairs, last) = nz.as_chunks::<2>();
+    for &[a, b] in pairs {
+        let (i, j) = (
+            get_index(count[a as usize]) as usize,
+            get_index(count[b as usize]) as usize,
+        );
+        debug_assert!(i.max(j) < RANK_POSITION_TABLE_SIZE - 2);
+        size[0][i] += 1;
+        size[1][j] += 1;
+        max_index = max_index.max(i).max(j);
     }
-    for n in (1..RANK_POSITION_TABLE_SIZE).rev() {
-        rank_position[n - 1].base += rank_position[n].base;
-        rank_position[n - 1].curr = rank_position[n - 1].base;
+    for &a in last {
+        let i = get_index(count[a as usize]) as usize;
+        size[0][i] += 1;
+        max_index = max_index.max(i);
     }
-    for (n, &c) in count[..max_sv1].iter().enumerate() {
-        let r = get_index(c) as usize + 1;
-        let pos = rank_position[r].curr as usize;
-        rank_position[r].curr += 1;
-        huff_node[pos].count = c;
-        huff_node[pos].byte = n as u8;
+    // Decreasing counts: bucket `i` starts after every bucket above it (the
+    // non-zero counts are in buckets 1 and above).
+    let mut start = [0u16; RANK_POSITION_TABLE_SIZE];
+    let mut acc = 0u16;
+    for i in (1..=max_index).rev() {
+        start[i] = acc;
+        acc += size[0][i] + size[1][i];
     }
-    for rp in
-        &rank_position[RANK_POSITION_DISTINCT_COUNT_CUTOFF as usize..RANK_POSITION_TABLE_SIZE - 1]
-    {
-        let bucket_size = i32::from(rp.curr) - i32::from(rp.base);
-        let start = rp.base as usize;
-        if bucket_size > 1 {
-            simple_quick_sort(&mut huff_node[start..], 0, bucket_size - 1);
+    debug_assert_eq!(usize::from(acc), k);
+    for &s in nz {
+        let c = count[s as usize];
+        let i = get_index(c) as usize;
+        let pos = start[i] as usize;
+        start[i] += 1;
+        huff_node[pos] = NodeElt {
+            count: c,
+            parent: 0,
+            byte: s,
+            nb_bits: 0,
+        };
+    }
+    // `start[i]` is now the end of bucket `i`. libzstd quick sorts buckets
+    // `RANK_POSITION_DISTINCT_COUNT_CUTOFF - 1` (count 164, sorting of
+    // equal counts, which moves them around when there are more than 8)
+    // to the last log2 bucket.
+    let first = RANK_POSITION_DISTINCT_COUNT_CUTOFF as usize - 1;
+    if max_index >= first {
+        let mut begin = 0;
+        for i in (first..=max_index).rev() {
+            let end = start[i] as usize;
+            if end - begin > 1 {
+                simple_quick_sort(&mut huff_node[begin..], 0, (end - begin - 1) as i32);
+            }
+            begin = end;
         }
     }
-    debug_assert!(
-        huff_node[..max_sv1]
-            .windows(2)
-            .all(|w| w[0].count >= w[1].count)
-    );
+    debug_assert!(huff_node[..k].windows(2).all(|w| w[0].count >= w[1].count));
 }
 
 /// libzstd's `HUF_buildTree`: an unlimited-depth Huffman tree over the
-/// sorted nodes. Returns the index of the last (smallest) non-zero symbol.
-fn huf_build_tree(nodes: &mut NodeTable, max_symbol_value: u32) -> i32 {
+/// sorted nodes, of which `huffNode[last + 1..]` have a zero count. Returns
+/// the index of the last (smallest) non-zero symbol.
+fn huf_build_tree(nodes: &mut NodeTable, last: u32) -> i32 {
     let mut node_nb = STARTNODE;
-    let mut non_null_rank = max_symbol_value as i32;
+    let mut non_null_rank = last as i32;
     // libzstd assumes at least one non-zero count (two, really).
     while non_null_rank > 0 && h!(nodes, non_null_rank).count == 0 {
         non_null_rank -= 1;
@@ -656,31 +685,45 @@ fn huf_set_max_height(nodes: &mut NodeTable, last_non_null: u32, target_nb_bits:
 }
 
 /// libzstd's `HUF_buildCTableFromTree`: canonical codes from the lengths.
+/// `coded` holds, in symbol order, every symbol that may have a code (the
+/// others of `0..=max_symbol_value` get a zero length, as in libzstd, whose
+/// loops visit them all to assign nothing).
 fn huf_build_ctable_from_tree(
     ct: &mut HufCTable,
     nodes: &NodeTable,
     non_null_rank: i32,
+    coded: &[u8],
     max_symbol_value: u32,
     max_nb_bits: u32,
 ) {
-    let mut nb_per_rank = [0u16; HUF_TABLELOG_MAX as usize + 1];
     let mut val_per_rank = [0u16; HUF_TABLELOG_MAX as usize + 1];
-    let alphabet_size = max_symbol_value as i32 + 1;
-    for n in 0..=non_null_rank {
-        nb_per_rank[h!(nodes, n).nb_bits as usize] += 1;
+    let alphabet_size = max_symbol_value as usize + 1;
+    // Two tables: neighbours in the sorted order mostly have the same
+    // length, and one counter would make a chain of increments.
+    let mut nb_per_rank2 = [[0u16; HUF_TABLELOG_MAX as usize + 1]; 2];
+    let leaves = &nodes[1..=non_null_rank as usize + 1];
+    let (pairs, last) = leaves.as_chunks::<2>();
+    for [a, b] in pairs {
+        nb_per_rank2[0][a.nb_bits as usize] += 1;
+        nb_per_rank2[1][b.nb_bits as usize] += 1;
+    }
+    for a in last {
+        nb_per_rank2[0][a.nb_bits as usize] += 1;
     }
     // Starting value per rank.
     let mut min: u16 = 0;
     for n in (1..=max_nb_bits as usize).rev() {
         val_per_rank[n] = min;
-        min += nb_per_rank[n];
+        min += nb_per_rank2[0][n] + nb_per_rank2[1][n];
         min >>= 1;
     }
-    for n in 0..alphabet_size {
+    ct.elts[..alphabet_size].fill(0);
+    for n in 0..=non_null_rank {
         let node = h!(nodes, n);
         ct.elts[node.byte as usize] = u64::from(node.nb_bits); // HUF_setNbBits
     }
-    for elt in &mut ct.elts[..alphabet_size as usize] {
+    for &s in coded {
+        let elt = &mut ct.elts[s as usize];
         let r = get_nb_bits(*elt) as usize;
         set_value(elt, u64::from(val_per_rank[r]));
         val_per_rank[r] = val_per_rank[r].wrapping_add(1);
@@ -705,19 +748,29 @@ pub(crate) fn huf_build_ctable(
     if max_symbol_value > HUF_SYMBOLVALUE_MAX {
         return Err(Error::Corrupted);
     }
+    // The symbols with a non-zero count, in symbol order (branch-free).
+    let mut nz = [0u8; 256];
+    let mut k = 0;
+    for (s, &c) in count[..=max_symbol_value as usize].iter().enumerate() {
+        nz[k & 0xFF] = s as u8;
+        k += usize::from(c != 0);
+    }
     // Not in libzstd (whose callers never ask for it): more symbols than
     // codes of `max_nb_bits` bits is impossible, and libzstd's height
     // limiting would go out of bounds.
-    if huf_cardinality(count, max_symbol_value) as u64 > 1u64 << max_nb_bits.min(32) {
+    if k as u64 > 1u64 << max_nb_bits.min(32) {
         return Err(Error::Corrupted);
     }
     let mut nodes: NodeTable = [NodeElt::default(); 2 * (HUF_SYMBOLVALUE_MAX as usize + 1)];
 
     // Sort, decreasing order.
-    huf_sort(&mut nodes[1..], count, max_symbol_value);
+    huf_sort(&mut nodes[1..], count, &nz[..k]);
 
     // Build the tree.
-    let non_null_rank = huf_build_tree(&mut nodes, max_symbol_value);
+    let non_null_rank = huf_build_tree(&mut nodes, k.saturating_sub(1) as u32);
+    // With no non-zero count (never asked for), libzstd gives symbol 0 a
+    // code.
+    let coded: &[u8] = if k == 0 { &[0] } else { &nz[..k] };
     if max_nb_bits > HUF_TABLELOG_MAX
         && u32::from(h!(nodes, non_null_rank).nb_bits) > HUF_TABLELOG_MAX
     {
@@ -731,7 +784,14 @@ pub(crate) fn huf_build_ctable(
     if max_nb_bits > HUF_TABLELOG_MAX {
         return Err(Error::Corrupted);
     }
-    huf_build_ctable_from_tree(ct, &nodes, non_null_rank, max_symbol_value, max_nb_bits);
+    huf_build_ctable_from_tree(
+        ct,
+        &nodes,
+        non_null_rank,
+        coded,
+        max_symbol_value,
+        max_nb_bits,
+    );
     Ok(max_nb_bits)
 }
 
@@ -1400,36 +1460,144 @@ mod tests {
         assert!(done > 1000, "{done}");
     }
 
-    #[test]
-    fn sort_is_descending_and_stable_in_small_buckets() {
-        let mut r = Rng(99);
-        for _ in 0..500 {
-            let mut count = [0u32; 256];
-            let big = r.below(2) == 0;
-            for c in count.iter_mut() {
-                *c = if big {
-                    r.below(100_000) as u32
-                } else {
-                    r.below(20) as u32
-                };
+    /// libzstd's `HUF_sort` as written there (every symbol, zero counts
+    /// included, prefix sum over all buckets): the reference for
+    /// [`huf_sort`].
+    fn reference_sort(huff_node: &mut [NodeElt], count: &[u32; 256], max_symbol_value: u32) {
+        #[derive(Clone, Copy, Default)]
+        struct RankPos {
+            base: u16,
+            curr: u16,
+        }
+        let max_sv1 = max_symbol_value as usize + 1;
+        let mut rank_position = [RankPos::default(); RANK_POSITION_TABLE_SIZE];
+        for &c in &count[..max_sv1] {
+            rank_position[get_index(c) as usize].base += 1;
+        }
+        for n in (1..RANK_POSITION_TABLE_SIZE).rev() {
+            rank_position[n - 1].base += rank_position[n].base;
+            rank_position[n - 1].curr = rank_position[n - 1].base;
+        }
+        for (n, &c) in count[..max_sv1].iter().enumerate() {
+            let r = get_index(c) as usize + 1;
+            let pos = rank_position[r].curr as usize;
+            rank_position[r].curr += 1;
+            huff_node[pos].count = c;
+            huff_node[pos].byte = n as u8;
+        }
+        for rp in &rank_position
+            [RANK_POSITION_DISTINCT_COUNT_CUTOFF as usize..RANK_POSITION_TABLE_SIZE - 1]
+        {
+            let bucket_size = i32::from(rp.curr) - i32::from(rp.base);
+            if bucket_size > 1 {
+                simple_quick_sort(&mut huff_node[rp.base as usize..], 0, bucket_size - 1);
             }
-            let mut nodes = [NodeElt::default(); 512];
-            huf_sort(&mut nodes[1..], &count, 255);
-            let h = &nodes[1..257];
-            for w in h.windows(2) {
-                assert!(w[0].count >= w[1].count);
-                // Distinct-count buckets keep symbol order.
-                if w[0].count == w[1].count && w[0].count < RANK_POSITION_DISTINCT_COUNT_CUTOFF - 1
-                {
-                    assert!(w[0].byte < w[1].byte);
+        }
+    }
+
+    /// libzstd's `HUF_buildCTable_wksp` and `HUF_buildCTableFromTree` as
+    /// written there (every symbol sorted and visited): the reference for
+    /// [`huf_build_ctable`].
+    fn reference_build_ctable(
+        ct: &mut HufCTable,
+        count: &[u32; 256],
+        max_symbol_value: u32,
+        max_nb_bits: u32,
+    ) -> Result<u32> {
+        if huf_cardinality(count, max_symbol_value) as u64 > 1u64 << max_nb_bits.min(32) {
+            return Err(Error::Corrupted);
+        }
+        let mut nodes: NodeTable = [NodeElt::default(); 512];
+        reference_sort(&mut nodes[1..], count, max_symbol_value);
+        let non_null_rank = huf_build_tree(&mut nodes, max_symbol_value);
+        if max_nb_bits > HUF_TABLELOG_MAX
+            && u32::from(h!(nodes, non_null_rank).nb_bits) > HUF_TABLELOG_MAX
+        {
+            return Err(Error::Corrupted);
+        }
+        let max_nb_bits = huf_set_max_height(&mut nodes, non_null_rank as u32, max_nb_bits);
+        if max_nb_bits > HUF_TABLELOG_MAX {
+            return Err(Error::Corrupted);
+        }
+        let mut nb_per_rank = [0u16; HUF_TABLELOG_MAX as usize + 1];
+        let mut val_per_rank = [0u16; HUF_TABLELOG_MAX as usize + 1];
+        let alphabet_size = max_symbol_value as i32 + 1;
+        for n in 0..=non_null_rank {
+            nb_per_rank[h!(nodes, n).nb_bits as usize] += 1;
+        }
+        let mut min: u16 = 0;
+        for n in (1..=max_nb_bits as usize).rev() {
+            val_per_rank[n] = min;
+            min += nb_per_rank[n];
+            min >>= 1;
+        }
+        for n in 0..alphabet_size {
+            let node = h!(nodes, n);
+            ct.elts[node.byte as usize] = u64::from(node.nb_bits);
+        }
+        for elt in &mut ct.elts[..alphabet_size as usize] {
+            let r = get_nb_bits(*elt) as usize;
+            set_value(elt, u64::from(val_per_rank[r]));
+            val_per_rank[r] = val_per_rank[r].wrapping_add(1);
+        }
+        ct.table_log = max_nb_bits;
+        ct.max_symbol_value = max_symbol_value;
+        Ok(max_nb_bits)
+    }
+
+    /// Counts that stress the sort: many zeros, ties in the distinct-count
+    /// buckets, more than 8 symbols of count 164 (quick sorted by
+    /// libzstd), ties in the log2 buckets, 0, 1 and 2 symbols.
+    fn sort_counts(r: &mut Rng, msv: u32) -> [u32; 256] {
+        let mut count = [0u32; 256];
+        let kind = r.below(7);
+        let palette: Vec<u32> = (0..1 + r.below(6))
+            .map(|_| 165 + r.below(5000) as u32)
+            .collect();
+        for c in &mut count[..=msv as usize] {
+            *c = match kind {
+                0 => r.below(20) as u32,
+                1 => [0, 0, 0, 1, 2, 3][r.below(6) as usize],
+                2 => [0, 163, 164, 164, 164, 165][r.below(6) as usize],
+                3 => palette[r.below(palette.len() as u64) as usize] * (r.below(2) as u32),
+                4 => r.below(100_000) as u32,
+                // (sums stay far below 2^32, as for a block)
+                5 => (r.next() as u32 >> 10) >> r.below(22),
+                _ => 0,
+            };
+        }
+        if kind == 6 {
+            // 0, 1 or 2 non-zero counts
+            for _ in 0..r.below(3) {
+                count[r.below(u64::from(msv) + 1) as usize] = 1 + r.below(1000) as u32;
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn sort_matches_reference() {
+        let mut r = Rng(99);
+        for _ in 0..if cfg!(miri) { 2 } else { 3000 } {
+            let msv = r.below(256) as u32;
+            let count = sort_counts(&mut r, msv);
+            let nz: Vec<u8> = (0..=msv)
+                .filter(|&s| count[s as usize] != 0)
+                .map(|s| s as u8)
+                .collect();
+            let mut want = [NodeElt::default(); 512];
+            reference_sort(&mut want[1..], &count, msv);
+            let mut got = [NodeElt::default(); 512];
+            huf_sort(&mut got[1..], &count, &nz);
+            for i in 0..=msv as usize {
+                let (g, w) = (got[i + 1], want[i + 1]);
+                if i < nz.len() {
+                    assert_eq!((g.count, g.byte), (w.count, w.byte), "msv {msv} at {i}");
+                    assert_eq!((g.parent, g.nb_bits), (0, 0));
+                } else {
+                    assert_eq!(w.count, 0);
                 }
             }
-            let mut seen = [false; 256];
-            for n in h {
-                assert_eq!(count[n.byte as usize], n.count);
-                seen[n.byte as usize] = true;
-            }
-            assert!(seen.iter().all(|&s| s));
         }
         assert_eq!(RANK_POSITION_DISTINCT_COUNT_CUTOFF, 165);
     }
@@ -1456,6 +1624,32 @@ mod tests {
                 .iter()
                 .all(|&e| u64::from(get_nb_bits(e)) <= u64::from(ct.table_log));
             assert_eq!(codes_fit(&ct), want);
+        }
+    }
+
+    #[test]
+    fn build_ctable_matches_reference() {
+        let mut r = Rng(1999);
+        for iter in 0..if cfg!(miri) { 2 } else { 5000 } {
+            let msv = r.below(256) as u32;
+            let count = sort_counts(&mut r, msv);
+            let card = huf_cardinality(&count, msv);
+            let need = huf_min_table_log(card.max(1));
+            let max_bits = need + r.below(u64::from(14 - need.min(13))) as u32;
+            // the same garbage table to start from
+            let mut want = HufCTable::new();
+            for e in want.elts.iter_mut() {
+                *e = r.next();
+            }
+            let mut got = want.clone();
+            let w = reference_build_ctable(&mut want, &count, msv, max_bits);
+            let g = huf_build_ctable(&mut got, &count, msv, max_bits);
+            assert_eq!(g, w, "iter {iter}");
+            if w.is_ok() {
+                assert_eq!(got.elts, want.elts, "iter {iter}");
+                assert_eq!(got.table_log, want.table_log);
+                assert_eq!(got.max_symbol_value, want.max_symbol_value);
+            }
         }
     }
 
