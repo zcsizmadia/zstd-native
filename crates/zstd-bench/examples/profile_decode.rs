@@ -4,7 +4,9 @@
 //! with lib `native` (per-CPU default), `native-asm` / `native-noasm`
 //! (force the asm or Rust Huffman loops), `c`, or `structured`
 //! (structured-zstd), or a streaming mode (`native-<mode>`, `c-<mode>`, see
-//! [`STREAM_MODES`]).
+//! [`STREAM_MODES`]). `native-long` / `native-short` force the prefetching
+//! or the fused sequence loop (`native` takes the prefetching loop only for
+//! the first block after a dictionary is installed).
 //!
 //! Dataset `cat` is every file of `$ZSTD_BENCH_CORPUS` catenated in name
 //! order (the Silesia corpus as one stream), cut to `$ZSTD_BENCH_CAT_MB`
@@ -58,6 +60,11 @@ fn main() {
         }
         Err(_) => params.compress(&data, level),
     };
+    zstd_native::__private::set_seq_loop(match lib {
+        "native-long" => Some(true),
+        "native-short" => Some(false),
+        _ => None,
+    });
     let mut out = vec![0u8; data.len() + 64];
     let mut n = 0u64;
     let t = Instant::now();
@@ -118,7 +125,7 @@ fn main() {
                     total += n;
                 }
             }
-            "native" | "native-noasm" | "native-asm" => {
+            "native" | "native-noasm" | "native-asm" | "native-long" | "native-short" => {
                 native.decompress_to_slice(&comp, &mut out).unwrap()
             }
             "structured" => sd.decode_all(&comp, &mut out).unwrap(),
@@ -126,6 +133,10 @@ fn main() {
         };
         assert_eq!(len, data.len());
         n += 1;
+    }
+    // Builds with debug assertions count the prefetching loop's blocks.
+    if let Some(b) = zstd_native::__private::long_blocks() {
+        eprintln!("prefetching loop: {b} blocks in {n} runs");
     }
     let el = t.elapsed().as_secs_f64();
     println!(

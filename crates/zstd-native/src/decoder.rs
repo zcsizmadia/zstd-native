@@ -24,6 +24,9 @@ use crate::xxhash::Xxh64;
 pub struct Decompressor {
     block: Box<BlockDecoder>,
     dict: Option<Dictionary>,
+    /// The dictionary was installed and no frame has used it yet (its
+    /// content is cold: see `BlockDecoder::dict_cold`).
+    dict_fresh: bool,
 }
 
 impl core::fmt::Debug for Decompressor {
@@ -52,6 +55,7 @@ impl Decompressor {
         Decompressor {
             block: Box::new(BlockDecoder::new()),
             dict: None,
+            dict_fresh: false,
         }
     }
 
@@ -60,11 +64,13 @@ impl Decompressor {
         Decompressor {
             block: Box::new(BlockDecoder::new()),
             dict: Some(dict),
+            dict_fresh: true,
         }
     }
 
     /// Replaces (or removes) the dictionary.
     pub fn set_dictionary(&mut self, dict: Option<Dictionary>) {
+        self.dict_fresh = dict.is_some();
         self.dict = dict;
     }
 
@@ -171,6 +177,9 @@ impl Decompressor {
                 &[]
             }
         };
+        // libzstd's `ddictIsCold`: the first frame after the dictionary was
+        // installed (a frame without compressed blocks clears it too).
+        self.block.dict_cold = core::mem::take(&mut self.dict_fresh) && self.dict.is_some();
         let block_max = fh.block_size_max();
         let prefix = out.pos;
 

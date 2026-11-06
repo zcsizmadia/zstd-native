@@ -4,7 +4,8 @@
 //! one `DDict` per frame (`ddictIsCold`). Prints the best of 7 rounds.
 //!
 //! `cargo run --profile bench -p zstd-bench --example cold_dict -- <lib> <level>`
-//! with lib `native` or `c`.
+//! with lib `native`, `native-long` / `native-short` (force the prefetching
+//! or the fused sequence loop) or `c`.
 
 use std::time::Instant;
 
@@ -19,6 +20,11 @@ fn main() {
         .iter()
         .map(|s| c.compress(s).unwrap())
         .collect();
+    zstd_native::__private::set_seq_loop(match lib.as_str() {
+        "native-long" => Some(true),
+        "native-short" => Some(false),
+        _ => None,
+    });
     let parsed = zstd_native::Dictionary::new(&dict).unwrap();
     let copies = 2048;
     let mut out = vec![0u8; 8192];
