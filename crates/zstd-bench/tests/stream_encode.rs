@@ -286,6 +286,43 @@ fn flushes() {
     }
 }
 
+/// A flush every few KiB at the fast levels (`fast` and `dfast`): once the
+/// input buffer wraps, nearly every block is compressed in extDict mode,
+/// with matches in both segments and tables full of stale entries (small
+/// windows), the default windows, and output buffers too small for a
+/// block.
+#[test]
+fn frequent_flushes_fast_levels() {
+    // past the default windows of these levels (512 KiB to 2 MiB)
+    let data = input(3_000_000);
+    for level in [-3, -1, 1, 2, 3, 4] {
+        for (wlog, flush) in [
+            (0, 4096),
+            (0, 16_384),
+            (10, 1000),
+            (12, 4096),
+            (15, 4096),
+            (17, 3000),
+        ] {
+            let mut s = Script::new(level);
+            s.window_log = wlog;
+            let mut left = if wlog == 0 { data.len() } else { 1_000_000 };
+            while left > 0 {
+                let c = flush.min(left);
+                let out = if s.ops.len().is_multiple_of(3) {
+                    100
+                } else {
+                    OUT
+                };
+                s.ops.push((c, EndOp::Flush, out));
+                left -= c;
+            }
+            s.ops.push((0, EndOp::End, OUT));
+            check("frequent flushes", &s, &data);
+        }
+    }
+}
+
 /// Random call sequences: chunk sizes, operations (ending frames in the
 /// middle, with or without input) and output sizes.
 #[test]

@@ -1525,7 +1525,7 @@ unsafe fn offset_match(
 /// window with an extDict segment (a stream whose input buffer wrapped,
 /// see the `stream` module). Picks `ZSTD_compressBlock_fast_extDict_<mls>_0`
 /// like libzstd (3 and other values use 4).
-#[inline(never)]
+#[inline(always)]
 pub(crate) fn compress_block_fast_ext_dict(
     ms: &mut MatchState,
     ss: &mut SeqStore,
@@ -1535,11 +1535,81 @@ pub(crate) fn compress_block_fast_ext_dict(
     end: usize,
 ) -> usize {
     debug_assert!(ms.cparams.strategy == Strategy::Fast);
+    // Valid indexes span at most 64 KiB: candidates checked with `cmov`s
+    // (meta/zstd#4764), with a BMI2 build. 3-11% faster there (small
+    // windows, small copied dictionaries: many stale entries), 1-3% slower
+    // from 128 KiB up (a 64 KiB dictionary copied into the tables, windows
+    // of 128 KiB and more), where libzstd's branches stay.
+    let end_index = ms.window.index(end);
+    let low_limit = ms.lowest_match_index(end_index, ms.cparams.window_log);
+    if end_index - low_limit <= 1 << 16 {
+        return ext_dict_cmov(ms, ss, rep, buf, start, end);
+    }
+    ext_dict_branch(ms, ss, rep, buf, start, end)
+}
+
+/// [`compress_block_fast_ext_dict`] for larger windows, libzstd's checks.
+#[inline(never)]
+fn ext_dict_branch(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
+    ext_dict_mls::<false>(ms, ss, rep, buf, start, end)
+}
+
+/// [`compress_block_fast_ext_dict`] for windows of at most 64 KiB.
+#[inline(never)]
+fn ext_dict_cmov(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
+    #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+    if crate::cpu::Features::detect().bmi2 {
+        // SAFETY: BMI2 (with BMI1 and LZCNT) was detected on this CPU.
+        #[allow(unsafe_code)]
+        return unsafe { ext_dict_bmi2(ms, ss, rep, buf, start, end) };
+    }
+    ext_dict_mls::<true>(ms, ss, rep, buf, start, end)
+}
+
+/// [`ext_dict_cmov`] compiled with BMI1, BMI2 and LZCNT.
+#[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+#[inline(never)]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+fn ext_dict_bmi2(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
+    ext_dict_mls::<true>(ms, ss, rep, buf, start, end)
+}
+
+/// The `ZSTD_compressBlock_fast_extDict_<mls>_0` variant.
+#[inline(always)]
+fn ext_dict_mls<const CMOV: bool>(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
     match ms.cparams.min_match {
-        5 => ext_dict_generic::<5>(ms, ss, rep, buf, start, end),
-        6 => ext_dict_generic::<6>(ms, ss, rep, buf, start, end),
-        7 => ext_dict_generic::<7>(ms, ss, rep, buf, start, end),
-        _ => ext_dict_generic::<4>(ms, ss, rep, buf, start, end),
+        5 => ext_dict_generic::<5, CMOV>(ms, ss, rep, buf, start, end),
+        6 => ext_dict_generic::<6, CMOV>(ms, ss, rep, buf, start, end),
+        7 => ext_dict_generic::<7, CMOV>(ms, ss, rep, buf, start, end),
+        _ => ext_dict_generic::<4, CMOV>(ms, ss, rep, buf, start, end),
     }
 }
 
@@ -1677,7 +1747,7 @@ impl ExtWindow {
 /// prefix (`ZSTD_count_2segments`). Debug builds check reads with `chk`.
 #[allow(unsafe_code)]
 #[inline(always)]
-fn ext_dict_generic<const MLS: u32>(
+fn ext_dict_generic<const MLS: u32, const CMOV: bool>(
     ms: &mut MatchState,
     ss: &mut SeqStore,
     rep: &mut [u32; 3],
@@ -1740,6 +1810,24 @@ fn ext_dict_generic<const MLS: u32>(
             offset_1 = 0;
         }
     }
+
+    // Whether table candidate `idx` matches at `ip0` (see [`cand_match`];
+    // with `CMOV` the segment is selected without a branch too).
+    let (dict_base, base_) = (w.dict_base, w.base);
+    let cand = |idx: u32, ip0: *const u8| {
+        let m = if CMOV {
+            core::hint::select_unpredictable(idx < prefix_start_index, dict_base, base_)
+                .wrapping_add(idx as usize)
+        } else {
+            w.pos(idx)
+        };
+        let valid = idx >= dict_start_index;
+        if valid {
+            w.chk(m, 4);
+        }
+        // SAFETY: `m` is in its segment if valid, `ip0` below `ilimit`.
+        unsafe { cand_match::<CMOV, false>(valid, m, ip0) }
+    };
 
     // SAFETY (whole block): see the function docs. Hash table writes use
     // hashes of `hlog` bits into a table of `1 << hlog` entries.
@@ -1805,11 +1893,7 @@ fn ext_dict_generic<const MLS: u32>(
                     }
 
                     // load match for ip[0], check it
-                    if idx >= dict_start_index && {
-                        let m = w.pos(idx);
-                        w.chk(m, 4);
-                        read32(m) == read32(ip0)
-                    } {
+                    if cand(idx, ip0) {
                         current0 = c0;
                         (match0, m_length, offcode, match_end) = ext_offset_match(
                             &w,
@@ -1841,11 +1925,7 @@ fn ext_dict_generic<const MLS: u32>(
                 *ht.add(hash0) = c0;
 
                 // load match for ip[0], check it
-                if idx >= dict_start_index && {
-                    let m = w.pos(idx);
-                    w.chk(m, 4);
-                    read32(m) == read32(ip0)
-                } {
+                if cand(idx, ip0) {
                     current0 = c0;
                     (match0, m_length, offcode, match_end) = ext_offset_match(
                         &w,
@@ -1959,6 +2039,69 @@ fn ext_dict_generic<const MLS: u32>(
 
     // Return the last literals size
     iend as usize - anchor as usize
+}
+
+/// ~random data, unlikely to match: read instead of an invalid table
+/// candidate (libzstd's `dummy` arrays, see [`select_addr`]).
+static DUMMY8: [u8; 8] = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0];
+
+/// `ZSTD_selectAddr()`: `candidate` if `valid`, else an 8-byte dummy
+/// array, without a branch (`cmov`).
+#[inline(always)]
+pub(crate) fn select_addr(valid: bool, candidate: *const u8) -> *const u8 {
+    core::hint::select_unpredictable(valid, candidate, DUMMY8.as_ptr())
+}
+
+/// `eq && valid`, for a table candidate read through [`select_addr`]: the
+/// bytes are compared first, and the validity tested only when they match
+/// (rare), so neither branch is mispredicted on stale entries
+/// (`ZSTD_match4Found_cmov`). The empty `asm!` keeps the compiler from
+/// testing `valid` first (libzstd's `__asm__("")` there).
+#[allow(unsafe_code)]
+#[inline(always)]
+pub(crate) fn then_valid(eq: bool, valid: bool) -> bool {
+    if !eq {
+        return false;
+    }
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // SAFETY: an empty asm block, an ordering barrier for the compiler.
+    unsafe {
+        core::arch::asm!("", options(nomem, nostack, preserves_flags));
+    }
+    valid
+}
+
+/// Whether the table candidate at `cand` (readable if `valid`) matches the
+/// 4 (or with `LONG` 8) bytes at `ip`, and is `valid`. With `CMOV`
+/// (`ZSTD_match4Found_cmov`), an invalid candidate reads a dummy array
+/// instead, and `valid` is tested only when the bytes match; otherwise
+/// (`ZSTD_match4Found_branch`) `valid` is tested first, which is faster when
+/// nearly every candidate is valid (large windows).
+///
+/// # Safety
+/// `ip..ip + 8` is readable, and `cand..cand + 8` if `valid`.
+#[allow(unsafe_code)]
+#[inline(always)]
+pub(crate) unsafe fn cand_match<const CMOV: bool, const LONG: bool>(
+    valid: bool,
+    cand: *const u8,
+    ip: *const u8,
+) -> bool {
+    // SAFETY: per the caller; the dummy array has 8 bytes.
+    unsafe {
+        let rd = |p: *const u8| {
+            if LONG {
+                read_le64(p)
+            } else {
+                u64::from(read32(p))
+            }
+        };
+        if CMOV {
+            then_valid(rd(select_addr(valid, cand)) == rd(ip), valid)
+        } else {
+            valid && rd(cand) == rd(ip)
+        }
+    }
 }
 
 /// `ZSTD_index_overlap_check()`: whether a 4-byte read at `rep_index`
@@ -2105,6 +2248,41 @@ pub(crate) fn compress_block_fast_dict_match_state(
     end: usize,
 ) -> usize {
     debug_assert!(ms.cparams.strategy == Strategy::Fast);
+    #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+    if crate::cpu::Features::detect().bmi2 {
+        // SAFETY: BMI2 (with BMI1 and LZCNT) was detected on this CPU.
+        #[allow(unsafe_code)]
+        return unsafe { dms_bmi2(ms, ss, rep, buf, start, end) };
+    }
+    dms_mls(ms, ss, rep, buf, start, end)
+}
+
+/// [`compress_block_fast_dict_match_state`] compiled with BMI1, BMI2 and
+/// LZCNT.
+#[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+#[inline(never)]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+fn dms_bmi2(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
+    dms_mls(ms, ss, rep, buf, start, end)
+}
+
+/// The `ZSTD_compressBlock_fast_dictMatchState_<mls>_0` variant.
+#[inline(always)]
+fn dms_mls(
+    ms: &mut MatchState,
+    ss: &mut SeqStore,
+    rep: &mut [u32; 3],
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> usize {
     match ms.cparams.min_match {
         5 => dms_generic::<5>(ms, ss, rep, buf, start, end),
         6 => dms_generic::<6>(ms, ss, rep, buf, start, end),
@@ -2315,10 +2493,13 @@ fn dms_generic<const MLS: u32>(
                     }
                 }
 
-                if match_index >= prefix_start_index && {
+                // ZSTD_match4Found_cmov: with a short prefix (small inputs),
+                // many candidates are below it, an unpredictable branch
+                if then_valid(
+                    read32(ip0) == read32(select_addr(match_index >= prefix_start_index, mtch)),
+                    match_index >= prefix_start_index,
+                ) {
                     chk(mtch, 4);
-                    read32(ip0) == read32(mtch)
-                } {
                     // found a regular match of size >= 4
                     let mut mtch = mtch;
                     let offset = (ip0 as usize - mtch as usize) as u32;
