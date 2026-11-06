@@ -22,6 +22,14 @@
 //! needs no mask) and remain the fallback (no BMI2, the `portable`
 //! feature, other targets). Uses BMI1/BMI2 (`shrx`, `tzcnt`): call only
 //! when the CPU has them.
+//!
+//! [`dfast_ext_block`] is the extDict loop of `dfast`
+//! (`ZSTD_compressBlock_doubleFast_extDict_generic`: streaming once the
+//! input buffer wraps, copied dictionaries), built the same way: the Rust
+//! loop (`dfast::ext_dict_generic`) had libzstd's instruction count and
+//! fewer branch misses, but reloaded the table pointers, a hash shift, the
+//! segment bases and `offset_1` at every position and spent 3-6% more
+//! cycles than libzstd's in that loop.
 #![allow(unsafe_code)]
 
 use super::seq_store::SeqDef;
@@ -82,6 +90,17 @@ macro_rules! count_asm {
             ", qword ptr [",
             $ctx,
             " + {iend}]\n",
+            count_lim_asm!($pin, $pm, $t, $t32, $t16, $t8, $lim),
+        )
+    };
+}
+
+/// `ZSTD_count(pIn, pMatch, pInLimit)` as [`count_asm`], with `pInLimit`
+/// in the register `$lim` (clobbered).
+macro_rules! count_lim_asm {
+    ($pin:literal, $pm:literal, $t:literal, $t32:literal, $t16:literal, $t8:literal,
+     $lim:literal) => {
+        concat!(
             "sub ",
             $lim,
             ", 7\n", // pInLoopLimit
@@ -1141,6 +1160,495 @@ pub(super) unsafe fn dfast_block(
             out("r10") _,
             out("r12") _,
             out("r13") _,
+            out("r14") _,
+            out("r15") _,
+            out("xmm0") _,
+            out("xmm1") _,
+        );
+    }
+}
+
+/// `ZSTD_count_2segments(pIn, pMatch, iend, mEnd, prefixStart)` for `$pin`
+/// = pIn, `$pm` = pMatch, `$mend` = mEnd (64-bit registers): counts up to
+/// `vEnd = min(pIn + (mEnd - pMatch), iend)`, and when the match reaches
+/// `mEnd` (the end of its segment) goes on from `prefixStart`. Leaves
+/// `$pin` at the end of the match; clobbers `$pm`, `$lim`, `$t` and
+/// `$ctx`'s `vend` field. Labels 200-205 and 239.
+macro_rules! count2_asm {
+    ($ctx:literal, $pin:literal, $pm:literal, $mend:literal, $t:literal, $t32:literal,
+     $t16:literal, $t8:literal, $lim:literal) => {
+        concat!(
+            // vEnd unclamped: the match reaches mEnd iff pIn ends there
+            "mov ",
+            $lim,
+            ", ",
+            $mend,
+            "\n",
+            "sub ",
+            $lim,
+            ", ",
+            $pm,
+            "\n",
+            "add ",
+            $lim,
+            ", ",
+            $pin,
+            "\n",
+            "mov qword ptr [",
+            $ctx,
+            " + {vend}], ",
+            $lim,
+            "\n",
+            "cmp ",
+            $lim,
+            ", qword ptr [",
+            $ctx,
+            " + {iend}]\n",
+            "cmova ",
+            $lim,
+            ", qword ptr [",
+            $ctx,
+            " + {iend}]\n",
+            count_lim_asm!($pin, $pm, $t, $t32, $t16, $t8, $lim),
+            "cmp ",
+            $pin,
+            ", qword ptr [",
+            $ctx,
+            " + {vend}]\n",
+            "jne 239f\n",
+            "mov ",
+            $pm,
+            ", qword ptr [",
+            $ctx,
+            " + {prefix_start}]\n",
+            "mov ",
+            $lim,
+            ", qword ptr [",
+            $ctx,
+            " + {iend}]\n",
+            count_lim_asm!($pin, $pm, $t, $t32, $t16, $t8, $lim),
+            "239:\n",
+        )
+    };
+}
+
+/// The state of the `dfast` extDict block loop, in memory (the asm reads
+/// it by field offset through one register).
+#[repr(C)]
+pub(super) struct DfastExtCtx {
+    /// Short hash: `(read64(p) * prime_s) >> shift_s` (see
+    /// `fast::hash_prime`).
+    pub(super) prime_s: u64,
+    /// Long hash: `(read64(p) * prime_l) >> shift_l` (`ZSTD_hash8Ptr`).
+    pub(super) prime_l: u64,
+    /// `64 - chainLog`.
+    pub(super) shift_s: u64,
+    /// `64 - hashLog`.
+    pub(super) shift_l: u64,
+    /// `prefixStartIndex`: indexes below it are in the extDict segment.
+    pub(super) prefix_start_index: u64,
+    /// `dictStartIndex`: table candidates must be above it.
+    pub(super) dict_start_index: u64,
+    pub(super) anchor: *const u8,
+    pub(super) iend: *const u8,
+    /// `iend - HASH_READ_SIZE`.
+    pub(super) ilimit: *const u8,
+    /// `base + prefixStartIndex`.
+    pub(super) prefix_start: *const u8,
+    /// `dictBase + dictStartIndex`.
+    pub(super) dict_start: *const u8,
+    /// `dictBase + prefixStartIndex`.
+    pub(super) dict_end: *const u8,
+    /// `iend - WILDCOPY_OVERLENGTH` (saturating), see [`FastCtx`].
+    pub(super) lit_limit_w: usize,
+    pub(super) lit: *mut u8,
+    pub(super) seq: *mut SeqDef,
+    pub(super) off1: u64,
+    pub(super) off2: u64,
+    pub(super) llt: u64,
+    pub(super) llpos: *mut SeqDef,
+    /// The search position of the current match (`curr`), for the
+    /// complementary insertion.
+    pub(super) curr_pos: *const u8,
+    /// The start of the current match's segment (`lowMatchPtr`).
+    pub(super) low_match: *const u8,
+    /// Scratch for [`count2_asm`].
+    pub(super) vend: *const u8,
+}
+
+/// `ZSTD_compressBlock_doubleFast_extDict_generic` from the top of its
+/// search loop with `ip` to the end of the block, with the candidate
+/// checks of meta/zstd#4764 (as `dfast::ext_dict_generic` with `CMOV`): a
+/// table candidate's segment is selected with a `cmov`, an invalid one
+/// (index at or below `dictStartIndex`) reads `ctx` instead (any readable
+/// address does, like libzstd's dummy array), and its index is tested only
+/// when the bytes match. Same parse and output as the Rust loop. Writes the
+/// sequences at `ctx.lit` / `ctx.seq` and leaves the state in `ctx`
+/// (`anchor`, `off1`, `off2`, `lit`, `seq`, `llt`, `llpos`).
+///
+/// As in [`dfast_block`], the per-position values stay in registers: the
+/// Rust loop reloaded the table pointers, a hash shift, `offset_1` and the
+/// segment bases from the stack at every position.
+///
+/// # Safety
+/// The contract of `dfast::ext_dict_generic` at the top of its search
+/// loop: `ip` and `ctx.anchor` are positions in `[prefix_start, iend]`
+/// with `anchor <= ip`; `ctx.ilimit = iend - 8`; the window fields describe
+/// the block's window as `fast::ExtWindow` does (both segments readable,
+/// `dict_start_index < prefix_start_index`), `base` and `dict_base` are
+/// its segment bases; `hash_long` / `hash_small` have `1 << (64 - shift_l)`
+/// / `1 << (64 - shift_s)` entries; the sequence store has room for the
+/// block's sequences and literals at `ctx.lit` / `ctx.seq`
+/// (`SeqStore::reserve`), with `WILDCOPY_OVERLENGTH` bytes of slack after
+/// the literals; the CPU has BMI1 and BMI2.
+#[inline(always)]
+pub(super) unsafe fn dfast_ext_block(
+    ctx: &mut DfastExtCtx,
+    ip: *const u8,
+    hash_long: *mut u32,
+    hash_small: *mut u32,
+    base: *const u8,
+    dict_base: *const u8,
+) {
+    debug_assert!(ctx.anchor <= ip && ip <= ctx.iend);
+    debug_assert!(ctx.ilimit == ctx.iend.wrapping_sub(8));
+    debug_assert!(ctx.dict_start_index < ctx.prefix_start_index);
+    // SAFETY: per the caller: the reads, table writes and sequence store
+    // writes are those of the Rust loop. `rbx` and `rbp` are saved and
+    // restored in the template (they can't be `asm!` operands).
+    unsafe {
+        asm!(
+            "push rbx",
+            "push rbp",
+            "mov rbp, rdx",
+            "jmp 20f",
+            // rdi: ip, r14: read64(ip), rbx: curr = ip - base, r15: idxl
+            // (hashLong), r9: idxs (hashSmall), r11: base, r13: dictBase,
+            // rcx: hashLong, r8: hashSmall, r10/r12: short/long hash shifts,
+            // rbp: ctx.
+            ".p2align 5",
+            "2:",
+            "mov r14, qword ptr [rdi]",
+            "mov rax, r14",
+            "imul rax, qword ptr [rbp + {prime_l}]",
+            "shrx rax, rax, r12",
+            "mov rsi, r14",
+            "imul rsi, qword ptr [rbp + {prime_s}]",
+            "shrx rsi, rsi, r10",
+            "mov r15d, dword ptr [rcx + 4*rax]",
+            "mov r9d, dword ptr [r8 + 4*rsi]",
+            // update hash tables: hashSmall[hs] = hashLong[hl] = curr
+            "mov ebx, edi",
+            "sub ebx, r11d",
+            "mov dword ptr [rcx + 4*rax], ebx",
+            "mov dword ptr [r8 + 4*rsi], ebx",
+            // repcode at ip + 1: repIndex = curr + 1 - offset_1, read if
+            // ZSTD_index_overlap_check(prefixStartIndex, repIndex) and
+            // offset_1 <= curr + 1 - dictStartIndex
+            "lea eax, [rbx + 1]",
+            "mov edx, eax",
+            "sub edx, dword ptr [rbp + {off1}]",
+            "sub eax, dword ptr [rbp + {dsi}]",
+            "cmp dword ptr [rbp + {off1}], eax",
+            "ja 3f",
+            "mov eax, dword ptr [rbp + {psi}]",
+            "dec eax",
+            "sub eax, edx",
+            "cmp eax, 3",
+            "jb 3f",
+            "lea rsi, [r11 + rdx]",
+            "lea rax, [r13 + rdx]",
+            "cmp edx, dword ptr [rbp + {psi}]",
+            "cmovb rsi, rax",
+            "mov eax, dword ptr [rsi]",
+            "cmp eax, dword ptr [rdi + 1]",
+            "je 30f",
+            "3:",
+            // long candidate: segment and validity selected, 8 bytes
+            "lea rsi, [r11 + r15]",
+            "lea rax, [r13 + r15]",
+            "cmp r15d, dword ptr [rbp + {psi}]",
+            "cmovb rsi, rax",
+            "cmp r15d, dword ptr [rbp + {dsi}]",
+            "cmovbe rsi, rbp",
+            "cmp r14, qword ptr [rsi]",
+            "je 40f",
+            "5:",
+            // short candidate: 4 bytes
+            "lea rsi, [r11 + r9]",
+            "lea rax, [r13 + r9]",
+            "cmp r9d, dword ptr [rbp + {psi}]",
+            "cmovb rsi, rax",
+            "cmp r9d, dword ptr [rbp + {dsi}]",
+            "cmovbe rsi, rbp",
+            "cmp r14d, dword ptr [rsi]",
+            "je 60f",
+            "7:",
+            // ip += ((ip - anchor) >> kSearchStrength) + 1; stop at ilimit
+            "mov rax, rdi",
+            "sub rax, qword ptr [rbp + {anchor}]",
+            "shr rax, 8",
+            "lea rdi, [rdi + rax + 1]",
+            "cmp rdi, qword ptr [rbp + {ilimit}]",
+            "jb 2b",
+            "jmp 90f",
+            //
+            // search loop top: while ip < ilimit; reload the shifts (the
+            // match path uses their registers)
+            "20:",
+            "cmp rdi, qword ptr [rbp + {ilimit}]",
+            "jae 90f",
+            "mov r10, qword ptr [rbp + {shift_s}]",
+            "mov r12, qword ptr [rbp + {shift_l}]",
+            "jmp 2b",
+            //
+            // repcode match at ip + 1 (rsi: repMatch, edx: repIndex):
+            // mLength = count_2segments(ip + 5, repMatch + 4, repMatchEnd)
+            // + 4; ip++; storeSeq(ip - anchor, anchor, iend,
+            // REPCODE1_TO_OFFBASE, mLength).
+            "30:",
+            "mov qword ptr [rbp + {curr_pos}], rdi",
+            "mov rax, qword ptr [rbp + {iend}]",
+            "cmp edx, dword ptr [rbp + {psi}]",
+            "cmovb rax, qword ptr [rbp + {dict_end}]",
+            "lea rdx, [rdi + 5]",
+            "add rsi, 4",
+            count2_asm!("rbp", "rdx", "rsi", "rax", "r10", "r10d", "r10w", "r10b", "r12"),
+            "inc rdi",
+            "mov r12, rdx",
+            "sub r12, rdi",
+            "mov r9d, 1",
+            "jmp 50f",
+            //
+            // long match at ip (the candidate must be valid, the dummy may
+            // have matched): offset = curr - idxl
+            "40:",
+            "cmp r15d, dword ptr [rbp + {dsi}]",
+            "jbe 5b",
+            "mov qword ptr [rbp + {curr_pos}], rdi",
+            // (from the short path: the long match at ip + 1, rbx: curr + 1)
+            "41:",
+            "lea rsi, [r11 + r15]",
+            "lea rax, [r13 + r15]",
+            "mov rdx, qword ptr [rbp + {iend}]",
+            "mov r10, qword ptr [rbp + {prefix_start}]",
+            "cmp r15d, dword ptr [rbp + {psi}]",
+            "cmovb rsi, rax",
+            "cmovb rdx, qword ptr [rbp + {dict_end}]",
+            "cmovb r10, qword ptr [rbp + {dict_start}]",
+            "mov qword ptr [rbp + {low_match}], r10",
+            "mov r9d, ebx",
+            "sub r9d, r15d",
+            "mov r15, rsi",
+            // mLength = count_2segments(ip + 8, matchLong + 8, matchEnd) + 8
+            "lea rax, [rdi + 8]",
+            "add rsi, 8",
+            count2_asm!("rbp", "rax", "rsi", "rdx", "r10", "r10d", "r10w", "r10b", "r12"),
+            "mov r12, rax",
+            "sub r12, rdi",
+            "mov rbx, r15",
+            "jmp 47f",
+            //
+            // short candidate at ip, valid? First the long candidate of
+            // ip + 1: h3 = hash_l(ip + 1), idx3 = hashLong[h3], hashLong[h3]
+            // = curr + 1; a valid one matching 8 bytes is taken instead.
+            "60:",
+            "cmp r9d, dword ptr [rbp + {dsi}]",
+            "jbe 7b",
+            "mov qword ptr [rbp + {curr_pos}], rdi",
+            "mov rax, qword ptr [rdi + 1]",
+            "mov r14, rax",
+            "imul rax, qword ptr [rbp + {prime_l}]",
+            "shrx rax, rax, r12",
+            "mov r15d, dword ptr [rcx + 4*rax]",
+            "lea edx, [rbx + 1]",
+            "mov dword ptr [rcx + 4*rax], edx",
+            "cmp r15d, dword ptr [rbp + {dsi}]",
+            "jbe 65f",
+            "lea rsi, [r11 + r15]",
+            "lea rax, [r13 + r15]",
+            "cmp r15d, dword ptr [rbp + {psi}]",
+            "cmovb rsi, rax",
+            "cmp r14, qword ptr [rsi]",
+            "jne 65f",
+            "inc rdi",
+            "inc ebx",
+            "jmp 41b",
+            // the short match: offset = curr - idxs; mLength =
+            // count_2segments(ip + 4, match + 4, matchEnd) + 4
+            "65:",
+            "lea rsi, [r11 + r9]",
+            "lea rax, [r13 + r9]",
+            "mov rdx, qword ptr [rbp + {iend}]",
+            "mov r10, qword ptr [rbp + {prefix_start}]",
+            "cmp r9d, dword ptr [rbp + {psi}]",
+            "cmovb rsi, rax",
+            "cmovb rdx, qword ptr [rbp + {dict_end}]",
+            "cmovb r10, qword ptr [rbp + {dict_start}]",
+            "mov qword ptr [rbp + {low_match}], r10",
+            "mov eax, ebx",
+            "sub eax, r9d",
+            "mov r9d, eax",
+            "mov r15, rsi",
+            "lea rax, [rdi + 4]",
+            "add rsi, 4",
+            count2_asm!("rbp", "rax", "rsi", "rdx", "r10", "r10d", "r10w", "r10b", "r12"),
+            "mov r12, rax",
+            "sub r12, rdi",
+            "mov rbx, r15",
+            //
+            // catch up (rdi: ip, rbx: match, r12: mLength): while ip >
+            // anchor and match > lowMatchPtr and ip[-1] == match[-1]
+            "47:",
+            "mov rax, qword ptr [rbp + {anchor}]",
+            "mov rdx, qword ptr [rbp + {low_match}]",
+            "48:",
+            "cmp rdi, rax",
+            "jbe 49f",
+            "cmp rbx, rdx",
+            "jbe 49f",
+            "movzx r10d, byte ptr [rdi - 1]",
+            "cmp r10b, byte ptr [rbx - 1]",
+            "jne 49f",
+            "dec rdi",
+            "dec rbx",
+            "inc r12",
+            "jmp 48b",
+            // offset_2 = offset_1; offset_1 = offset; offcode =
+            // OFFSET_TO_OFFBASE(offset)
+            "49:",
+            "mov rax, qword ptr [rbp + {off1}]",
+            "mov qword ptr [rbp + {off2}], rax",
+            "mov qword ptr [rbp + {off1}], r9",
+            "add r9d, 3",
+            //
+            // storeSeq(ip - anchor, anchor, iend, r9d, mLength); ip +=
+            // mLength; anchor = ip
+            "50:",
+            store_seq_asm!("rbp", "rdi", "r9d", "r12", "r10"),
+            "cmp rdi, qword ptr [rbp + {ilimit}]",
+            "ja 20b",
+            // complementary insertion: indexToInsert = curr + 2 (its
+            // position p = curr_pos + 2): hashLong[hash_l(p)] =
+            // indexToInsert; hashLong[hash_l(ip - 2)] = ip - 2 - base;
+            // hashSmall[hash_s(p)] = indexToInsert; hashSmall[hash_s(ip -
+            // 1)] = ip - 1 - base
+            "mov r10, qword ptr [rbp + {shift_s}]",
+            "mov r12, qword ptr [rbp + {shift_l}]",
+            "mov rsi, qword ptr [rbp + {curr_pos}]",
+            "add rsi, 2",
+            "mov r9d, esi",
+            "sub r9d, r11d",
+            "mov rax, qword ptr [rsi]",
+            "mov rdx, rax",
+            "imul rax, qword ptr [rbp + {prime_l}]",
+            "shrx rax, rax, r12",
+            "mov dword ptr [rcx + 4*rax], r9d",
+            "imul rdx, qword ptr [rbp + {prime_s}]",
+            "shrx rdx, rdx, r10",
+            "mov dword ptr [r8 + 4*rdx], r9d",
+            "mov rax, qword ptr [rdi - 2]",
+            "imul rax, qword ptr [rbp + {prime_l}]",
+            "shrx rax, rax, r12",
+            "lea edx, [rdi - 2]",
+            "sub edx, r11d",
+            "mov dword ptr [rcx + 4*rax], edx",
+            "mov rax, qword ptr [rdi - 1]",
+            "imul rax, qword ptr [rbp + {prime_s}]",
+            "shrx rax, rax, r10",
+            "lea edx, [rdi - 1]",
+            "sub edx, r11d",
+            "mov dword ptr [r8 + 4*rax], edx",
+            //
+            // check immediate repcode (ip <= ilimit): repIndex2 = current2 -
+            // offset_2, read if ZSTD_index_overlap_check(prefixStartIndex,
+            // repIndex2) and offset_2 <= current2 - dictStartIndex
+            "61:",
+            "mov r15d, edi",
+            "sub r15d, r11d",
+            "mov eax, r15d",
+            "sub eax, dword ptr [rbp + {off2}]",
+            "mov esi, r15d",
+            "sub esi, dword ptr [rbp + {dsi}]",
+            "cmp dword ptr [rbp + {off2}], esi",
+            "ja 20b",
+            "mov esi, dword ptr [rbp + {psi}]",
+            "dec esi",
+            "sub esi, eax",
+            "cmp esi, 3",
+            "jb 20b",
+            "lea rsi, [r11 + rax]",
+            "lea r9, [r13 + rax]",
+            "mov rbx, qword ptr [rbp + {iend}]",
+            "cmp eax, dword ptr [rbp + {psi}]",
+            "cmovb rsi, r9",
+            "cmovb rbx, qword ptr [rbp + {dict_end}]",
+            "mov eax, dword ptr [rsi]",
+            "cmp eax, dword ptr [rdi]",
+            "jne 20b",
+            // repLength2 = count_2segments(ip + 4, repMatch2 + 4, repEnd2) + 4
+            "lea rax, [rdi + 4]",
+            "add rsi, 4",
+            count2_asm!("rbp", "rax", "rsi", "rbx", "r9", "r9d", "r9w", "r9b", "rdx"),
+            "mov rbx, rax",
+            "sub rbx, rdi",
+            // swap offset_2 <=> offset_1
+            "mov rax, qword ptr [rbp + {off1}]",
+            "mov rdx, qword ptr [rbp + {off2}]",
+            "mov qword ptr [rbp + {off1}], rdx",
+            "mov qword ptr [rbp + {off2}], rax",
+            // hashSmall[hash_s(ip)] = hashLong[hash_l(ip)] = current2
+            "mov rax, qword ptr [rdi]",
+            "mov rdx, rax",
+            "imul rax, qword ptr [rbp + {prime_s}]",
+            "shrx rax, rax, r10",
+            "mov dword ptr [r8 + 4*rax], r15d",
+            "imul rdx, qword ptr [rbp + {prime_l}]",
+            "shrx rdx, rdx, r12",
+            "mov dword ptr [rcx + 4*rdx], r15d",
+            // storeSeq(0, anchor, iend, REPCODE1, repLength2); ip += it
+            store_rep_asm!("rbp", "rdi", "rbx", "rsi"),
+            "cmp rdi, qword ptr [rbp + {ilimit}]",
+            "jbe 61b",
+            "jmp 20b",
+            //
+            // end of the block
+            "90:",
+            "pop rbp",
+            "pop rbx",
+            prime_s = const offset_of!(DfastExtCtx, prime_s),
+            prime_l = const offset_of!(DfastExtCtx, prime_l),
+            shift_s = const offset_of!(DfastExtCtx, shift_s),
+            shift_l = const offset_of!(DfastExtCtx, shift_l),
+            psi = const offset_of!(DfastExtCtx, prefix_start_index),
+            dsi = const offset_of!(DfastExtCtx, dict_start_index),
+            anchor = const offset_of!(DfastExtCtx, anchor),
+            iend = const offset_of!(DfastExtCtx, iend),
+            ilimit = const offset_of!(DfastExtCtx, ilimit),
+            prefix_start = const offset_of!(DfastExtCtx, prefix_start),
+            dict_start = const offset_of!(DfastExtCtx, dict_start),
+            dict_end = const offset_of!(DfastExtCtx, dict_end),
+            lit_limit_w = const offset_of!(DfastExtCtx, lit_limit_w),
+            lit = const offset_of!(DfastExtCtx, lit),
+            seq = const offset_of!(DfastExtCtx, seq),
+            llt = const offset_of!(DfastExtCtx, llt),
+            llpos = const offset_of!(DfastExtCtx, llpos),
+            off1 = const offset_of!(DfastExtCtx, off1),
+            off2 = const offset_of!(DfastExtCtx, off2),
+            curr_pos = const offset_of!(DfastExtCtx, curr_pos),
+            low_match = const offset_of!(DfastExtCtx, low_match),
+            vend = const offset_of!(DfastExtCtx, vend),
+            inout("rdx") ctx as *mut DfastExtCtx => _,
+            inout("rdi") ip => _,
+            in("rcx") hash_long,
+            in("r8") hash_small,
+            in("r11") base,
+            in("r13") dict_base,
+            out("rax") _,
+            out("rsi") _,
+            out("r9") _,
+            out("r10") _,
+            out("r12") _,
             out("r14") _,
             out("r15") _,
             out("xmm0") _,

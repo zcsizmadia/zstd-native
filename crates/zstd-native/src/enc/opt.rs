@@ -197,19 +197,29 @@ pub(crate) struct OptStats {
     off_code_sum_base_price: u32,
     price_type: PriceType,
     /// The dynamic price of each literal length code and match length code
-    /// (`LL_bits * MULTIPLIER + sumBasePrice - WEIGHT(freq)`, the parts of
-    /// `ZSTD_litLengthPrice` and `ZSTD_getMatchPrice` that only depend on
-    /// the code), tabulated whenever the base prices change
-    /// ([`OptStats::set_base_prices`]): the parser prices every match length
-    /// of every candidate, and this takes the `highbit` and the weight out
-    /// of that loop. Only read with `price_type == Dynamic`.
+    /// without the sum's base price (`LL_bits * MULTIPLIER - WEIGHT(freq)`:
+    /// the parts of `ZSTD_litLengthPrice` and `ZSTD_getMatchPrice` that
+    /// only depend on the code; the base price is added when they are
+    /// read, the same wrapping sums as libzstd's): the parser prices every
+    /// match length of every candidate, and this takes the `highbit` and the
+    /// weight out of that loop. Only read with `price_type == Dynamic`.
+    /// Kept up to date by [`OptStats::set_base_prices`] for the codes whose
+    /// frequency changed since (`dirty_ll`, `dirty_ml`): it runs after every
+    /// stretch of stored sequences, a few hundred times per 128 KiB block,
+    /// and recomputing all the codes there was up to 17% of the time
+    /// (`btultra2` on 4 KiB frames).
     ll_code_price: [u32; MAX_LL as usize + 1],
     ml_code_price: [u32; MAX_ML as usize + 1],
     /// The match length part of the price by `mlBase` (`matchLength -
     /// MINMATCH`) for `mlBase < 128` (longer lengths go through the code),
-    /// for either price type: the hot loop reads it without a code lookup
-    /// or a price type test.
+    /// for either price type (without the base price, see
+    /// [`OptStats::match_off_price`]): the hot loop reads it without a
+    /// code lookup or a price type test.
     ml_len_price: [u32; 128],
+    /// The literal length and match length codes whose frequency changed
+    /// since the tables above were computed (bit `code`).
+    dirty_ll: u64,
+    dirty_ml: u64,
 }
 
 /// libzstd's `optState_t` (the literal compression mode is always "on":
@@ -254,6 +264,8 @@ impl OptState {
                 ll_code_price: [0; MAX_LL as usize + 1],
                 ml_code_price: [0; MAX_ML as usize + 1],
                 ml_len_price: [0; 128],
+                dirty_ll: 0,
+                dirty_ml: 0,
             },
             price_table: vec![Optimal::default(); OPT_SIZE],
             match_table: vec![Match::default(); OPT_SIZE],
@@ -294,6 +306,15 @@ fn weight<const OPT_LEVEL: u32>(stat: u32) -> u32 {
     }
 }
 
+/// The first `mlBase` of each match length code up to 42 (`ZSTD_MLcode`),
+/// and 128: code `c` covers `ML_CODE_BASES[c]..ML_CODE_BASES[c + 1]`.
+#[rustfmt::skip]
+const ML_CODE_BASES: [u8; 44] = [
+     0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+    32, 34, 36, 38, 40, 44, 48, 56, 64, 80, 96, 128,
+];
+
 /// `ZSTD_downscaleStats()`. With `base1`, every symbol keeps a count of at
 /// least 1 (`base_1guaranteed`), else only those with a non-zero count
 /// (`base_0possible`). Returns the new sum.
@@ -322,37 +343,52 @@ fn scale_stats(table: &mut [u32], log_target: u32) -> u32 {
 }
 
 impl OptStats {
-    /// `ZSTD_setBasePrices()`.
+    /// `ZSTD_setBasePrices()`, and the per-code prices of the codes whose
+    /// frequency changed since the last call (see `ll_code_price`).
     fn set_base_prices<const OPT_LEVEL: u32>(&mut self) {
         self.lit_sum_base_price = weight::<OPT_LEVEL>(self.lit_sum);
         self.lit_length_sum_base_price = weight::<OPT_LEVEL>(self.lit_length_sum);
         self.match_length_sum_base_price = weight::<OPT_LEVEL>(self.match_length_sum);
         self.off_code_sum_base_price = weight::<OPT_LEVEL>(self.off_code_sum);
-        // the per-code prices (the same wrapping sums as libzstd's)
-        for (code, p) in self.ll_code_price.iter_mut().enumerate() {
-            *p = (u32::from(LL_BITS[code]) * BITCOST_MULTIPLIER)
-                .wrapping_add(self.lit_length_sum_base_price)
+        let mut d = core::mem::take(&mut self.dirty_ll);
+        while d != 0 {
+            let code = d.trailing_zeros() as usize;
+            d &= d - 1;
+            self.ll_code_price[code] = (u32::from(LL_BITS[code]) * BITCOST_MULTIPLIER)
                 .wrapping_sub(weight::<OPT_LEVEL>(self.lit_length_freq[code]));
         }
-        for (code, p) in self.ml_code_price.iter_mut().enumerate() {
-            *p = (u32::from(ML_BITS[code]) * BITCOST_MULTIPLIER).wrapping_add(
-                self.match_length_sum_base_price
-                    .wrapping_sub(weight::<OPT_LEVEL>(self.match_length_freq[code])),
-            );
-        }
-        let predef = self.price_type == PriceType::Predef;
-        for (ml_base, p) in self.ml_len_price.iter_mut().enumerate() {
-            *p = if predef {
-                weight::<OPT_LEVEL>(ml_base as u32)
-            } else {
-                self.ml_code_price[ml_code(ml_base as u32) as usize]
-            };
+        let dynamic = self.price_type == PriceType::Dynamic;
+        let mut d = core::mem::take(&mut self.dirty_ml);
+        while d != 0 {
+            let code = d.trailing_zeros() as usize;
+            d &= d - 1;
+            let p = (u32::from(ML_BITS[code]) * BITCOST_MULTIPLIER)
+                .wrapping_sub(weight::<OPT_LEVEL>(self.match_length_freq[code]));
+            self.ml_code_price[code] = p;
+            if dynamic && code < ML_CODE_BASES.len() - 1 {
+                // the mlBase range of the code below 128
+                let (lo, hi) = (ML_CODE_BASES[code], ML_CODE_BASES[code + 1]);
+                self.ml_len_price[lo as usize..hi as usize].fill(p);
+            }
         }
     }
 
-    /// The offset part of `ZSTD_getMatchPrice()`, with the constant of the
-    /// dynamic scheme (the "fewer sequences" heuristic): invariant over the
-    /// match lengths of a candidate.
+    /// [`set_base_prices`](Self::set_base_prices) after every frequency
+    /// may have changed, and the price type with them (a new block).
+    fn set_all_prices<const OPT_LEVEL: u32>(&mut self) {
+        self.dirty_ll = (1 << (MAX_LL + 1)) - 1;
+        self.dirty_ml = (1 << (MAX_ML + 1)) - 1;
+        if self.price_type == PriceType::Predef {
+            for (ml_base, p) in self.ml_len_price.iter_mut().enumerate() {
+                *p = weight::<OPT_LEVEL>(ml_base as u32);
+            }
+        }
+        self.set_base_prices::<OPT_LEVEL>();
+    }
+
+    /// The offset part of `ZSTD_getMatchPrice()`, with the constants of the
+    /// dynamic scheme (the "fewer sequences" heuristic, the match length
+    /// sum's base price): invariant over the match lengths of a candidate.
     #[inline(always)]
     fn match_off_price<const OPT_LEVEL: u32>(&self, off_base: u32) -> u32 {
         let off_code = highbit32(off_base);
@@ -370,11 +406,15 @@ impl OptStats {
             price = price.wrapping_add((off_code - 19) * 2 * BITCOST_MULTIPLIER);
         }
         // heuristic: make matches a bit more costly to favor fewer
-        // sequences (faster decompression)
-        price.wrapping_add(BITCOST_MULTIPLIER / 5)
+        // sequences (faster decompression); and the match length sum's base
+        // price, which `ml_len_price` leaves out
+        price
+            .wrapping_add(BITCOST_MULTIPLIER / 5)
+            .wrapping_add(self.match_length_sum_base_price)
     }
 
-    /// The match length part of `ZSTD_getMatchPrice()`.
+    /// The match length part of `ZSTD_getMatchPrice()`, without the match
+    /// length sum's base price (in [`match_off_price`](Self::match_off_price)).
     #[inline(always)]
     fn ml_len_price<const OPT_LEVEL: u32>(&self, match_length: u32) -> u32 {
         debug_assert!(match_length >= MINMATCH);
@@ -415,7 +455,7 @@ impl OptStats {
                 self.match_length_sum = d.match_length_freq.iter().sum();
                 self.off_code_freq = d.off_code_freq;
                 self.off_code_sum = d.off_code_freq.iter().sum();
-                self.set_base_prices::<OPT_LEVEL>();
+                self.set_all_prices::<OPT_LEVEL>();
                 return;
             }
 
@@ -448,7 +488,7 @@ impl OptStats {
             self.match_length_sum = scale_stats(&mut self.match_length_freq, 11);
             self.off_code_sum = scale_stats(&mut self.off_code_freq, 11);
         }
-        self.set_base_prices::<OPT_LEVEL>();
+        self.set_all_prices::<OPT_LEVEL>();
     }
 
     /// `ZSTD_rawLiteralsCost()` for one literal (`LIT_PRICE`).
@@ -478,7 +518,8 @@ impl OptStats {
             return BITCOST_MULTIPLIER as i32 + self.ll_price::<OPT_LEVEL>(lit_length - 1);
         }
         // dynamic statistics
-        self.ll_code_price[ll_code(lit_length) as usize] as i32
+        self.ll_code_price[ll_code(lit_length) as usize]
+            .wrapping_add(self.lit_length_sum_base_price) as i32
     }
 
     /// `LL_INCPRICE`: the price change of one more literal.
@@ -520,6 +561,8 @@ impl OptStats {
         let ml = ml_code(match_length - MINMATCH) as usize;
         self.match_length_freq[ml] += 1;
         self.match_length_sum += 1;
+        self.dirty_ll |= 1 << ll;
+        self.dirty_ml |= 1 << ml;
     }
 }
 
@@ -2138,7 +2181,7 @@ fn opt_generic<
 
 #[cfg(test)]
 mod tests {
-    use super::super::fast::tests::{random, roundtrip, roundtrip_ring, texty};
+    use super::super::fast::tests::{random, roundtrip, roundtrip_ring, texty, xorshift};
     use super::super::params::{CParams, Strategy, block_size_max, one_shot_cparams};
     use super::*;
 
@@ -2264,6 +2307,107 @@ mod tests {
         let mut t = [0u32, 1, 4, 255, 256];
         assert_eq!(downscale_stats(&mut t, 8, false), 5);
         assert_eq!(t, [0, 1, 1, 1, 2]);
+    }
+
+    #[test]
+    fn ml_code_bases() {
+        for code in 0..ML_CODE_BASES.len() - 1 {
+            let (lo, hi) = (ML_CODE_BASES[code], ML_CODE_BASES[code + 1]);
+            assert!(lo < hi);
+            for b in lo..hi {
+                assert_eq!(ml_code(u32::from(b)), code as u32, "mlBase {b}");
+            }
+        }
+        assert_eq!(ML_CODE_BASES[0], 0);
+        assert_eq!(*ML_CODE_BASES.last().unwrap(), 128);
+    }
+
+    /// libzstd's `ZSTD_litLengthPrice()`, computed from the frequencies.
+    fn ref_ll_price<const L: u32>(s: &OptStats, lit_length: u32) -> i32 {
+        if s.price_type == PriceType::Predef {
+            return weight::<L>(lit_length) as i32;
+        }
+        if lit_length as usize == BLOCKSIZE_MAX {
+            return BITCOST_MULTIPLIER as i32 + ref_ll_price::<L>(s, lit_length - 1);
+        }
+        let c = ll_code(lit_length) as usize;
+        (u32::from(LL_BITS[c]) * BITCOST_MULTIPLIER) as i32 + weight::<L>(s.lit_length_sum) as i32
+            - weight::<L>(s.lit_length_freq[c]) as i32
+    }
+
+    /// libzstd's `ZSTD_getMatchPrice()`, computed from the frequencies.
+    fn ref_match_price<const L: u32>(s: &OptStats, off_base: u32, match_length: u32) -> u32 {
+        let off_code = highbit32(off_base);
+        let ml_base = match_length - MINMATCH;
+        if s.price_type == PriceType::Predef {
+            return weight::<L>(ml_base).wrapping_add((16 + off_code) * BITCOST_MULTIPLIER);
+        }
+        let mut price = (off_code * BITCOST_MULTIPLIER).wrapping_add(
+            weight::<L>(s.off_code_sum)
+                .wrapping_sub(weight::<L>(s.off_code_freq[off_code as usize])),
+        );
+        if L < 2 && off_code >= 20 {
+            price = price.wrapping_add((off_code - 19) * 2 * BITCOST_MULTIPLIER);
+        }
+        let c = ml_code(ml_base) as usize;
+        price = price.wrapping_add((u32::from(ML_BITS[c]) * BITCOST_MULTIPLIER).wrapping_add(
+            weight::<L>(s.match_length_sum).wrapping_sub(weight::<L>(s.match_length_freq[c])),
+        ));
+        price.wrapping_add(BITCOST_MULTIPLIER / 5)
+    }
+
+    /// The price tables, updated for the changed codes only, give
+    /// libzstd's prices after any sequence of statistics updates, blocks
+    /// (rescaling) and price types.
+    fn incremental_prices<const L: u32>(seed: u64) {
+        let mut r = seed;
+        let mut s = OptState::new().stats;
+        let lens: Vec<u32> = (0..=300u32)
+            .chain([1000, 4095, 65_535, 65_536, 131_071, BLOCKSIZE_MAX as u32])
+            .collect();
+        let rounds = if cfg!(miri) { 2 } else { 40 };
+        for round in 0..rounds {
+            // a new block: the first of a frame now and then, small (the
+            // predefined prices) or not
+            if round % 7 == 0 {
+                s.lit_length_sum = 0;
+            }
+            let n = [10, 5000, 100_000][(xorshift(&mut r) % 3) as usize];
+            s.rescale_freqs::<L>(&texty(n, xorshift(&mut r)), None);
+            for _ in 0..(xorshift(&mut r) % 50) {
+                for _ in 0..(xorshift(&mut r) % 4) {
+                    let ll = (xorshift(&mut r) % [20, 300, 70_000][(xorshift(&mut r) % 3) as usize])
+                        as usize;
+                    let lits = alloc::vec![(xorshift(&mut r) % 256) as u8; ll];
+                    let off_base = 1 + (xorshift(&mut r) % (1 << (xorshift(&mut r) % 27))) as u32;
+                    let ml = 3
+                        + (xorshift(&mut r) % [10, 200, 70_000][(xorshift(&mut r) % 3) as usize])
+                            as u32;
+                    s.update_stats(&lits, off_base, ml);
+                }
+                s.set_base_prices::<L>();
+                for &ll in &lens {
+                    assert_eq!(s.ll_price::<L>(ll), ref_ll_price::<L>(&s, ll), "ll {ll}");
+                }
+                for off_base in [1u32, 2, 3, 4, 100, 70_000, 1 << 22, (1 << 30) + 5] {
+                    for &ml in lens.iter().filter(|&&l| l >= MINMATCH) {
+                        assert_eq!(
+                            s.match_price::<L>(off_base, ml) as u32,
+                            ref_match_price::<L>(&s, off_base, ml),
+                            "off_base {off_base} ml {ml} {:?}",
+                            s.price_type
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_prices_match_libzstd() {
+        incremental_prices::<0>(1);
+        incremental_prices::<1>(2);
+        incremental_prices::<2>(3);
     }
 
     /// The extDict variants, through a wrapping ring buffer like the
