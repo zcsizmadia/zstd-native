@@ -46,8 +46,10 @@ On this Windows machine, cargo is in `~/.cargo/bin` (not on PATH in Bash).
   `enc/lazy.rs`, the extDict loops of `enc/fast.rs` and `enc/dfast.rs`
   and the dictMatchState loop of `enc/fast.rs`), the `madvise` syscall
   that puts large match finder tables on huge pages (`enc/table.rs`),
-  the output writes in `decoder.rs`, the `align_hot_loop!` macro in
-  `lib.rs` (an `asm!` alignment directive before the hot loops) and
+  the output writes in `decoder.rs` and `stream.rs` (direct output into
+  the caller's buffer or `Vec`, the window history copy), the
+  `align_hot_loop!` macro in `lib.rs` (an `asm!` alignment directive
+  before the hot loops) and
   `then_valid` in `enc/fast.rs` (an empty `asm!` that keeps a branch
   order). New `unsafe` needs a benchmark showing the gain.
 - Every performance-related change, however small (a prefetch, an
