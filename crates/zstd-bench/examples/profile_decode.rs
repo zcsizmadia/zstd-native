@@ -4,7 +4,18 @@
 //! with lib `native` (per-CPU default), `native-asm` / `native-noasm`
 //! (force the asm or Rust Huffman loops), `c`, or `structured`
 //! (structured-zstd), or a streaming mode (`native-<mode>`, `c-<mode>`, see
-//! [`STREAM_MODES`]).
+//! [`STREAM_MODES`]). `native-long` / `native-short` force the prefetching
+//! or the fused sequence loop (`native` takes the prefetching loop only for
+//! the first block after a dictionary is installed).
+//!
+//! Dataset `cat` is every file of `$ZSTD_BENCH_CORPUS` catenated in name
+//! order (the Silesia corpus as one stream), cut to `$ZSTD_BENCH_CAT_MB`
+//! MiB if set. libzstd compresses at `<level>` with `$ZSTD_BENCH_WLOG`
+//! (window log), `$ZSTD_BENCH_LONG=1` (long distance matching) and
+//! `$ZSTD_BENCH_WORKERS` (threads, for big inputs at high levels) when set.
+//! Dataset `cat-dup` is `cat` followed by a copy with a few bytes changed
+//! every 1-8 KiB (two versions of a big file: matches a whole `cat` back,
+//! for long distance matching).
 
 use std::time::Instant;
 
@@ -15,28 +26,45 @@ fn main() {
     let lib = args.get(3).map_or("native", |s| s);
     let secs: f64 = args.get(4).map_or(5.0, |s| s.parse().unwrap());
     // `datasets()` (with `$ZSTD_BENCH_CORPUS`) or `short_offset_datasets()`.
-    let data = zstd_bench::datasets()
-        .into_iter()
-        .chain(zstd_bench::short_offset_datasets())
-        .find(|(n, _)| n == ds)
-        .expect("dataset")
-        .1;
+    let data = if ds == "cat" {
+        catenated_corpus()
+    } else if ds == "cat-dup" {
+        edited_copy(catenated_corpus())
+    } else {
+        zstd_bench::datasets()
+            .into_iter()
+            .chain(zstd_bench::short_offset_datasets())
+            .find(|(n, _)| n == ds)
+            .expect("dataset")
+            .1
+    };
+    let params = CompressParams::from_env();
     // `ZSTD_BENCH_COMP_CACHE=dir` keeps the compressed input on disk, so
     // repeated A/B runs at high levels don't recompress every time.
     let comp = match std::env::var("ZSTD_BENCH_COMP_CACHE") {
         Ok(dir) => {
-            let path = std::path::Path::new(&dir).join(format!("{ds}.L{level}.zst"));
+            let cut = match std::env::var("ZSTD_BENCH_CAT_MB") {
+                Ok(mb) if ds.starts_with("cat") => format!(".{mb}m"),
+                _ => String::new(),
+            };
+            let name = format!("{ds}{cut}.L{level}{}.zst", params.suffix());
+            let path = std::path::Path::new(&dir).join(name);
             match std::fs::read(&path) {
                 Ok(c) => c,
                 Err(_) => {
-                    let c = zstd_bench::c_compress(&data, level);
+                    let c = params.compress(&data, level);
                     std::fs::write(&path, &c).expect("write cache");
                     c
                 }
             }
         }
-        Err(_) => zstd_bench::c_compress(&data, level),
+        Err(_) => params.compress(&data, level),
     };
+    zstd_native::__private::set_seq_loop(match lib {
+        "native-long" => Some(true),
+        "native-short" => Some(false),
+        _ => None,
+    });
     let mut out = vec![0u8; data.len() + 64];
     let mut n = 0u64;
     let t = Instant::now();
@@ -97,7 +125,7 @@ fn main() {
                     total += n;
                 }
             }
-            "native" | "native-noasm" | "native-asm" => {
+            "native" | "native-noasm" | "native-asm" | "native-long" | "native-short" => {
                 native.decompress_to_slice(&comp, &mut out).unwrap()
             }
             "structured" => sd.decode_all(&comp, &mut out).unwrap(),
@@ -105,6 +133,10 @@ fn main() {
         };
         assert_eq!(len, data.len());
         n += 1;
+    }
+    // Builds with debug assertions count the prefetching loop's blocks.
+    if let Some(b) = zstd_native::__private::long_blocks() {
+        eprintln!("prefetching loop: {b} blocks in {n} runs");
     }
     let el = t.elapsed().as_secs_f64();
     println!(
@@ -235,5 +267,103 @@ fn c_stream_mode(
                 }
             }
         }
+    }
+}
+
+/// Dataset `cat`: the corpus files catenated in name order.
+fn catenated_corpus() -> Vec<u8> {
+    let dir = std::env::var("ZSTD_BENCH_CORPUS").expect("dataset cat needs ZSTD_BENCH_CORPUS");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    files.sort();
+    let mut v = Vec::new();
+    for f in files {
+        v.extend_from_slice(&std::fs::read(f).unwrap());
+    }
+    if let Ok(mb) = std::env::var("ZSTD_BENCH_CAT_MB") {
+        v.truncate(mb.parse::<usize>().unwrap() << 20);
+    }
+    v
+}
+
+/// `data`, then `data` again with 1-4 bytes replaced or inserted every 1-8
+/// KiB.
+fn edited_copy(mut data: Vec<u8>) -> Vec<u8> {
+    let mut r = zstd_bench::Rng::new(7);
+    let n = data.len();
+    let mut p = 0;
+    while p < n {
+        let run = (1024 + r.below(7 << 10) as usize).min(n - p);
+        data.extend_from_within(p..p + run);
+        p += run;
+        for _ in 0..1 + r.below(4) {
+            if r.below(2) == 0 {
+                data.push(r.next_u64() as u8);
+            } else {
+                p += 1;
+                data.push(r.next_u64() as u8);
+            }
+        }
+    }
+    data
+}
+
+/// libzstd parameters beyond the level, from the environment.
+struct CompressParams {
+    wlog: Option<u32>,
+    long: bool,
+    workers: Option<u32>,
+}
+
+impl CompressParams {
+    fn from_env() -> Self {
+        let var = |k: &str| std::env::var(k).ok().map(|s| s.parse::<u32>().unwrap());
+        CompressParams {
+            wlog: var("ZSTD_BENCH_WLOG"),
+            long: var("ZSTD_BENCH_LONG").is_some_and(|v| v != 0),
+            workers: var("ZSTD_BENCH_WORKERS"),
+        }
+    }
+
+    /// Cache file name suffix (the worker count changes the frame too).
+    fn suffix(&self) -> String {
+        let mut s = String::new();
+        if let Some(w) = self.wlog {
+            s += &format!(".w{w}");
+        }
+        if self.long {
+            s += ".long";
+        }
+        if let Some(n) = self.workers {
+            s += &format!(".t{n}");
+        }
+        s
+    }
+
+    fn compress(&self, data: &[u8], level: i32) -> Vec<u8> {
+        use zstd::zstd_safe::{CCtx, CParameter};
+        if self.wlog.is_none() && !self.long && self.workers.is_none() {
+            return zstd_bench::c_compress(data, level);
+        }
+        let mut c = CCtx::create();
+        c.set_parameter(CParameter::CompressionLevel(level))
+            .unwrap();
+        if let Some(w) = self.wlog {
+            c.set_parameter(CParameter::WindowLog(w)).unwrap();
+        }
+        if self.long {
+            c.set_parameter(CParameter::EnableLongDistanceMatching(true))
+                .unwrap();
+        }
+        if let Some(n) = self.workers {
+            c.set_parameter(CParameter::NbWorkers(n)).unwrap();
+        }
+        let mut out = Vec::with_capacity(zstd::zstd_safe::compress_bound(data.len()));
+        c.compress2(&mut out, data).unwrap();
+        out
     }
 }

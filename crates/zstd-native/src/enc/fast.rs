@@ -2069,7 +2069,7 @@ pub(crate) fn then_valid(eq: bool, valid: bool) -> bool {
     if !eq {
         return false;
     }
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(miri)))]
     // SAFETY: an empty asm block, an ordering barrier for the compiler.
     unsafe {
         core::arch::asm!("", options(nomem, nostack, preserves_flags));

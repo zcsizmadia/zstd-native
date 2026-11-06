@@ -68,8 +68,10 @@ fn mutated_frames() {
                 m.splice(p..p, piece);
             }
         }
-        // Alternate the asm and Rust Huffman loops (where the CPU has both).
+        // Alternate the asm and Rust Huffman loops (where the CPU has both),
+        // and the fused and the prefetching sequence loops.
         zstd_native::__private::set_asm(Some(i % 2 == 0));
+        zstd_native::__private::set_seq_loop(Some(i / 2 % 2 == 0));
         let native = dec.decompress(&m);
         let mut buf = vec![0u8; orig_len + 100];
         let native_slice = dec.decompress_to_slice(&m, &mut buf);
@@ -90,6 +92,8 @@ fn mutated_frames() {
             }
         }
     }
+    zstd_native::__private::set_asm(None);
+    zstd_native::__private::set_seq_loop(None);
     eprintln!("{accepted} of {iters} mutated inputs decoded");
 }
 
@@ -126,6 +130,7 @@ fn mutated_streams() {
             m.truncate(n);
         }
         zstd_native::__private::set_asm(Some(i % 2 == 0));
+        zstd_native::__private::set_seq_loop(Some(i / 2 % 2 == 0));
         let mut dec = zstd_native::StreamDecoder::new();
         let mut out = Vec::new();
         let mut buf = vec![0u8; 1 + r.below(70_000) as usize];
@@ -158,6 +163,7 @@ fn mutated_streams() {
         }
     }
     zstd_native::__private::set_asm(None);
+    zstd_native::__private::set_seq_loop(None);
     eprintln!("{accepted} of {iters} mutated streams decoded");
 }
 
@@ -228,6 +234,7 @@ fn mutated_streams_direct() {
             m.truncate(n);
         }
         zstd_native::__private::set_asm(Some(i % 2 == 0));
+        zstd_native::__private::set_seq_loop(Some(i / 2 % 2 == 0));
         // Direct: one call with all the input and room for everything.
         let mut dec = zstd_native::StreamDecoder::new();
         let direct = match dec.decode(&m, &mut big) {
@@ -265,5 +272,6 @@ fn mutated_streams_direct() {
         }
     }
     zstd_native::__private::set_asm(None);
+    zstd_native::__private::set_seq_loop(None);
     eprintln!("{accepted} of {iters} mutated streams decoded");
 }

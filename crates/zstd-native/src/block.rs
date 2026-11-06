@@ -11,6 +11,7 @@
 
 use alloc::vec::Vec;
 use core::ptr;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::bits::{BitReader, SeqBits};
 use crate::cpu::Features;
@@ -69,6 +70,10 @@ pub(crate) struct BlockDecoder {
     /// after the last literal.
     lit_buf: Vec<u8>,
     pub cpu: Features,
+    /// The dictionary was just installed and its content is likely out of
+    /// cache (libzstd's `ddictIsCold`): the next compressed block takes
+    /// the prefetching loop. Cleared by that block.
+    pub dict_cold: bool,
 }
 
 /// The literals of one block.
@@ -83,6 +88,7 @@ impl BlockDecoder {
             ent: Entropy::new(),
             lit_buf: Vec::new(),
             cpu: Features::detect(),
+            dict_cold: false,
         }
     }
 
@@ -112,6 +118,7 @@ impl BlockDecoder {
         let src = &src[used..];
         let (nb_seq, used) = self.decode_seq_headers(src)?;
         let seq_src = &src[used..];
+        let cold = core::mem::take(&mut self.dict_cold);
         if nb_seq == 0 {
             // Literals only.
             if lits.len > out.cap - out.pos {
@@ -128,6 +135,7 @@ impl BlockDecoder {
         }
         self.ent.fse_ok = true;
         let tables = &self.ent.seq;
+        let long = use_prefetch_loop(cold);
         let mut rep = self.ent.rep.map(|r| r as usize);
         // A block regenerates at most `block_max` bytes (the format's
         // Block_Maximum_Size). libzstd's one-shot decoder, given the room,
@@ -141,9 +149,15 @@ impl BlockDecoder {
         let limit = out.pos.saturating_add(block_max + WILDCOPY_OVERLENGTH);
         let start = out.pos;
         out.cap = cap.min(limit);
-        let res = run_sequences(
-            self.cpu, tables, &mut rep, seq_src, nb_seq, &lits, out, prefix, dict,
-        );
+        let res = if long {
+            run_sequences_long(
+                self.cpu, tables, &mut rep, seq_src, nb_seq, &lits, out, prefix, dict,
+            )
+        } else {
+            run_sequences(
+                self.cpu, tables, &mut rep, seq_src, nb_seq, &lits, out, prefix, dict,
+            )
+        };
         out.cap = cap;
         self.ent.rep = rep.map(|r| r as u32);
         match res {
@@ -392,6 +406,172 @@ fn sequences_generic(
     dict: &[u8],
 ) -> Result<()> {
     sequences_body::<{ copy::SHUFFLE_BASELINE }>(t, rep, src, nb_seq, lits, out, prefix, dict)
+}
+
+/// Selection of the sequence loop for tests and A/B measurements
+/// ([`set_seq_loop`]): auto (`use_prefetch_loop`), always the prefetching
+/// loop, or never.
+static SEQ_LOOP: AtomicU8 = AtomicU8::new(LOOP_AUTO);
+const LOOP_AUTO: u8 = 0;
+const LOOP_LONG: u8 = 1;
+const LOOP_SHORT: u8 = 2;
+
+/// Forces the prefetching sequence loop (`Some(true)`), the fused loop
+/// (`Some(false)`), or restores the default (`None`). For tests
+/// (every frame through either loop) and A/B measurements in one binary.
+#[doc(hidden)]
+pub fn set_seq_loop(long: Option<bool>) {
+    let v = match long {
+        None => LOOP_AUTO,
+        Some(true) => LOOP_LONG,
+        Some(false) => LOOP_SHORT,
+    };
+    SEQ_LOOP.store(v, Ordering::Relaxed);
+}
+
+/// Blocks decoded by the prefetching loop, in builds with debug
+/// assertions (for tests that must prove they reach it).
+#[cfg(debug_assertions)]
+static LONG_BLOCKS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The number of blocks the prefetching loop decoded so far (`None`
+/// without debug assertions).
+#[doc(hidden)]
+pub fn long_blocks() -> Option<usize> {
+    #[cfg(debug_assertions)]
+    return Some(LONG_BLOCKS.load(Ordering::Relaxed));
+    #[cfg(not(debug_assertions))]
+    None
+}
+
+/// Whether a block takes the prefetching loop: as [`set_seq_loop`] forces
+/// it, else for the first compressed block after a dictionary was
+/// installed (`cold`, libzstd's `ddictIsCold`), on x86-64, where the
+/// prefetch exists ([`prefetch_l1`]; elsewhere decoding ahead would be
+/// pure overhead).
+///
+/// libzstd also takes it when the history exceeds 16 MiB and offsets of
+/// more than 22 extra bits hold at least 7/256 of the offset table
+/// (`ZSTD_getOffsetInfo`). That half of its heuristic is left out: on Zen 3
+/// the loop is slower wherever it fires (decoding ahead costs ~20
+/// instructions per sequence; the out-of-order window already overlaps
+/// most far-match misses). EPYC 7543, cycles against the fused loop: the
+/// Silesia files catenated, window log 27, L19 +1.6% with libzstd's choice
+/// (63% of the blocks), +9% for every block; the corpus followed by an
+/// edited copy (matches 100 MiB back), L19 +3.0%, L9 +0.2% (+4% to +5% for
+/// every block).
+#[inline]
+fn use_prefetch_loop(cold: bool) -> bool {
+    let long = match SEQ_LOOP.load(Ordering::Relaxed) {
+        LOOP_LONG => true,
+        LOOP_SHORT => false,
+        _ => HAS_PREFETCH && cold,
+    };
+    #[cfg(debug_assertions)]
+    if long {
+        LONG_BLOCKS.fetch_add(1, Ordering::Relaxed);
+    }
+    long
+}
+
+const HAS_PREFETCH: bool = cfg!(target_arch = "x86_64");
+
+/// Prefetches the cache line at `p` into L1 (any address: a prefetch
+/// never faults).
+#[inline(always)]
+fn prefetch_l1(p: *const u8) {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    // SAFETY: `prefetcht0` only hints the cache; it doesn't dereference
+    // `p` (no fault, no memory access visible to the program) and SSE is
+    // in the x86-64 baseline.
+    #[allow(unsafe_code, unused_unsafe)]
+    unsafe {
+        use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch::<_MM_HINT_T0>(p.cast());
+    }
+    #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+    let _ = p;
+}
+
+/// libzstd's `ZSTD_prefetchMatch`: prefetches the first two cache lines
+/// of `seq`'s match source and returns the output position after `seq`.
+/// `pos` is the output position relative to `prefix_start` (where the
+/// sequence starts); a match before the prefix is in the dictionary,
+/// which ends at `dict_end`. Wrapping arithmetic: a corrupt offset only
+/// prefetches a useless address.
+#[inline(always)]
+fn prefetch_match(pos: usize, seq: &Seq, prefix_start: *const u8, dict_end: *const u8) -> usize {
+    let pos = pos.wrapping_add(seq.lit_len);
+    let base = if seq.offset > pos {
+        dict_end
+    } else {
+        prefix_start
+    };
+    let m = base.wrapping_add(pos).wrapping_sub(seq.offset);
+    prefetch_l1(m);
+    prefetch_l1(m.wrapping_add(64));
+    pos.wrapping_add(seq.match_len)
+}
+
+/// Out of line and cold, like the loops it calls: it runs once per
+/// dictionary installed. Inline (or the loops in the hot text section) it
+/// changed how `decode_block` inlines the fused loop and moved the
+/// per-block code: 0.2-1% slower one-shot decoding, same instructions.
+#[allow(clippy::too_many_arguments)]
+#[cold]
+#[inline(never)]
+fn run_sequences_long(
+    cpu: Features,
+    t: &SeqTables,
+    rep: &mut [usize; 3],
+    src: &[u8],
+    nb_seq: usize,
+    lits: &Literals,
+    out: &mut Output,
+    prefix: usize,
+    dict: &[u8],
+) -> Result<()> {
+    #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+    if cpu.bmi2 {
+        #[allow(unsafe_code)]
+        // SAFETY: the caller detected BMI2 (and BMI1/LZCNT/SSSE3) on this CPU.
+        return unsafe { sequences_long_bmi2(t, rep, src, nb_seq, lits, out, prefix, dict) };
+    }
+    let _ = cpu;
+    sequences_long_generic(t, rep, src, nb_seq, lits, out, prefix, dict)
+}
+
+#[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+#[target_feature(enable = "bmi1,bmi2,lzcnt,ssse3")]
+#[allow(clippy::too_many_arguments)]
+#[cold]
+fn sequences_long_bmi2(
+    t: &SeqTables,
+    rep: &mut [usize; 3],
+    src: &[u8],
+    nb_seq: usize,
+    lits: &Literals,
+    out: &mut Output,
+    prefix: usize,
+    dict: &[u8],
+) -> Result<()> {
+    sequences_long_body::<true>(t, rep, src, nb_seq, lits, out, prefix, dict)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cold]
+#[inline(never)]
+fn sequences_long_generic(
+    t: &SeqTables,
+    rep: &mut [usize; 3],
+    src: &[u8],
+    nb_seq: usize,
+    lits: &Literals,
+    out: &mut Output,
+    prefix: usize,
+    dict: &[u8],
+) -> Result<()> {
+    sequences_long_body::<{ copy::SHUFFLE_BASELINE }>(t, rep, src, nb_seq, lits, out, prefix, dict)
 }
 
 /// The cell for `state` in the combined table at `tp`.
@@ -974,6 +1154,134 @@ fn sequences_body<const SHUF: bool>(
     Ok(())
 }
 
+/// Sequences decoded ahead of execution in the prefetching loop
+/// (libzstd's `ADVANCED_SEQS`).
+const ADVANCED_SEQS: usize = 8;
+
+/// The prefetching loop (libzstd's `ZSTD_decompressSequencesLong_body`):
+/// sequences are decoded [`ADVANCED_SEQS`] ahead of their execution, and
+/// each one's match source is prefetched when it is decoded, so that the
+/// cache misses of long offsets (or a cold dictionary) overlap. Same
+/// execution as [`sequences_body`].
+#[inline(always)]
+#[allow(clippy::too_many_arguments, unsafe_code)]
+fn sequences_long_body<const SHUF: bool>(
+    t: &SeqTables,
+    rep: &mut [usize; 3],
+    src: &[u8],
+    nb_seq: usize,
+    lits: &Literals,
+    out: &mut Output,
+    prefix: usize,
+    dict: &[u8],
+) -> Result<()> {
+    let mut br = BitReader::new(src)?;
+    let tp = t.cells.as_ptr();
+    let mut ll = LL_KIND.region + br.read(t.log[0]) as usize;
+    br.reload();
+    let mut of = OF_KIND.region + br.read(t.log[1]) as usize;
+    br.reload();
+    let mut ml = ML_KIND.region + br.read(t.log[2]) as usize;
+    br.reload();
+    let mut reps = *rep;
+
+    let base = out.ptr;
+    let cap = out.cap;
+    // SAFETY: `out.pos <= cap` and `prefix <= out.pos`.
+    let (mut op, prefix_start) = unsafe { (base.add(out.pos), base.add(prefix)) };
+    let oend_w = base as usize + cap.saturating_sub(WILDCOPY_OVERLENGTH);
+    let lit_start = lits.ptr;
+    let lit_end = lits.ptr as usize + lits.len;
+    let mut lp = lits.ptr;
+    let dict_end = dict.as_ptr().wrapping_add(dict.len());
+    // Output position (relative to the prefix) after the sequences decoded
+    // so far, for the prefetches.
+    let mut pf = out.pos - prefix;
+
+    let mut ring = [Seq {
+        lit_len: 0,
+        match_len: 0,
+        offset: 0,
+    }; ADVANCED_SEQS];
+    let advance = nb_seq.min(ADVANCED_SEQS);
+    let mut i = 0;
+    while i < advance {
+        let seq = decode_sequence(
+            &mut br,
+            tp,
+            &mut ll,
+            &mut ml,
+            &mut of,
+            &mut reps,
+            i + 1 == nb_seq,
+        );
+        pf = prefetch_match(pf, &seq, prefix_start, dict_end);
+        ring[i] = seq;
+        i += 1;
+    }
+    // Decode sequence `i`, execute sequence `i - ADVANCED_SEQS` (whose ring
+    // slot it takes). The sentinel bit reader while 16 bytes remain before
+    // the window, as in `sequences_body`. (Counting down instead, as
+    // `sequences_body` does, measured 3% slower.)
+    if i < nb_seq && br.pos() >= 16 {
+        let mut fb = br.fast();
+        // SAFETY: `pos() >= 16`.
+        let limit = unsafe { br.start().add(16) };
+        while i < nb_seq && fb.ip >= limit {
+            let seq = decode_sequence(
+                &mut fb,
+                tp,
+                &mut ll,
+                &mut ml,
+                &mut of,
+                &mut reps,
+                i + 1 == nb_seq,
+            );
+            pf = prefetch_match(pf, &seq, prefix_start, dict_end);
+            let exec = core::mem::replace(&mut ring[i % ADVANCED_SEQS], seq);
+            i += 1;
+            exec_seq!(SHUF; exec; op, lp; base, cap, prefix_start, oend_w, lit_start, lit_end, lits.len, prefix, dict);
+        }
+        br = br.resume(fb);
+    }
+    while i < nb_seq {
+        let seq = decode_sequence(
+            &mut br,
+            tp,
+            &mut ll,
+            &mut ml,
+            &mut of,
+            &mut reps,
+            i + 1 == nb_seq,
+        );
+        pf = prefetch_match(pf, &seq, prefix_start, dict_end);
+        let exec = core::mem::replace(&mut ring[i % ADVANCED_SEQS], seq);
+        i += 1;
+        exec_seq!(SHUF; exec; op, lp; base, cap, prefix_start, oend_w, lit_start, lit_end, lits.len, prefix, dict);
+    }
+    if !br.is_end() {
+        return Err(Error::Corrupted);
+    }
+    // The last `advance` sequences, still in the ring.
+    let mut i = nb_seq - advance;
+    while i < nb_seq {
+        let exec = ring[i % ADVANCED_SEQS];
+        i += 1;
+        exec_seq!(SHUF; exec; op, lp; base, cap, prefix_start, oend_w, lit_start, lit_end, lits.len, prefix, dict);
+    }
+    *rep = reps;
+    // Last literals.
+    let last = lit_end - lp as usize;
+    let o = op as usize - base as usize;
+    if last > cap - o {
+        return Err(Error::OutputTooSmall);
+    }
+    // SAFETY: `last` literals remain and the output has room for them.
+    unsafe { ptr::copy_nonoverlapping(lp, op, last) };
+    out.pos = o + last;
+    Ok(())
+}
+
 /// Exact-size execution near the end of the buffer (libzstd's
 /// `ZSTD_execSequenceEnd`). Returns the new output position.
 #[cold]
@@ -1145,5 +1453,73 @@ mod tests {
         if shuffle_ok() {
             check_match_copy::<true>();
         }
+    }
+
+    /// Text-like data with repeats near and far.
+    fn text(len: usize) -> Vec<u8> {
+        let words: [&[u8]; 8] = [
+            b"zstd ",
+            b"window ",
+            b"prefetch ",
+            b"the ",
+            b"sequence ",
+            b"of ",
+            b"long ",
+            b"\n",
+        ];
+        let mut v = Vec::with_capacity(len + 16);
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        while v.len() < len {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            if x.is_multiple_of(7) && v.len() > 100 {
+                // Copy an earlier stretch.
+                let from = (x >> 20) as usize % (v.len() - 50);
+                let n = 8 + (x >> 40) as usize % 40;
+                for i in 0..n {
+                    v.push(v[from + i]);
+                }
+            } else {
+                v.extend_from_slice(words[(x >> 33) as usize % 8]);
+                v.push((x >> 50) as u8);
+            }
+        }
+        v.truncate(len);
+        v
+    }
+
+    /// The prefetching loop decodes what the fused loop does: blocks of 1
+    /// to many sequences (ending with the ring partly full), and matches
+    /// reaching into a dictionary.
+    #[test]
+    fn prefetch_loop_matches_fused() {
+        let data = text(if cfg!(miri) { 3000 } else { 300_000 });
+        let sizes: &[usize] = if cfg!(miri) {
+            &[30, 400, 3000]
+        } else {
+            &[1, 30, 60, 100, 200, 400, 1000, 3000, 20_000, 300_000]
+        };
+        let levels: &[i32] = if cfg!(miri) { &[1] } else { &[1, 3, 19] };
+        let dict = text(if cfg!(miri) { 500 } else { 20_000 });
+        for &n in sizes {
+            let src = &data[data.len() - n..];
+            for &level in levels {
+                let plain = crate::compress(src, level).unwrap();
+                let with_dict = crate::compress_with_dictionary(src, &dict, level).unwrap();
+                for long in [false, true] {
+                    set_seq_loop(Some(long));
+                    let got = crate::decompress(&plain).unwrap();
+                    assert!(got == src, "{n} bytes L{level} long={long}");
+                    let mut d = crate::Decompressor::with_dictionary(crate::Dictionary::raw(&dict));
+                    let got = d.decompress(&with_dict).unwrap();
+                    assert!(got == src, "{n} bytes L{level} dict long={long}");
+                    // Too small an output: an error, not a write past it.
+                    let mut buf = vec![0u8; n - 1];
+                    assert!(d.decompress_to_slice(&with_dict, &mut buf).is_err());
+                }
+            }
+        }
+        set_seq_loop(None);
     }
 }

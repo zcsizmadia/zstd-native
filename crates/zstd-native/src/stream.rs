@@ -111,6 +111,8 @@ pub struct StreamDecoder {
     block: Box<BlockDecoder>,
     dict: Option<Dictionary>,
     window_max: u64,
+    /// The dictionary was installed and no frame has used it yet.
+    dict_fresh: bool,
     stage: Stage,
     /// Frame header / small field staging.
     hdr: [u8; 18],
@@ -161,6 +163,7 @@ impl StreamDecoder {
             block: Box::new(BlockDecoder::new()),
             dict: None,
             window_max: 1 << DEFAULT_WINDOW_LOG_MAX,
+            dict_fresh: false,
             stage: Stage::Magic,
             hdr: [0; 18],
             hdr_len: 0,
@@ -185,6 +188,7 @@ impl StreamDecoder {
     pub fn with_dictionary(dict: Dictionary) -> Self {
         let mut d = Self::new();
         d.dict = Some(dict);
+        d.dict_fresh = true;
         d
     }
 
@@ -437,6 +441,11 @@ impl StreamDecoder {
             None => self.block.ent.reset(),
         }
         self.block_max = fh.block_size_max();
+        // libzstd's `ddictIsCold`: the first frame after the dictionary was
+        // installed, or after a frame that wrapped the window buffer (libzstd
+        // then compares the history end it moved with the dictionary's end).
+        let fresh = core::mem::take(&mut self.dict_fresh);
+        self.block.dict_cold = self.dict.is_some() && (fresh || self.old_end.is_some());
         // The window never needs to exceed the frame's size.
         let window = match fh.content_size {
             Some(cs) => fh.window_size.min(cs),

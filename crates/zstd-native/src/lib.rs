@@ -123,6 +123,7 @@ pub use xxhash::xxh64;
 
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::block::{long_blocks, set_seq_loop};
     pub use crate::cpu::{selected_paths, set_asm};
     pub use crate::huf::{
         bench_read as huf_bench_read, first_tree_description as huf_first_tree_description,
