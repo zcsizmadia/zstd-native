@@ -1026,8 +1026,12 @@ fn ext_dict_generic<const MLS: u32, const CMOV: bool>(
 
 /// `ZSTD_compressBlock_doubleFast_dictMatchState()`: as
 /// [`compress_block_double_fast`], with an attached dictionary
-/// ([`MatchState::dms`]) whose tagged tables are searched too.
-#[inline(always)]
+/// ([`MatchState::dms`]) whose tagged tables are searched too. Picks the
+/// `ZSTD_compressBlock_doubleFast_dictMatchState_<mls>` variant like
+/// libzstd (3 and other values use 4). Out of line: inlined into the
+/// block loop it was 0.5-1.5% slower on small inputs. (A BMI2 version, as for
+/// the extDict loop, measured 1.5-3% slower here.)
+#[inline(never)]
 pub(crate) fn compress_block_double_fast_dict_match_state(
     ms: &mut MatchState,
     ss: &mut SeqStore,
@@ -1208,10 +1212,12 @@ fn dms_generic<const MLS: u32>(
                     break 'found; // _match_stored
                 }
 
-                if match_index_l >= prefix_lowest_index && {
+                // The prefix candidates are read through `select_addr` and
+                // their index tested once the bytes match (meta/zstd#4866):
+                // with a short prefix (small inputs), many candidates are
+                // below it, an unpredictable branch.
+                if cand_match::<true, true>(match_index_l >= prefix_lowest_index, match_long, ip) {
                     chk(match_long, 8);
-                    read_le64(match_long) == read_le64(ip)
-                } {
                     // check prefix long match
                     m_length = count(ip.add(8), match_long.add(8), iend) + 8;
                     offset = (ip as usize - match_long as usize) as u32;
@@ -1249,22 +1255,25 @@ fn dms_generic<const MLS: u32>(
                         m_length += 1;
                     } // catch up
                 } else {
-                    let short_found = if match_index_s > prefix_lowest_index {
-                        // short match candidate
-                        chk(mtch, 4);
-                        read32(mtch) == read32(ip)
-                    } else if dict_tags_match_s {
-                        // check dictMatchState short match
-                        let dict_match_index_s = dict_match_index_and_tag_s >> SHORT_CACHE_TAG_BITS;
-                        mtch = dict_base.wrapping_add(dict_match_index_s as usize);
-                        match_index_s = dict_match_index_s.wrapping_add(dict_index_delta);
-                        mtch > dict_start && {
+                    let short_found =
+                        if cand_match::<true, false>(match_index_s > prefix_lowest_index, mtch, ip)
+                        {
+                            // short match candidate
                             chk(mtch, 4);
-                            read32(mtch) == read32(ip)
-                        }
-                    } else {
-                        false
-                    };
+                            true
+                        } else if dict_tags_match_s && match_index_s <= prefix_lowest_index {
+                            // check dictMatchState short match
+                            let dict_match_index_s =
+                                dict_match_index_and_tag_s >> SHORT_CACHE_TAG_BITS;
+                            mtch = dict_base.wrapping_add(dict_match_index_s as usize);
+                            match_index_s = dict_match_index_s.wrapping_add(dict_index_delta);
+                            mtch > dict_start && {
+                                chk(mtch, 4);
+                                read32(mtch) == read32(ip)
+                            }
+                        } else {
+                            false
+                        };
 
                     if !short_found {
                         ip = ip.add(((ip as usize - anchor as usize) >> K_SEARCH_STRENGTH) + 1);
@@ -1284,10 +1293,12 @@ fn dms_generic<const MLS: u32>(
                     let mut match_l3 = base.wrapping_add(match_index_l3 as usize);
                     *hash_long.add(hl3) = curr + 1;
 
-                    if match_index_l3 >= prefix_lowest_index && {
+                    if cand_match::<true, true>(
+                        match_index_l3 >= prefix_lowest_index,
+                        match_l3,
+                        ip.add(1),
+                    ) {
                         chk(match_l3, 8);
-                        read_le64(match_l3) == read_le64(ip.add(1))
-                    } {
                         // check prefix long +1 match
                         m_length = count(ip.add(9), match_l3.add(8), iend) + 8;
                         ip = ip.add(1);
