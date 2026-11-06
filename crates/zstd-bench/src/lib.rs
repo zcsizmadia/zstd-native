@@ -6,6 +6,9 @@
 //! - `skewed`: skewed random bytes, nearly all Huffman literals
 //! - `random`: incompressible bytes
 //! - every file in `$ZSTD_BENCH_CORPUS` (for example the Silesia corpus)
+//!
+//! [`short_offset_datasets`] adds short-period and columnar integer data
+//! (match offsets under 16), kept out of [`datasets`].
 
 use std::path::{Path, PathBuf};
 
@@ -164,4 +167,62 @@ pub fn datasets() -> Vec<(String, Vec<u8>)> {
 /// Compresses with C libzstd at `level` (the reference encoder).
 pub fn c_compress(data: &[u8], level: i32) -> Vec<u8> {
     zstd::bulk::compress(data, level).expect("libzstd compress")
+}
+
+/// Runs of a random pattern with a period of 1-15 bytes (16 B - 2 KiB per
+/// run), between a few random bytes: matches with offsets under 16.
+pub fn short_period_corpus(len: usize) -> Vec<u8> {
+    let mut r = Rng::new(17);
+    let mut out = Vec::with_capacity(len + 4096);
+    while out.len() < len {
+        let period = 1 + r.below(15) as usize;
+        let pat: Vec<u8> = (0..period).map(|_| r.next_u64() as u8).collect();
+        let run = 16 + r.below(2033) as usize;
+        out.extend((0..run).map(|i| pat[i % period]));
+        for _ in 0..r.below(9) {
+            out.push(r.next_u64() as u8);
+        }
+    }
+    out.truncate(len);
+    out
+}
+
+/// A column of `width`-byte little-endian integers. `runs`: each value
+/// repeats 1-64 times, then moves by a small step (low-cardinality,
+/// run-heavy columns); otherwise every value moves by 0-15 (sorted keys,
+/// timestamps).
+pub fn int_column_corpus(len: usize, width: usize, runs: bool) -> Vec<u8> {
+    let mut r = Rng::new(23 + width as u64 * 2 + runs as u64);
+    let mut out = Vec::with_capacity(len + 64 * width);
+    let mut v: u64 = 1_700_000_000_000 + r.below(1 << 20);
+    while out.len() < len {
+        let (n, step) = if runs {
+            (1 + r.below(64), 1 + r.below(1000))
+        } else {
+            (1, r.below(16))
+        };
+        for _ in 0..n {
+            out.extend_from_slice(&v.to_le_bytes()[..width]);
+        }
+        v = v.wrapping_add(step);
+    }
+    out.truncate(len);
+    out
+}
+
+/// `(name, data)` for the short-offset datasets: `periods` and integer
+/// columns (`u16runs`, `u32runs`, `u64runs`, `u32delta`, `u64delta`).
+pub fn short_offset_datasets() -> Vec<(String, Vec<u8>)> {
+    let n = 4 << 20;
+    let mut v = vec![("periods".to_string(), short_period_corpus(n))];
+    for (name, width, runs) in [
+        ("u16runs", 2, true),
+        ("u32runs", 4, true),
+        ("u64runs", 8, true),
+        ("u32delta", 4, false),
+        ("u64delta", 8, false),
+    ] {
+        v.push((name.to_string(), int_column_corpus(n, width, runs)));
+    }
+    v
 }

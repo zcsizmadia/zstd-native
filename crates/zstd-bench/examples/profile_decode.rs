@@ -13,8 +13,10 @@ fn main() {
     let level: i32 = args.get(2).map_or(3, |s| s.parse().unwrap());
     let lib = args.get(3).map_or("native", |s| s);
     let secs: f64 = args.get(4).map_or(5.0, |s| s.parse().unwrap());
+    // `datasets()` (with `$ZSTD_BENCH_CORPUS`) or `short_offset_datasets()`.
     let data = zstd_bench::datasets()
         .into_iter()
+        .chain(zstd_bench::short_offset_datasets())
         .find(|(n, _)| n == ds)
         .expect("dataset")
         .1;
