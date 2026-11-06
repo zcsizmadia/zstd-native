@@ -12,7 +12,8 @@ use core::sync::atomic::{AtomicU8, Ordering};
 /// The CPU features the decoder's specialized code paths use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Features {
-    /// x86-64 BMI1 + BMI2 (+ LZCNT, which every BMI2 CPU has).
+    /// x86-64 BMI1 + BMI2 (+ LZCNT and SSSE3, which every BMI2 CPU has;
+    /// the BMI2 sequence loop uses SSSE3 shuffles for short match offsets).
     pub bmi2: bool,
     /// Use the `asm!` Huffman loops: x86-64 with BMI2, not AMD (unless
     /// disabled with [`set_asm`] for testing and A/B measurements). On
@@ -43,13 +44,15 @@ fn bmi2() -> bool {
         std::is_x86_feature_detected!("bmi2")
             && std::is_x86_feature_detected!("bmi1")
             && std::is_x86_feature_detected!("lzcnt")
+            && std::is_x86_feature_detected!("ssse3")
     }
     #[cfg(not(feature = "std"))]
     {
         cfg!(all(
             target_feature = "bmi2",
             target_feature = "bmi1",
-            target_feature = "lzcnt"
+            target_feature = "lzcnt",
+            target_feature = "ssse3"
         ))
     }
 }

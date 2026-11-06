@@ -3,7 +3,8 @@
 use std::io::Write;
 
 use zstd_bench::{
-    Rng, c_compress, datasets, log_corpus, numeric_corpus, random_corpus, source_corpus,
+    Rng, c_compress, datasets, log_corpus, numeric_corpus, random_corpus, short_offset_datasets,
+    source_corpus,
 };
 
 fn check(name: &str, data: &[u8], compressed: &[u8]) {
@@ -32,6 +33,24 @@ fn levels_and_datasets() {
                 continue; // slow C levels on big inputs
             }
             check(&format!("{name} L{level}"), data, &c_compress(data, level));
+        }
+    }
+}
+
+/// Short-period and integer-column data: matches with offsets under 16
+/// (the shuffle copies), including frames that end mid-run.
+#[test]
+fn short_offsets() {
+    for (name, data) in short_offset_datasets() {
+        for (len, levels) in [(1 << 20, &[-1, 1, 3, 9, 19][..]), (100_003, &[3, 22][..])] {
+            let data = &data[..len];
+            for &level in levels {
+                check(
+                    &format!("{name} {len} L{level}"),
+                    data,
+                    &c_compress(data, level),
+                );
+            }
         }
     }
 }

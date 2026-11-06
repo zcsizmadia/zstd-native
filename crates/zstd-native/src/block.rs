@@ -364,7 +364,7 @@ fn run_sequences(
 }
 
 #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
-#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+#[target_feature(enable = "bmi1,bmi2,lzcnt,ssse3")]
 #[allow(clippy::too_many_arguments)]
 fn sequences_bmi2(
     t: &SeqTables,
@@ -376,7 +376,8 @@ fn sequences_bmi2(
     prefix: usize,
     dict: &[u8],
 ) -> Result<()> {
-    sequences_body(t, rep, src, nb_seq, lits, out, prefix, dict)
+    // `cpu.bmi2` includes SSSE3 (see `cpu::bmi2`): the shuffle copies.
+    sequences_body::<true>(t, rep, src, nb_seq, lits, out, prefix, dict)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -390,7 +391,7 @@ fn sequences_generic(
     prefix: usize,
     dict: &[u8],
 ) -> Result<()> {
-    sequences_body(t, rep, src, nb_seq, lits, out, prefix, dict)
+    sequences_body::<{ copy::SHUFFLE_BASELINE }>(t, rep, src, nb_seq, lits, out, prefix, dict)
 }
 
 /// The cell for `state` in the combined table at `tp`.
@@ -595,6 +596,238 @@ mod copy {
             debug_assert!(*o as usize - *m as usize >= 8);
         }
     }
+
+    /// Whether the generic sequence loop uses the shuffle copies: on
+    /// AArch64, whose baseline has NEON. (On x86-64 only the BMI2 loop
+    /// does: every BMI2 CPU has SSSE3, and `cpu::bmi2` checks it.)
+    pub(super) const SHUFFLE_BASELINE: bool = cfg!(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little",
+        not(feature = "portable")
+    ));
+
+    /// Matches with offsets under 16 take the shuffle copy above this
+    /// length; shorter ones keep the scalar copies inline (two 8-byte
+    /// copies at most), so short offset-8 matches in integer data and text
+    /// run exactly the code they did before.
+    const SHUFFLE_MIN: usize = 16;
+
+    /// Copies a match of `match_len` bytes from `offset` bytes back,
+    /// writing up to 31 bytes past its end. `SHUF` selects the shuffle
+    /// copy for offsets under 16 ([`shuffle::short_copy`]); the caller
+    /// guarantees the CPU has its instructions.
+    #[inline(always)]
+    pub(super) unsafe fn match_copy<const SHUF: bool>(
+        mop: *mut u8,
+        offset: usize,
+        match_len: usize,
+    ) {
+        debug_assert!(offset > 0 && match_len > 0);
+        // SAFETY: per the caller: `mop - offset .. mop` is written output
+        // and `mop .. mop + match_len + 32` is writable.
+        unsafe {
+            let mut mop = mop;
+            let mut mp: *const u8 = mop.sub(offset);
+            if offset >= 16 {
+                wildcopy(mop, mp, match_len);
+            } else if SHUF && match_len > SHUFFLE_MIN {
+                shuffle::short_copy(mop, mp, offset, match_len);
+            } else {
+                overlap_copy8(&mut mop, &mut mp, offset);
+                if match_len > 8 {
+                    wildcopy8(mop, mp, match_len - 8);
+                }
+            }
+        }
+    }
+
+    /// Matches with offsets under 16, 16 bytes per store: one period of
+    /// the pattern in a vector register, advanced by a byte shuffle with no
+    /// load in the loop (libzstd's scalar loop stores 8 bytes per
+    /// iteration and reloads what it just stored). From meta/zstd#4718,
+    /// but the first vector is built from two 8-byte loads of already
+    /// written bytes (each inside one earlier store, so store-forwarded)
+    /// instead of 16 scalar bytes and a 16-byte reload.
+    #[cfg(any(
+        all(target_arch = "x86_64", not(feature = "portable")),
+        all(
+            target_arch = "aarch64",
+            target_feature = "neon",
+            target_endian = "little",
+            not(feature = "portable")
+        )
+    ))]
+    mod shuffle {
+        #[cfg(target_arch = "aarch64")]
+        use core::arch::aarch64::{
+            uint8x16_t as V, vcombine_u8, vld1_u8, vld1q_u8, vqtbl1q_u8, vst1q_u8,
+        };
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::{
+            __m128i as V, _mm_load_si128, _mm_loadl_epi64, _mm_shuffle_epi8, _mm_storeu_si128,
+            _mm_unpacklo_epi64,
+        };
+
+        /// Shuffle indexes for the short-offset copies (meta/zstd#4718). Row
+        /// `o` serves offset `o` (row 0 is unused).
+        #[repr(align(16))]
+        struct ShufTables {
+            /// The first 16 output bytes from the register the copy starts
+            /// with. Offsets under 8 (after `overlap_copy8` wrote the first 8
+            /// bytes): byte `k` is output byte `k - 8`, so lane `j` takes
+            /// `(8 + j) % o`. Offsets 8 to 15: bytes 0-7 are source bytes 0-7
+            /// and bytes 8-15 source bytes `o - 8 .. o`, so lane `j` takes
+            /// source byte `s = j % o`, at `s` or `s + 16 - o`.
+            init: [[u8; 16]; 16],
+            /// The next 16 bytes of the pattern from the last 16: lane `j`
+            /// takes `(16 + j) % o` (the output repeats with period `o`).
+            adv: [[u8; 16]; 16],
+        }
+
+        static SHUF_TABLES: ShufTables = {
+            let mut init = [[0u8; 16]; 16];
+            let mut adv = [[0u8; 16]; 16];
+            let mut o = 1;
+            while o < 16 {
+                let mut j = 0;
+                while j < 16 {
+                    adv[o][j] = ((16 + j) % o) as u8;
+                    init[o][j] = if o < 8 {
+                        (8 + j) % o
+                    } else if j % o < 8 {
+                        j % o
+                    } else {
+                        j % o + 16 - o
+                    } as u8;
+                    j += 1;
+                }
+                o += 1;
+            }
+            ShufTables { init, adv }
+        };
+
+        /// `lo[..8]` then `hi[..8]`.
+        #[inline(always)]
+        unsafe fn load8x2(lo: *const u8, hi: *const u8) -> V {
+            // SAFETY: per the caller, 8 readable bytes at each.
+            unsafe {
+                #[cfg(target_arch = "x86_64")]
+                return _mm_unpacklo_epi64(_mm_loadl_epi64(lo.cast()), _mm_loadl_epi64(hi.cast()));
+                #[cfg(target_arch = "aarch64")]
+                return vcombine_u8(vld1_u8(lo), vld1_u8(hi));
+            }
+        }
+
+        /// `t` (16-byte aligned).
+        #[inline(always)]
+        fn table(t: &[u8; 16]) -> V {
+            // SAFETY: 16 readable bytes, aligned (`ShufTables` is
+            // `align(16)` and its rows are 16 bytes).
+            unsafe {
+                #[cfg(target_arch = "x86_64")]
+                return _mm_load_si128(t.as_ptr().cast());
+                #[cfg(target_arch = "aarch64")]
+                return vld1q_u8(t.as_ptr());
+            }
+        }
+
+        /// Lane `j` of the result is lane `idx[j]` of `v` (`idx[j] < 16`).
+        #[inline(always)]
+        unsafe fn shuffle(v: V, idx: V) -> V {
+            // SAFETY: the caller guarantees SSSE3 (x86-64); NEON is in
+            // the AArch64 baseline.
+            unsafe {
+                #[cfg(target_arch = "x86_64")]
+                return _mm_shuffle_epi8(v, idx);
+                #[cfg(target_arch = "aarch64")]
+                return vqtbl1q_u8(v, idx);
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn store16(dst: *mut u8, v: V) {
+            // SAFETY: per the caller, 16 writable bytes.
+            unsafe {
+                #[cfg(target_arch = "x86_64")]
+                _mm_storeu_si128(dst.cast(), v);
+                #[cfg(target_arch = "aarch64")]
+                vst1q_u8(dst, v);
+            }
+        }
+
+        /// Copies a match of `match_len` bytes from `mp = mop - offset`,
+        /// `1 <= offset < 16`, writing up to 15 bytes past its end. On
+        /// x86-64 the CPU must have SSSE3. Cold and out of line, so the
+        /// sequence loop keeps the exact code (and registers) of the
+        /// scalar copy for the common short matches: inlined, or called
+        /// from inside it, it measured 2-5% slower on short offset-8
+        /// matches and on nci.
+        #[cold]
+        #[inline(never)]
+        #[cfg_attr(target_arch = "x86_64", target_feature(enable = "ssse3"))]
+        pub(in super::super) unsafe fn short_copy(
+            mop: *mut u8,
+            mp: *const u8,
+            offset: usize,
+            match_len: usize,
+        ) {
+            debug_assert!((1..16).contains(&offset));
+            debug_assert!(match_len > 8);
+            debug_assert_eq!(mop as usize - mp as usize, offset);
+            // SAFETY: per the caller: `mp .. mop` is written output and
+            // `mop .. mop + match_len + 15` is writable. The loads read only
+            // written bytes: for offsets under 8, `o - 8 .. o` (just
+            // written by `overlap_copy8`); else `mp .. mp + 8` and
+            // `mop - 8 .. mop`, both in `mp .. mop`.
+            unsafe {
+                let (mut o, r) = if offset < 8 {
+                    let (mut o, mut m) = (mop, mp);
+                    super::overlap_copy8(&mut o, &mut m, offset);
+                    (o, load8x2(o.sub(8), o.sub(8)))
+                } else {
+                    (mop, load8x2(mp, mop.sub(8)))
+                };
+                let end = mop as usize + match_len;
+                let mut p = shuffle(r, table(&SHUF_TABLES.init[offset]));
+                let adv = table(&SHUF_TABLES.adv[offset]);
+                loop {
+                    store16(o, p);
+                    o = o.add(16);
+                    if o as usize >= end {
+                        break;
+                    }
+                    p = shuffle(p, adv);
+                }
+            }
+        }
+    }
+
+    /// Never selected here (`SHUF` is false): the scalar copy.
+    #[cfg(not(any(
+        all(target_arch = "x86_64", not(feature = "portable")),
+        all(
+            target_arch = "aarch64",
+            target_feature = "neon",
+            target_endian = "little",
+            not(feature = "portable")
+        )
+    )))]
+    mod shuffle {
+        pub(in super::super) unsafe fn short_copy(
+            mop: *mut u8,
+            mp: *const u8,
+            offset: usize,
+            match_len: usize,
+        ) {
+            let (mut o, mut m) = (mop, mp);
+            // SAFETY: per the caller.
+            unsafe {
+                super::overlap_copy8(&mut o, &mut m, offset);
+                super::wildcopy8(o, m, match_len - 8);
+            }
+        }
+    }
 }
 
 /// Executes one sequence inside a decode loop: the fast path when the
@@ -603,7 +836,7 @@ mod copy {
 /// cursors (`op`, `lp`) and bounds are passed by name so the fast and the
 /// checked loop share it with everything in registers.
 macro_rules! exec_seq {
-    ($seq:expr; $op:ident, $lp:ident; $base:ident, $cap:ident, $prefix_start:ident,
+    ($shuf:ident; $seq:expr; $op:ident, $lp:ident; $base:ident, $cap:ident, $prefix_start:ident,
      $oend_w:ident, $lit_start:ident, $lit_end:ident, $lit_total:expr, $prefix:ident,
      $dict:ident) => {{
         let seq = $seq;
@@ -645,7 +878,7 @@ macro_rules! exec_seq {
                 copy::wildcopy($op.add(16), $lp.add(16), seq.lit_len - 16);
             }
             $lp = $lp.add(seq.lit_len);
-            let mut mop = $op.add(seq.lit_len);
+            let mop = $op.add(seq.lit_len);
             let op_end = $op.add(seq_len);
             let match_len = seq.match_len;
             let offset = seq.offset;
@@ -655,15 +888,7 @@ macro_rules! exec_seq {
                 $op = op_end;
                 continue;
             }
-            let mut mp: *const u8 = mop.sub(offset);
-            if offset >= 16 {
-                copy::wildcopy(mop, mp, match_len);
-            } else {
-                copy::overlap_copy8(&mut mop, &mut mp, offset);
-                if match_len > 8 {
-                    copy::wildcopy8(mop, mp, match_len - 8);
-                }
-            }
+            copy::match_copy::<$shuf>(mop, offset, match_len);
             $op = op_end;
         }
     }};
@@ -671,10 +896,12 @@ macro_rules! exec_seq {
 
 /// The fused decode + execute loop (libzstd's `ZSTD_decompressSequences_body`).
 /// (Decoding batches of sequences first and executing them after was
-/// measured 15% slower.)
+/// measured 15% slower.) `SHUF` enables the byte-shuffle copy for long
+/// matches with offsets under 16 ([`copy::match_copy`]); the caller
+/// guarantees SSSE3 (x86-64) or NEON (AArch64).
 #[inline(always)]
 #[allow(clippy::too_many_arguments, unsafe_code)]
-fn sequences_body(
+fn sequences_body<const SHUF: bool>(
     t: &SeqTables,
     rep: &mut [usize; 3],
     src: &[u8],
@@ -721,7 +948,7 @@ fn sequences_body(
         while n > 0 && fb.ip >= limit {
             n -= 1;
             let seq = decode_sequence(&mut fb, tp, &mut ll, &mut ml, &mut of, &mut reps, n == 0);
-            exec_seq!(seq; op, lp; base, cap, prefix_start, oend_w, lit_start, lit_end, lits.len, prefix, dict);
+            exec_seq!(SHUF; seq; op, lp; base, cap, prefix_start, oend_w, lit_start, lit_end, lits.len, prefix, dict);
         }
         br = br.resume(fb);
     }
@@ -729,7 +956,7 @@ fn sequences_body(
     while n > 0 {
         n -= 1;
         let seq = decode_sequence(&mut br, tp, &mut ll, &mut ml, &mut of, &mut reps, n == 0);
-        exec_seq!(seq; op, lp; base, cap, prefix_start, oend_w, lit_start, lit_end, lits.len, prefix, dict);
+        exec_seq!(SHUF; seq; op, lp; base, cap, prefix_start, oend_w, lit_start, lit_end, lits.len, prefix, dict);
     }
     *rep = reps;
     if !br.is_end() {
@@ -851,4 +1078,72 @@ fn dict_match(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    /// Whether `copy::match_copy::<true>` may run here.
+    fn shuffle_ok() -> bool {
+        #[cfg(all(target_arch = "x86_64", not(feature = "portable"), feature = "std"))]
+        return std::is_x86_feature_detected!("ssse3");
+        // AArch64 (NEON baseline), or the scalar stand-in.
+        #[allow(unreachable_code)]
+        true
+    }
+
+    /// Every offset 1-31 and lengths around the 8/16/32-byte steps, with
+    /// exactly `WILDCOPY_OVERLENGTH` bytes of room after the match (then
+    /// guard bytes that must stay untouched) and the source at the start
+    /// of the buffer.
+    fn check_match_copy<const SHUF: bool>() {
+        const GUARD: usize = 16;
+        let lens: &[usize] = if cfg!(miri) {
+            &[1, 3, 8, 9, 16, 17, 33]
+        } else {
+            &[
+                1, 2, 3, 4, 5, 7, 8, 9, 10, 15, 16, 17, 18, 23, 24, 25, 31, 32, 33, 34, 47, 48, 49,
+                63, 64, 65, 100, 255,
+            ]
+        };
+        for offset in 1..32 {
+            for &len in lens {
+                let total = offset + len + WILDCOPY_OVERLENGTH + GUARD;
+                let mut buf = vec![0xA5u8; total];
+                for (i, b) in buf[..offset].iter_mut().enumerate() {
+                    *b = (i * 37 + offset * 11 + 1) as u8;
+                }
+                let mut want = buf[..offset].to_vec();
+                for i in 0..len {
+                    want.push(want[i]);
+                }
+                // SAFETY: `offset` written bytes precede the match and
+                // `len + WILDCOPY_OVERLENGTH` bytes follow it.
+                unsafe { copy::match_copy::<SHUF>(buf.as_mut_ptr().add(offset), offset, len) };
+                assert!(
+                    buf[..offset + len] == want[..],
+                    "offset {offset} len {len} shuffle {SHUF}"
+                );
+                assert!(
+                    buf[total - GUARD..].iter().all(|&b| b == 0xA5),
+                    "offset {offset} len {len} shuffle {SHUF}: wrote past the slack"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn match_copy_scalar() {
+        check_match_copy::<false>();
+    }
+
+    #[test]
+    fn match_copy_shuffle() {
+        if shuffle_ok() {
+            check_match_copy::<true>();
+        }
+    }
 }
