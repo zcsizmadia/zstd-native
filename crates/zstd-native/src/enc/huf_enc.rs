@@ -1019,6 +1019,27 @@ fn tight_compress_bound(src_size: usize, table_log: u32) -> usize {
 /// No BMI2 variant (libzstd has one): on Zen 3 it saves instructions but
 /// not cycles, measured on x-ray, dickens, mozilla and xml.
 pub(crate) fn huf_compress1x_using_ctable(dst: &mut [u8], src: &[u8], ct: &HufCTable) -> usize {
+    compress1x_checked(dst, src, ct, codes_fit(ct))
+}
+
+/// True if no code of `ct` is longer than `ct.table_log` bits. Every table
+/// built or read here satisfies it; it is checked anyway, as the unclamped
+/// flushes of the fast loops rely on it. Once per table use (not once per
+/// stream: four times for four streams), and in plain 64-bit adds and ORs,
+/// which vectorize with SSE2 (an early-exit scan doesn't, nor do 64-bit
+/// compares, which need SSE4.2): `len + 255 - table_log`, below 512, has
+/// bit 8 set if and only if `len > table_log`.
+#[inline]
+fn codes_fit(ct: &HufCTable) -> bool {
+    let bias = 0xFF - u64::from(ct.table_log.min(0xFF));
+    let over = ct.elts.iter().fold(0, |acc, &e| acc | ((e & 0xFF) + bias));
+    over & 0x100 == 0
+}
+
+/// [`huf_compress1x_using_ctable`] with `codes_fit` = [`codes_fit`]`(ct)`.
+#[inline(never)]
+fn compress1x_checked(dst: &mut [u8], src: &[u8], ct: &HufCTable, codes_fit: bool) -> usize {
+    debug_assert_eq!(codes_fit, self::codes_fit(ct));
     let table_log = ct.table_log;
     let dst_size = dst.len();
     if dst_size < 8 {
@@ -1028,10 +1049,6 @@ pub(crate) fn huf_compress1x_using_ctable(dst: &mut [u8], src: &[u8], ct: &HufCT
         return 0;
     };
     let elts = &ct.elts;
-    // True if no code is longer than `table_log` bits (every table built or
-    // read here satisfies it; checked anyway, as the unclamped flushes of
-    // the fast loops rely on it).
-    let codes_fit = elts.iter().all(|&e| get_nb_bits(e) <= table_log);
     if dst_size < tight_compress_bound(src.len(), table_log) || table_log > 11 || !codes_fit {
         compress1x_loop::<4, false, true>(&mut bc, src, elts);
     } else {
@@ -1064,13 +1081,14 @@ pub(crate) fn huf_compress4x_using_ctable(dst: &mut [u8], src: &[u8], ct: &HufCT
     }
     let mut op = 6; // jump table
     let mut ip = 0;
+    let fit = codes_fit(ct);
     for i in 0..4 {
         let seg = if i < 3 {
             &src[ip..ip + segment_size]
         } else {
             &src[ip..]
         };
-        let c_size = huf_compress1x_using_ctable(&mut dst[op..], seg, ct);
+        let c_size = compress1x_checked(&mut dst[op..], seg, ct, fit);
         if c_size == 0 || c_size > 65535 {
             return 0;
         }
@@ -1414,6 +1432,31 @@ mod tests {
             assert!(seen.iter().all(|&s| s));
         }
         assert_eq!(RANK_POSITION_DISTINCT_COUNT_CUTOFF, 165);
+    }
+
+    #[test]
+    fn codes_fit_scan() {
+        let mut r = Rng(5);
+        for _ in 0..if cfg!(miri) { 4 } else { 2000 } {
+            let mut ct = HufCTable::new();
+            ct.table_log = r.below(14) as u32;
+            if r.below(8) == 0 {
+                ct.table_log = 200 + r.below(1000) as u32;
+            }
+            let longest = r.below(14);
+            for e in ct.elts.iter_mut() {
+                // random code bits, a length up to `longest`
+                *e = (r.next() << 8) | r.below(longest + 1);
+            }
+            if r.below(3) == 0 {
+                ct.elts[r.below(256) as usize] = (r.next() << 8) | (200 + r.below(56));
+            }
+            let want = ct
+                .elts
+                .iter()
+                .all(|&e| u64::from(get_nb_bits(e)) <= u64::from(ct.table_log));
+            assert_eq!(codes_fit(&ct), want);
+        }
     }
 
     /// Code lengths: complete prefix code, limited height, a code for
