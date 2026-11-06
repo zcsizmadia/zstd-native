@@ -801,6 +801,70 @@ fn ext_dict_generic<const MLS: u32, const CMOV: bool>(
     let mut ip = istart;
     let mut anchor = istart;
 
+    // The whole loop in asm (`block_asm::dfast_ext_block`, same parse and
+    // checks as the `CMOV` loop below): 3-6% faster, see `block_asm`.
+    #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
+    if CMOV && crate::cpu::Features::detect().bmi2 {
+        use super::seq_store::{LongLengthType, SeqDef, WILDCOPY_OVERLENGTH};
+        // Room for the sequences the asm stores (no per-sequence checks).
+        ss.reserve(end - start);
+        let lit_base = ss.lit_buf.as_mut_ptr();
+        let seq_base = ss.sequences.as_mut_ptr();
+        let mut ctx = super::block_asm::DfastExtCtx {
+            prime_s,
+            prime_l: PRIME8BYTES,
+            shift_s,
+            shift_l,
+            prefix_start_index: u64::from(prefix_start_index),
+            dict_start_index: u64::from(dict_start_index),
+            anchor,
+            iend,
+            ilimit,
+            prefix_start: w.prefix_start,
+            dict_start: w.dict_start,
+            dict_end: w.dict_end,
+            lit_limit_w: (iend as usize).saturating_sub(WILDCOPY_OVERLENGTH),
+            // SAFETY: `lit_len <= max_nb_lit` and `nb_seq <= max_nb_seq`,
+            // inside the buffers (`reserve`).
+            lit: unsafe { lit_base.add(ss.lit_len) },
+            seq: unsafe { seq_base.add(ss.nb_seq) },
+            off1: u64::from(offset_1),
+            off2: u64::from(offset_2),
+            llt: 0,
+            llpos: core::ptr::null_mut(),
+            curr_pos: core::ptr::null(),
+            low_match: core::ptr::null(),
+            vend: core::ptr::null(),
+        };
+        // SAFETY: the window checks of `ExtWindow::new` above, the table
+        // sizes asserted above, `ss.reserve(end - start)`, `ip = anchor =
+        // istart` in the prefix, and the CPU has BMI1/BMI2
+        // (`Features::detect`).
+        unsafe {
+            super::block_asm::dfast_ext_block(&mut ctx, ip, hash_long, hash_small, base, dict_base);
+        }
+        anchor = ctx.anchor;
+        debug_assert!(istart <= anchor && anchor <= iend);
+        debug_assert!((ctx.off1 >> 32) == 0 && (ctx.off2 >> 32) == 0);
+        debug_assert!(ctx.lit >= lit_base && ctx.seq >= seq_base);
+        ss.lit_len = ctx.lit as usize - lit_base as usize;
+        ss.nb_seq = (ctx.seq as usize - seq_base as usize) / size_of::<SeqDef>();
+        debug_assert!(ss.lit_len <= ss.max_nb_lit && ss.nb_seq <= ss.max_nb_seq);
+        if ctx.llt != 0 {
+            debug_assert!(ss.long_length_type == LongLengthType::None);
+            ss.long_length_type = if ctx.llt == 1 {
+                LongLengthType::LiteralLength
+            } else {
+                LongLengthType::MatchLength
+            };
+            ss.long_length_pos =
+                ((ctx.llpos as usize - seq_base as usize) / size_of::<SeqDef>()) as u32;
+        }
+        rep[0] = ctx.off1 as u32;
+        rep[1] = ctx.off2 as u32;
+        return iend as usize - anchor as usize;
+    }
+
     // The position of a valid table candidate `i` (`> dictStartIndex`), or
     // the dummy array: no branch on either test.
     let cand = |i: u32| {

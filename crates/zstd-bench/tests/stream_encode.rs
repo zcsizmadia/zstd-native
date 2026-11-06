@@ -323,6 +323,62 @@ fn frequent_flushes_fast_levels() {
     }
 }
 
+/// extDict blocks (the input buffer wrapped) with the extremes of the
+/// `dfast`/`fast` extDict loops: literal runs over 64 KiB (incompressible
+/// pieces: the long literal length flag), matches over 64 KiB (long
+/// repeats of older data: the long match length flag) that start in the
+/// extDict segment and run on into the prefix, and repcodes reaching
+/// back across the wrap.
+#[test]
+fn ext_dict_long_lengths() {
+    let src = input(1_000_000);
+    let mut r = Rng::new(75);
+    let mut data = Vec::new();
+    while data.len() < 3_000_000 {
+        match r.below(3) {
+            0 => {
+                // incompressible run
+                let n = r.below(40_000) as usize + 66_000;
+                data.extend((0..n).map(|_| r.next_u64() as u8));
+            }
+            1 if data.len() > 200_000 => {
+                // long repeat of older data (often across the wrap)
+                let n = r.below(60_000) as usize + 66_000;
+                let back = r.below(data.len() as u64 - n as u64) as usize;
+                let piece = data[back..back + n].to_vec();
+                data.extend_from_slice(&piece);
+            }
+            _ => {
+                let s = r.below(src.len() as u64 - 50_000) as usize;
+                data.extend_from_slice(&src[s..s + r.below(40_000) as usize + 10]);
+            }
+        }
+    }
+    let cases: &[(i32, u32, usize)] = &[
+        (3, 0, 16_384),
+        (3, 17, 4096),
+        (3, 20, 100_000),
+        (4, 0, 65_536),
+        (4, 18, 1024),
+        (2, 0, 16_384),
+        (1, 17, 4096),
+        (-1, 20, 30_000),
+    ];
+    let n = if cfg!(miri) { 2 } else { cases.len() };
+    for &(level, wlog, flush) in &cases[..n] {
+        let mut s = Script::new(level);
+        s.window_log = wlog;
+        let mut left = data.len();
+        while left > 0 {
+            let c = (r.below(2 * flush as u64) as usize + 1).min(left);
+            s.ops.push((c, EndOp::Flush, OUT));
+            left -= c;
+        }
+        s.ops.push((0, EndOp::End, OUT));
+        check("extDict long lengths", &s, &data);
+    }
+}
+
 /// Random call sequences: chunk sizes, operations (ending frames in the
 /// middle, with or without input) and output sizes.
 #[test]
