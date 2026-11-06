@@ -282,7 +282,7 @@ impl Decompressor {
 }
 
 /// Makes room for `extra` more bytes after `out.pos` in `v`.
-fn reserve(v: &mut Vec<u8>, out: &mut Output, extra: usize) -> Result<()> {
+pub(crate) fn reserve(v: &mut Vec<u8>, out: &mut Output, extra: usize) -> Result<()> {
     if out.cap - out.pos >= extra {
         return Ok(());
     }

@@ -160,3 +160,110 @@ fn mutated_streams() {
     zstd_native::__private::set_asm(None);
     eprintln!("{accepted} of {iters} mutated streams decoded");
 }
+
+/// Mutated streams through the streaming decoder's direct output (one
+/// output buffer that holds everything, and `io::Read::read_to_end`) and
+/// through its window buffer (small outputs): the same verdict and the
+/// same output, and anything accepted, libzstd accepts with that output.
+#[test]
+fn mutated_streams_direct() {
+    use std::io::{Read, Write};
+    let iters: usize = std::env::var("ZSTD_NATIVE_CORRUPTION_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3000);
+    let data = log_corpus(200_000);
+    let mut frames = Vec::new();
+    for (level, wlog, pledged) in [
+        (1, 10, true),
+        (3, 12, false),
+        (9, 17, true),
+        (19, 15, false),
+    ] {
+        let part = &data[..(50_000 * level as usize).min(data.len())];
+        let mut enc = zstd::stream::write::Encoder::new(Vec::new(), level).unwrap();
+        enc.window_log(wlog).unwrap();
+        enc.include_checksum(wlog % 2 == 0).unwrap();
+        enc.include_contentsize(pledged).unwrap();
+        if pledged {
+            enc.set_pledged_src_size(Some(part.len() as u64)).unwrap();
+        }
+        enc.write_all(part).unwrap();
+        frames.push(enc.finish().unwrap());
+    }
+    frames.push(c_compress(&data[..30_000], 3));
+    let decode = |m: &[u8], out_max: usize, r: &mut Rng| -> (bool, Vec<u8>) {
+        let mut dec = zstd_native::StreamDecoder::new();
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; out_max];
+        let mut ip = 0;
+        let ok = loop {
+            let n = (1 + r.below(50_000) as usize).min(m.len() - ip);
+            let o = 1 + r.below(out_max as u64) as usize;
+            match dec.decode(&m[ip..ip + n], &mut buf[..o]) {
+                Err(_) => break false,
+                Ok(p) => {
+                    ip += p.read;
+                    out.extend_from_slice(&buf[..p.written]);
+                    if ip == m.len() && p.read == 0 && p.written == 0 {
+                        break p.at_frame_boundary;
+                    }
+                }
+            }
+        };
+        (ok, out)
+    };
+    let mut r = Rng::new(4242);
+    // More than any mutated stream here decodes to.
+    let mut big = vec![0u8; 16 << 20];
+    let mut accepted = 0;
+    for i in 0..iters {
+        let mut m = frames[i % frames.len()].clone();
+        for _ in 0..1 + r.below(3) {
+            let p = r.below(m.len() as u64) as usize;
+            m[p] ^= 1 << r.below(8);
+        }
+        if r.below(4) == 0 {
+            let n = r.below(m.len() as u64) as usize;
+            m.truncate(n);
+        }
+        zstd_native::__private::set_asm(Some(i % 2 == 0));
+        // Direct: one call with all the input and room for everything.
+        let mut dec = zstd_native::StreamDecoder::new();
+        let direct = match dec.decode(&m, &mut big) {
+            Ok(p) if p.read == m.len() && p.at_frame_boundary => Some(big[..p.written].to_vec()),
+            _ => None,
+        };
+        // Window buffer: small outputs.
+        let (ok, small) = decode(&m, 300, &mut r);
+        let buffered = ok.then_some(small);
+        // Mixed: random outputs up to more than the frame.
+        let (ok, mixed) = decode(&m, 400_000, &mut r);
+        let mixed = ok.then_some(mixed);
+        let mut v = Vec::new();
+        let rte = zstd_native::Decoder::with_buffer(std::io::BufReader::with_capacity(
+            1 + r.below(70_000) as usize,
+            &m[..],
+        ))
+        .read_to_end(&mut v)
+        .ok()
+        .map(|_| v);
+        assert!(
+            direct == buffered && mixed == buffered && rte == buffered,
+            "iteration {i}: direct {:?}, buffered {:?}, mixed {:?}, read_to_end {:?}",
+            direct.as_ref().map(Vec::len),
+            buffered.as_ref().map(Vec::len),
+            mixed.as_ref().map(Vec::len),
+            rte.as_ref().map(Vec::len)
+        );
+        if let Some(out) = &buffered
+            && !m.is_empty()
+        {
+            accepted += 1;
+            let c = zstd::stream::decode_all(&m[..]).ok();
+            assert_eq!(c.as_ref(), Some(out), "iteration {i}: libzstd differs");
+        }
+    }
+    zstd_native::__private::set_asm(None);
+    eprintln!("{accepted} of {iters} mutated streams decoded");
+}

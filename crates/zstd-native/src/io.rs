@@ -2,7 +2,9 @@
 
 use std::boxed::Box;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::string::String;
 use std::vec;
+use std::vec::Vec;
 
 use crate::dict::Dictionary;
 use crate::enc::{EncoderDictionary, EndOp, StreamEncoder};
@@ -25,6 +27,11 @@ use crate::stream::StreamDecoder;
 /// error; corrupt input is [`io::ErrorKind::InvalidData`] (the source is an
 /// [`Error`]). Empty input is zero frames: empty output, as with
 /// libzstd (the `zstd` crate's reader reports an error there instead).
+///
+/// [`read_to_end`](Read::read_to_end) (and `read_to_string`) decode
+/// straight into the `Vec`, growing it (reserving a frame's content size
+/// up front, up to the window limit), without the window buffer and the
+/// copy out of it that [`read`](Read::read) needs.
 #[derive(Debug)]
 pub struct Decoder<R> {
     reader: R,
@@ -106,6 +113,78 @@ impl<R: BufRead> Read for Decoder<R> {
             if eof {
                 return if p.at_frame_boundary {
                     Ok(0)
+                } else {
+                    self.failed = true;
+                    Err(Error::Truncated.into())
+                };
+            }
+        }
+    }
+
+    /// Decodes straight into `buf`, growing it (by a frame's content size
+    /// when the header gives it), without the window buffer and the copy
+    /// out of it that [`read`](Read::read) needs.
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        if self.failed {
+            return Err(io::Error::other("zstd decoder failed earlier"));
+        }
+        let start = buf.len();
+        let r = self.read_to_end_direct(buf);
+        if r.is_err() && !self.failed {
+            // A reader error: later reads go on from the window buffer.
+            if let Err(e) = self.dec.leave_direct(buf) {
+                self.failed = true;
+                return Err(e.into());
+            }
+        }
+        r.map(|()| buf.len() - start)
+    }
+
+    fn read_to_string(&mut self, buf: &mut String) -> io::Result<usize> {
+        // `Read`'s default would go through `read`, not `read_to_end`.
+        let old = buf.len();
+        let mut v = core::mem::take(buf).into_bytes();
+        let r = self.read_to_end(&mut v);
+        match String::from_utf8(v) {
+            Ok(s) => {
+                *buf = s;
+                r
+            }
+            Err(e) => {
+                // As `Read::read_to_string`: no invalid text is appended.
+                let mut v = e.into_bytes();
+                v.truncate(old);
+                *buf = String::from_utf8(v).expect("the text before was valid UTF-8");
+                r.and(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stream did not contain valid UTF-8",
+                )))
+            }
+        }
+    }
+}
+
+impl<R: BufRead> Decoder<R> {
+    /// `read_to_end` until the end of the input (or an error).
+    fn read_to_end_direct(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
+        loop {
+            let input = match self.reader.fill_buf() {
+                Ok(i) => i,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            let eof = input.is_empty();
+            let read = match self.dec.decode_vec(input, buf) {
+                Ok(n) => n,
+                Err(e) => {
+                    self.failed = true;
+                    return Err(e.into());
+                }
+            };
+            self.reader.consume(read);
+            if eof {
+                return if self.dec.at_frame_boundary() {
+                    Ok(())
                 } else {
                     self.failed = true;
                     Err(Error::Truncated.into())
