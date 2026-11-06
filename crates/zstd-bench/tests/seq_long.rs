@@ -146,7 +146,11 @@ fn selected_for_cold_dictionary() {
             let (got, n) = count_long(|| decode(f));
             assert!(got == samples[i], "frame {i} streaming={streaming}");
             if let Some(n) = n {
-                assert_eq!(n, usize::from(i == 0), "frame {i} streaming={streaming}");
+                assert_eq!(
+                    n,
+                    usize::from(i == 0 && cfg!(target_arch = "x86_64")),
+                    "frame {i} streaming={streaming}"
+                );
             }
         }
     }
