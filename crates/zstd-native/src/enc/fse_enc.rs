@@ -539,10 +539,24 @@ impl<const STATES: usize, const SYMBOLS: usize> FseCTable<STATES, SYMBOLS> {
             // symbols and reading them back. Same table as the loop below.
             let mut spread = [0u8; STATES];
             let mut pos = 0usize;
-            for (s, &n) in norm[..max_sv1].iter().enumerate() {
-                let n = n as usize;
-                spread[pos..pos + n].fill(s as u8);
-                pos += n;
+            // 8 bytes per store, as libzstd: a run may spill up to 7 bytes
+            // past its end, which the next symbols' runs (or nothing, past
+            // the table) overwrite. `fill` would be a `memset` call per
+            // symbol, much of a small table's cost.
+            let mut sv = 0u64;
+            for &n in &norm[..max_sv1] {
+                let end = pos + n as usize;
+                let mut p = pos;
+                while p < end && p + 8 <= STATES {
+                    spread[p..p + 8].copy_from_slice(&sv.to_le_bytes());
+                    p += 8;
+                }
+                while p < end {
+                    spread[p] = sv as u8; // the last bytes of a full-size table
+                    p += 1;
+                }
+                pos = end;
+                sv = sv.wrapping_add(0x0101_0101_0101_0101);
             }
             let inv = inv_table_step(table_size) as usize;
             let mask = table_mask as usize;

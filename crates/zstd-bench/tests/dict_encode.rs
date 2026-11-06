@@ -176,6 +176,57 @@ fn prepared_reused() {
     }
 }
 
+/// Many small frames on one context with a prepared dictionary: the
+/// dictionary is attached (dictMatchState) and the context's indices
+/// continue from frame to frame (libzstd's `ZSTDirp_continue`), so its
+/// tables hold entries of earlier frames, below the window. Frames of
+/// similar data (overlapping pieces) would find matches through any stale
+/// entry the match finders used; now and then a larger frame copies the
+/// dictionary's tables instead, and a frame without a dictionary comes in
+/// between.
+#[test]
+fn prepared_attached_many_frames() {
+    let data = input(300_000, 12);
+    let dicts = dictionaries();
+    let mut r = Rng::new(13);
+    for (name, dict) in [&dicts[1], &dicts[5]] {
+        for level in [-5, -1, 1, 2, 3, 4, 5, 6, 7, 9, 12, 13, 16, 18, 19, 22] {
+            let cdict = zstd::dict::EncoderDictionary::copy(dict, level);
+            let mut c = zstd::bulk::Compressor::with_prepared_dictionary(&cdict).unwrap();
+            let edict = EncoderDictionary::new(dict, level).unwrap();
+            let mut n_c = Compressor::with_prepared_dictionary(&edict);
+            let mut at = 0;
+            for frame in 0..if level >= SLOW_LEVEL { 20 } else { 60 } {
+                let n = match r.below(16) {
+                    0 => 9_000 + r.below(60_000) as usize,
+                    1 => r.below(100) as usize,
+                    _ => 500 + r.below(7_500) as usize,
+                };
+                // overlapping pieces, now and then back to the start
+                at = if r.below(8) == 0 { 0 } else { at + n / 2 };
+                if at + n > data.len() {
+                    at = 0;
+                }
+                let src = &data[at..at + n];
+                let what = format!("{name} L{level} frame {frame} n={n}");
+                if r.below(20) == 0 {
+                    // a frame without the dictionary on the same contexts
+                    c.set_compression_level(level).unwrap(); // clears it
+                    n_c.clear_dictionary();
+                    let want = c.compress(src).unwrap();
+                    compare(&what, &n_c.compress(src).unwrap(), &want);
+                    c.set_prepared_dictionary(&cdict).unwrap();
+                    n_c.set_prepared_dictionary(&edict);
+                }
+                let want = c.compress(src).unwrap();
+                let got = n_c.compress(src).unwrap_or_else(|e| panic!("{what}: {e}"));
+                compare(&what, &got, &want);
+                round_trip(&what, &got, dict, src);
+            }
+        }
+    }
+}
+
 #[test]
 fn reused_context_switching() {
     let dicts = dictionaries();

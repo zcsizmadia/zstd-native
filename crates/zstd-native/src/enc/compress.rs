@@ -712,7 +712,10 @@ impl FrameCompressor {
             resolve_row_match_finder_mode(ParamSwitch::Auto, &frame_cp),
         );
         cp.window_log = frame_cp.window_log;
-        self.reset_full(cp, pledged, cd.use_row, &frame_cp, ldm, false);
+        // ZSTDcrp_makeClean with ZSTDirp_continue (no loaded dictionary
+        // size): the context's indices continue, its tables aren't zeroed
+        // again when their size is unchanged.
+        self.reset_full(cp, pledged, cd.use_row, &frame_cp, ldm, true);
         debug_assert!(self.cp.strategy == cd.cparams.strategy);
         // don't even attach dictionaries with no contents
         if cd.has_window_content() {
