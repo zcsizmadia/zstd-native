@@ -477,7 +477,9 @@ impl MatchState {
     }
 
     /// [`reset_with`](Self::reset_with) for a CCtx that then compresses
-    /// without a dictionary, with libzstd's `ZSTDirp_continue`, the index
+    /// without a dictionary or with an attached one (dictMatchState: the
+    /// context's own tables are searched only above the window start, as
+    /// without one), with libzstd's `ZSTDirp_continue`, the index
     /// policy of a reused context (`ZSTD_resetCCtx_internal`): the window
     /// keeps its indices and is only cleared (`ZSTD_invalidateMatchState`),
     /// so every index stored by earlier frames is below the new window, and
@@ -487,7 +489,8 @@ impl MatchState {
     /// sequences are the same as after a reset. Falls back to the reset
     /// when the indices come close to the maximum
     /// (`ZSTD_indexTooCloseToMax`), when the table sizes, the strategy or
-    /// the match finder change, or after a frame with a dictionary.
+    /// the match finder change, or after a frame with a copied or loaded
+    /// dictionary.
     pub(crate) fn reset_keep_indices(&mut self, cparams: CParams, use_row: bool) {
         self.reset_impl(cparams, use_row, false, true);
     }
@@ -513,8 +516,11 @@ impl MatchState {
         };
         let keep = keep
             && !for_cdict
-            && self.dict.is_none()
-            && !self.dms
+            // after a frame with an attached dictionary (dictMatchState),
+            // the window is the context's own: its indices continue as
+            // after a frame without one (a copied or loaded dictionary's
+            // window is in the dictionary's buffer, see the flags below)
+            && (self.dms || self.dict.is_none())
             && !self.window.base_in_dict
             && !self.window.dict_base_in_dict
             && self.cparams.strategy == cparams.strategy
