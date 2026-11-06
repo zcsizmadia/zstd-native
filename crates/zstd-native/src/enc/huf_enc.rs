@@ -519,23 +519,47 @@ fn huf_build_tree(nodes: &mut NodeTable, last: u32) -> i32 {
     }
     h!(nodes, -1).count = 1 << 31; // fake entry, strong barrier
 
-    // Create parents.
+    // Create parents: merge the leaves (from the smallest, `low_s` down)
+    // and the new nodes (`low_n` up), two at a time. The counts at `low_s`
+    // and `low_n` are kept in registers (`s_count`, `n_count`) and each
+    // pick is a branch, as GCC compiles libzstd's loop: with selects, every
+    // pick waits for the load the previous one chose, and picks come in
+    // runs that predict well. The same picks as libzstd's, which reads the
+    // counts from the table each time: only the node created here changes
+    // a count, see below. (The loads are clamped to the table: an index past
+    // it, which libzstd would read, is only reached by picking the -1
+    // sentinel, which counts that sum below 2^31 never do.)
+    let count_at = |nodes: &NodeTable, i: i32| h!(nodes, i.clamp(-1, 2 * STARTNODE - 2)).count;
+    let mut s_count = count_at(nodes, low_s);
+    let mut n_count = count_at(nodes, low_n);
     while node_nb <= node_root {
-        let n1 = if h!(nodes, low_s).count < h!(nodes, low_n).count {
+        let (n1, c1) = if s_count < n_count {
+            let picked = (low_s, s_count);
             low_s -= 1;
-            low_s + 1
+            s_count = count_at(nodes, low_s);
+            picked
         } else {
+            let picked = (low_n, n_count);
             low_n += 1;
-            low_n - 1
+            n_count = count_at(nodes, low_n);
+            picked
         };
-        let n2 = if h!(nodes, low_s).count < h!(nodes, low_n).count {
+        let (n2, c2) = if s_count < n_count {
+            let picked = (low_s, s_count);
             low_s -= 1;
-            low_s + 1
+            s_count = count_at(nodes, low_s);
+            picked
         } else {
+            let picked = (low_n, n_count);
             low_n += 1;
-            low_n - 1
+            n_count = count_at(nodes, low_n);
+            picked
         };
-        h!(nodes, node_nb).count = h!(nodes, n1).count.wrapping_add(h!(nodes, n2).count);
+        let c = c1.wrapping_add(c2);
+        h!(nodes, node_nb).count = c;
+        if low_n == node_nb {
+            n_count = c; // was its placeholder count
+        }
         h!(nodes, n1).parent = node_nb as u16;
         h!(nodes, n2).parent = node_nb as u16;
         node_nb += 1;
