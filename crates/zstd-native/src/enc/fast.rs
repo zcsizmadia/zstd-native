@@ -1961,6 +1961,69 @@ fn ext_dict_generic<const MLS: u32>(
     iend as usize - anchor as usize
 }
 
+/// ~random data, unlikely to match: read instead of an invalid table
+/// candidate (libzstd's `dummy` arrays, see [`select_addr`]).
+static DUMMY8: [u8; 8] = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0];
+
+/// `ZSTD_selectAddr()`: `candidate` if `valid`, else an 8-byte dummy
+/// array, without a branch (`cmov`).
+#[inline(always)]
+pub(crate) fn select_addr(valid: bool, candidate: *const u8) -> *const u8 {
+    core::hint::select_unpredictable(valid, candidate, DUMMY8.as_ptr())
+}
+
+/// `eq && valid`, for a table candidate read through [`select_addr`]: the
+/// bytes are compared first, and the validity tested only when they match
+/// (rare), so neither branch is mispredicted on stale entries
+/// (`ZSTD_match4Found_cmov`). The empty `asm!` keeps the compiler from
+/// testing `valid` first (libzstd's `__asm__("")` there).
+#[allow(unsafe_code)]
+#[inline(always)]
+pub(crate) fn then_valid(eq: bool, valid: bool) -> bool {
+    if !eq {
+        return false;
+    }
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // SAFETY: an empty asm block, an ordering barrier for the compiler.
+    unsafe {
+        core::arch::asm!("", options(nomem, nostack, preserves_flags));
+    }
+    valid
+}
+
+/// Whether the table candidate at `cand` (readable if `valid`) matches the
+/// 4 (or with `LONG` 8) bytes at `ip`, and is `valid`. With `CMOV`
+/// (`ZSTD_match4Found_cmov`), an invalid candidate reads a dummy array
+/// instead, and `valid` is tested only when the bytes match; otherwise
+/// (`ZSTD_match4Found_branch`) `valid` is tested first, which is faster when
+/// nearly every candidate is valid (large windows).
+///
+/// # Safety
+/// `ip..ip + 8` is readable, and `cand..cand + 8` if `valid`.
+#[allow(unsafe_code)]
+#[inline(always)]
+pub(crate) unsafe fn cand_match<const CMOV: bool, const LONG: bool>(
+    valid: bool,
+    cand: *const u8,
+    ip: *const u8,
+) -> bool {
+    // SAFETY: per the caller; the dummy array has 8 bytes.
+    unsafe {
+        let rd = |p: *const u8| {
+            if LONG {
+                read_le64(p)
+            } else {
+                u64::from(read32(p))
+            }
+        };
+        if CMOV {
+            then_valid(rd(select_addr(valid, cand)) == rd(ip), valid)
+        } else {
+            valid && rd(cand) == rd(ip)
+        }
+    }
+}
+
 /// `ZSTD_index_overlap_check()`: whether a 4-byte read at `rep_index`
 /// stays in one segment (at least 4 bytes below `prefix_lowest_index`, or
 /// in the prefix).
