@@ -43,11 +43,13 @@ On this Windows machine, cargo is in `~/.cargo/bin` (not on PATH in Bash).
   encoder's bit writers (`enc/bitwriter.rs`, `enc/huf_enc.rs`: 8-byte
   flushes) and its run-time dispatch to `#[target_feature]` loops
   (`enc/seq_store.rs`, the BMI2 lazy parsers and searches in
-  `enc/lazy.rs`), the `madvise` syscall that puts large match finder
-  tables on huge pages (`enc/table.rs`), the output writes in
-  `decoder.rs`, and the `align_hot_loop!` macro in `lib.rs` (an `asm!`
-  alignment directive before the hot loops). New `unsafe` needs a
-  benchmark showing the gain.
+  `enc/lazy.rs`, the extDict loops of `enc/fast.rs` and `enc/dfast.rs`
+  and the dictMatchState loop of `enc/fast.rs`), the `madvise` syscall
+  that puts large match finder tables on huge pages (`enc/table.rs`),
+  the output writes in `decoder.rs`, the `align_hot_loop!` macro in
+  `lib.rs` (an `asm!` alignment directive before the hot loops) and
+  `then_valid` in `enc/fast.rs` (an empty `asm!` that keeps a branch
+  order). New `unsafe` needs a benchmark showing the gain.
 - Every performance-related change, however small (a prefetch, an
   alignment directive, a refactor of hot code), is benchmarked on the
   EPYC host before it's committed: several binary copies run interleaved,
