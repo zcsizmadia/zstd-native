@@ -126,10 +126,10 @@ pub struct StreamDecoder {
     fh: Option<FrameHeader>,
     block_max: usize,
     window: usize,
-    /// Write position, start of the current segment, and output not yet
-    /// copied out (`flush..cur`).
+    /// Write position and output not yet copied out (`flush..cur`). The
+    /// current segment always starts at 0 (a frame starts there, and a
+    /// wrap goes back there).
     cur: usize,
-    prefix: usize,
     flush: usize,
     /// End of the previous segment after a wrap (its history).
     old_end: Option<usize>,
@@ -175,7 +175,6 @@ impl StreamDecoder {
             block_max: 0,
             window: 0,
             cur: 0,
-            prefix: 0,
             flush: 0,
             old_end: None,
             direct: false,
@@ -456,7 +455,6 @@ impl StreamDecoder {
         // decoded directly never needs it.
         self.win_size = window + 2 * self.block_max + 2 * WILDCOPY_OVERLENGTH;
         self.cur = 0;
-        self.prefix = 0;
         self.flush = 0;
         self.old_end = None;
         self.direct = false;
@@ -547,7 +545,6 @@ impl StreamDecoder {
         if self.cur + self.block_max + WILDCOPY_OVERLENGTH > self.win_size {
             self.old_end = Some(self.cur);
             self.cur = 0;
-            self.prefix = 0;
             self.flush = 0;
         }
         let start = self.cur;
@@ -628,7 +625,8 @@ impl StreamDecoder {
                 size,
                 src,
                 &mut wout,
-                self.prefix,
+                // The segment starts at 0: its history is all in `dict`.
+                0,
                 dict,
                 self.dict.as_ref().and_then(Dictionary::entropy),
                 self.block_max,
