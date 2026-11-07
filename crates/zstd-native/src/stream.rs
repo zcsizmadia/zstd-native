@@ -354,7 +354,8 @@ impl StreamDecoder {
                         // The whole block is in the input: decode in place.
                         ip += need;
                         let src = &input[ip - need..ip];
-                        self.decode_block(btype, size, src, out, vec.as_deref_mut())?;
+                        let left = input.len() - ip;
+                        self.decode_block(btype, size, src, left, out, vec.as_deref_mut())?;
                     } else {
                         let take = (need - self.in_buf.len()).min(rest.len());
                         self.in_buf.extend_from_slice(&rest[..take]);
@@ -363,7 +364,8 @@ impl StreamDecoder {
                             break;
                         }
                         let buf = core::mem::take(&mut self.in_buf);
-                        let r = self.decode_block(btype, size, &buf, out, vec.as_deref_mut());
+                        let left = input.len() - ip;
+                        let r = self.decode_block(btype, size, &buf, left, out, vec.as_deref_mut());
                         self.in_buf = buf;
                         self.in_buf.clear();
                         r?;
@@ -487,13 +489,14 @@ impl StreamDecoder {
     /// Decodes one block (everything before was flushed): into the
     /// caller's output when the frame is direct (or can become direct: at
     /// its start, with room for the block), else into the window at `cur`.
-    /// `src` is the block's content (1 byte for RLE). `out` and `vec` are
-    /// as in [`run`](Self::run).
+    /// `src` is the block's content (1 byte for RLE), `input_left` the
+    /// caller's input after it. `out` and `vec` are as in [`run`](Self::run).
     fn decode_block(
         &mut self,
         btype: u8,
         size: usize,
         src: &[u8],
+        input_left: usize,
         out: &mut Output,
         vec: Option<&mut Vec<u8>>,
     ) -> Result<()> {
@@ -515,8 +518,16 @@ impl StreamDecoder {
                 {
                     // Frame start: room for the whole frame, within the
                     // window limit (no more than the window buffer that
-                    // isn't needed now).
-                    let want = cs.min(self.window_max) as usize;
+                    // isn't needed now), and no more than the input at
+                    // hand can produce: every further block takes at least
+                    // 4 input bytes (header and RLE byte) for at most
+                    // `block_max` bytes. A few bytes claiming a huge content
+                    // size can't make this allocate; real frames are far
+                    // below that bound and still get the whole size here.
+                    let can = (input_left / 4)
+                        .saturating_mul(self.block_max)
+                        .saturating_add(need) as u64;
+                    let want = cs.min(self.window_max).min(can) as usize;
                     reserve(v, out, want + WILDCOPY_OVERLENGTH)?;
                 }
                 reserve(v, out, need + WILDCOPY_OVERLENGTH)?;
