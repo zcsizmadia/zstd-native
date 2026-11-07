@@ -23,7 +23,7 @@ use super::compress::{
     build_sequences_statistics, entropy_compress_seq_store, is_rle,
 };
 use super::fse_enc::FseCTable;
-use super::hist::{hist_count, hist_count_fast};
+use super::hist::{hist_count, hist_count_codes};
 use super::huf_enc::{
     HUF_FLAGS_OPTIMAL_DEPTH, HufCTable, HufRepeat, huf_build_ctable, huf_estimate_compressed_size,
     huf_optimal_table_log, huf_validate_ctable, huf_write_ctable,
@@ -317,7 +317,7 @@ fn estimate_symbol_type_size<const N: usize, const S: usize>(
     let nb_seq = codes.len();
     let mut count = [0u32; 256];
     let mut max = max_code;
-    hist_count_fast(&mut count, &mut max, codes); // can't fail
+    hist_count_codes(&mut count, &mut max, codes);
     let mut bits = match encoding {
         SET_BASIC => cross_entropy_cost(default_norm, default_norm_log, &count, max),
         SET_RLE => 0,

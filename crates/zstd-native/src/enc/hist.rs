@@ -72,9 +72,9 @@ fn hist_count_parallel(
     // and each increment waits for the previous one's store; twice the
     // lanes halve the length of those chains. The sums are the same.
     let (c, max) = if src.len() < LANES8_MIN {
-        count_lanes::<4>(src)
+        count_lanes::<4, 256>(src)
     } else {
-        count_lanes::<8>(src)
+        count_lanes::<8, 256>(src)
     };
     let mut max_sv = 255;
     while c[max_sv] == 0 {
@@ -95,28 +95,31 @@ const LANES8_MIN: usize = 8 * 1024;
 /// counted in lanes.
 pub(crate) fn hist_largest_count(src: &[u8]) -> u32 {
     if src.len() < LANES8_MIN {
-        count_lanes::<4>(src).1
+        count_lanes::<4, 256>(src).1
     } else {
-        count_lanes::<8>(src).1
+        count_lanes::<8, 256>(src).1
     }
 }
 
-/// The histogram of `src` counted in `L` lane tables, summed; and the
-/// largest count.
+/// The histogram of `src` counted in `L` lane tables of `N` entries (a
+/// power of two; every byte must be below it), summed; and the largest
+/// count.
 #[inline(always)]
-fn count_lanes<const L: usize>(src: &[u8]) -> ([u32; 256], u32) {
-    let mut c = [[0u32; 256]; L];
+fn count_lanes<const L: usize, const N: usize>(src: &[u8]) -> ([u32; N], u32) {
+    const { assert!(N.is_power_of_two() && N <= 256) };
+    debug_assert!(N == 256 || src.iter().all(|&b| (b as usize) < N));
+    let mut c = [[0u32; N]; L];
     let (chunks, rest) = src.as_chunks::<L>();
     for w in chunks {
         for (lane, &b) in c.iter_mut().zip(w) {
-            lane[b as usize] += 1;
+            lane[b as usize % N] += 1;
         }
     }
     for &b in rest {
-        c[0][b as usize] += 1;
+        c[0][b as usize % N] += 1;
     }
     let mut max = 0;
-    for s in 0..256 {
+    for s in 0..N {
         let mut v = 0;
         for lane in &c {
             v += lane[s];
@@ -143,6 +146,43 @@ pub(crate) fn hist_count_fast(
     // Can't fail without `check`.
     hist_count_parallel(count, max_symbol_value, src, false).unwrap_or(0)
 }
+
+/// [`hist_count_fast`] for the sequence codes (every byte of `src` and
+/// `*max_symbol_value` below [`CODES`]), with the same results. Lane
+/// tables of [`CODES`] entries instead of 256 cost a quarter to clear and
+/// sum, so they pay off from [`CODES_LANES_MIN`] codes on, where libzstd
+/// counts in one table up to 1500: on the small blocks of dictionary
+/// frames and flushes, runs of one code (repcodes, short lengths) make
+/// each increment wait for the one before.
+pub(crate) fn hist_count_codes(
+    count: &mut [u32; 256],
+    max_symbol_value: &mut u32,
+    src: &[u8],
+) -> u32 {
+    debug_assert!((*max_symbol_value as usize) < CODES);
+    if src.len() < CODES_LANES_MIN {
+        return hist_count_simple(count, max_symbol_value, src);
+    }
+    let (c, max) = if src.len() < LANES8_MIN {
+        count_lanes::<4, CODES>(src)
+    } else {
+        count_lanes::<8, CODES>(src)
+    };
+    let mut max_sv = CODES - 1;
+    while c[max_sv] == 0 {
+        max_sv -= 1;
+    }
+    let count_len = *max_symbol_value as usize + 1;
+    *max_symbol_value = max_sv as u32;
+    count[..count_len].copy_from_slice(&c[..count_len]);
+    max
+}
+
+/// The sequence codes are below this ([`hist_count_codes`]).
+pub(crate) const CODES: usize = 64;
+
+/// [`hist_count_codes`] counts this many codes or more in lanes.
+const CODES_LANES_MIN: usize = 64;
 
 /// libzstd's `HIST_count_wksp`: like [`hist_count_fast`] but returns
 /// [`Error::Corrupted`] (libzstd's `maxSymbolValue_tooSmall`) if a byte is
@@ -234,5 +274,36 @@ mod tests {
         assert_eq!(&count[..9], &[1, 1, 2, 0, 0, 3, 0, 0, 9]);
         let mut max = 4;
         assert!(hist_count(&mut count, &mut max, &src).is_err());
+    }
+
+    /// [`hist_count_codes`] gives [`hist_count_fast`]'s results for codes
+    /// (below 64), around its thresholds, with the table entries above
+    /// the given maximum untouched.
+    #[test]
+    fn codes_match_fast() {
+        let (ns, alphas): (&[usize], &[u32]) = if cfg!(miri) {
+            (&[63, 64, 700], &[2, 53])
+        } else {
+            (
+                &[1, 2, 63, 64, 65, 600, 1499, 1500, 8191, 8192, 30000],
+                &[1, 2, 32, 36, 53, 64],
+            )
+        };
+        for &n in ns {
+            for &alpha in alphas {
+                let src = data(n, n as u64 * 7 + u64::from(alpha), alpha);
+                for &max_in in &[31u32, 35, 52, 63] {
+                    if src.iter().any(|&b| u32::from(b) > max_in) {
+                        continue;
+                    }
+                    let (mut a, mut b) = ([7u32; 256], [7u32; 256]);
+                    let (mut ma, mut mb) = (max_in, max_in);
+                    let la = hist_count_codes(&mut a, &mut ma, &src);
+                    let lb = hist_count_fast(&mut b, &mut mb, &src);
+                    assert_eq!((la, ma), (lb, mb), "n={n} alpha={alpha} max={max_in}");
+                    assert_eq!(a, b, "n={n} alpha={alpha} max={max_in}");
+                }
+            }
+        }
     }
 }
