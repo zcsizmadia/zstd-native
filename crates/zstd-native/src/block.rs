@@ -9,6 +9,7 @@
 //! and every literal buffer carries that much slack; the last sequences
 //! of a buffer take the exact (slow) path, as in libzstd.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ptr;
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -17,7 +18,7 @@ use crate::bits::{BitReader, SeqBits};
 use crate::cpu::Features;
 use crate::error::{Error, Result};
 use crate::fse::{self, LL_KIND, ML_KIND, OF_KIND, SeqSymbol, SeqTables};
-use crate::huf::{self, HufTable};
+use crate::huf::{self, HufRef, HufTable};
 
 pub(crate) const WILDCOPY_OVERLENGTH: usize = 32;
 pub(crate) const BLOCK_SIZE_MAX: usize = 128 << 10;
@@ -65,7 +66,19 @@ impl Entropy {
 /// Decoder state for blocks: entropy tables plus the literals buffer.
 #[derive(Debug)]
 pub(crate) struct BlockDecoder {
+    /// The decoder's own tables and the repeat offsets. A frame with a
+    /// dictionary starts on the dictionary's tables in place (libzstd's
+    /// `ZSTD_copyDDictParameters` points at the `ZSTD_DDict`'s): `huf_dict`
+    /// and `seq_dict` say which of `ent.huf` and `ent.seq` the dictionary's
+    /// stand in for, until a block brings its own.
     pub ent: Entropy,
+    huf_dict: bool,
+    seq_dict: bool,
+    /// The double-symbol table of the dictionary's Huffman table, built on
+    /// its first use after the first frame (`dict_x2_ready`, cleared when
+    /// the dictionary changes).
+    dict_x2: Option<Box<huf::X2Table>>,
+    dict_x2_ready: bool,
     /// Decoded literals, always with `WILDCOPY_OVERLENGTH` readable bytes
     /// after the last literal.
     lit_buf: Vec<u8>,
@@ -86,9 +99,37 @@ impl BlockDecoder {
     pub(crate) fn new() -> Self {
         BlockDecoder {
             ent: Entropy::new(),
+            huf_dict: false,
+            seq_dict: false,
+            dict_x2: None,
+            dict_x2_ready: false,
             lit_buf: Vec::new(),
             cpu: Features::detect(),
             dict_cold: false,
+        }
+    }
+
+    /// The decoder's dictionary was replaced (or removed).
+    pub(crate) fn dict_changed(&mut self) {
+        self.dict_x2_ready = false;
+    }
+
+    /// Entropy state at the start of a frame: the dictionary's tables and
+    /// repeat offsets (`dict`, used in place), or none.
+    pub(crate) fn start_frame(&mut self, dict: Option<&Entropy>) {
+        match dict {
+            Some(e) => {
+                self.ent.huf_ok = e.huf_ok;
+                self.ent.fse_ok = e.fse_ok;
+                self.ent.rep = e.rep;
+                self.huf_dict = true;
+                self.seq_dict = true;
+            }
+            None => {
+                self.ent.reset();
+                self.huf_dict = false;
+                self.seq_dict = false;
+            }
         }
     }
 
@@ -102,21 +143,24 @@ impl BlockDecoder {
 
     /// Decodes one compressed block of a frame. `out.pos - prefix` bytes of
     /// the frame are already in the output, and `dict` precedes them.
+    /// `dict_ent` is the entropy of the dictionary given to `start_frame`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn decode_block(
         &mut self,
         src: &[u8],
         out: &mut Output,
         prefix: usize,
         dict: &[u8],
+        dict_ent: Option<&Entropy>,
         block_max: usize,
     ) -> Result<()> {
         if src.len() > block_max {
             return Err(Error::Corrupted);
         }
         let room = (out.cap - out.pos).min(block_max);
-        let (lits, used) = self.decode_literals(src, block_max, room)?;
+        let (lits, used) = self.decode_literals(src, block_max, room, dict_ent)?;
         let src = &src[used..];
-        let (nb_seq, used) = self.decode_seq_headers(src)?;
+        let (nb_seq, used) = self.decode_seq_headers(src, dict_ent)?;
         let seq_src = &src[used..];
         let cold = core::mem::take(&mut self.dict_cold);
         if nb_seq == 0 {
@@ -134,7 +178,10 @@ impl BlockDecoder {
             return Ok(());
         }
         self.ent.fse_ok = true;
-        let tables = &self.ent.seq;
+        let tables = match (self.seq_dict, dict_ent) {
+            (true, Some(e)) => &e.seq,
+            _ => &self.ent.seq,
+        };
         let long = use_prefetch_loop(cold);
         let mut rep = self.ent.rep.map(|r| r as usize);
         // A block regenerates at most `block_max` bytes (the format's
@@ -175,6 +222,7 @@ impl BlockDecoder {
         src: &[u8],
         block_max: usize,
         room: usize,
+        dict_ent: Option<&Entropy>,
     ) -> Result<(Literals, usize)> {
         if src.len() < 2 {
             return Err(Error::Corrupted);
@@ -285,18 +333,47 @@ impl BlockDecoder {
                     }
                     csrc = &csrc[h..];
                     self.ent.huf_ok = true;
+                    self.huf_dict = false;
                 }
                 let cpu = self.cpu;
                 let need = lit_size + WILDCOPY_OVERLENGTH;
                 if self.lit_buf.len() < need {
                     self.lit_buf.resize(need.max(4096), 0);
                 }
+                let (table, x2) = match (self.huf_dict, dict_ent) {
+                    (true, Some(e)) if self.dict_cold => {
+                        // The table of a cold dictionary, at any size
+                        // (libzstd prefetches over 768 literals; the
+                        // single-stream decode of fewer is a chain of
+                        // dependent misses: 4 KiB frames, 1.0-2.0 us
+                        // faster). Single-symbol: half the cache lines.
+                        e.huf.touch();
+                        (HufRef::Shared(&e.huf, None), false)
+                    }
+                    (true, Some(e)) => {
+                        // A dictionary in use for more than one frame: its
+                        // double-symbol table (libzstd's dictionaries hold
+                        // only that one), built once into our own space.
+                        let x2 = e.huf.x2_capable() && huf::prefer_x2_built(lit_size, lit_csize);
+                        if x2 && !self.dict_x2_ready {
+                            let dt2 = self.dict_x2.get_or_insert_with(|| Box::new([0; 2048]));
+                            self.ent.huf.build_x2_of(&e.huf, dt2);
+                            self.dict_x2_ready = true;
+                        }
+                        let dt2 = self.dict_x2.as_deref().filter(|_| x2);
+                        (HufRef::Shared(&e.huf, dt2), x2)
+                    }
+                    (true, None) => return Err(Error::Corrupted),
+                    (false, _) => (
+                        HufRef::Own(&mut self.ent.huf),
+                        !single && huf::prefer_x2(lit_size, lit_csize),
+                    ),
+                };
                 let out = &mut self.lit_buf[..lit_size];
                 if single {
-                    huf::decode_1x(out, csrc, &self.ent.huf)?;
+                    huf::decode_1x(out, csrc, table.get(), table.shared_x2())?;
                 } else {
-                    let x2 = huf::prefer_x2(lit_size, lit_csize);
-                    huf::decode_4x(out, csrc, &mut self.ent.huf, x2, cpu)?;
+                    huf::decode_4x(out, csrc, table, x2, cpu)?;
                 }
                 Ok((
                     Literals {
@@ -310,7 +387,11 @@ impl BlockDecoder {
     }
 
     /// Sequences section header (libzstd's `ZSTD_decodeSeqHeaders`).
-    fn decode_seq_headers(&mut self, src: &[u8]) -> Result<(usize, usize)> {
+    fn decode_seq_headers(
+        &mut self,
+        src: &[u8],
+        dict_ent: Option<&Entropy>,
+    ) -> Result<(usize, usize)> {
         let Some(&b0) = src.first() else {
             return Err(Error::Corrupted);
         };
@@ -344,6 +425,31 @@ impl BlockDecoder {
             return Err(Error::Corrupted);
         }
         ip += 1;
+        if self.seq_dict {
+            let Some(e) = dict_ent else {
+                return Err(Error::Corrupted);
+            };
+            if modes & 0xFC == 0xFC {
+                // Three repeats: the dictionary's tables stay in use.
+                if self.dict_cold {
+                    // The tables of a cold dictionary, for any number of
+                    // sequences (libzstd: over 24; 256-byte frames measured
+                    // 0.3-1.1 us faster without that limit).
+                    for kind in [LL_KIND, OF_KIND, ML_KIND] {
+                        let n = 1 << e.seq.log[kind.index];
+                        touch_area(&e.seq.cells[kind.region..kind.region + n]);
+                    }
+                }
+                return Ok((nb_seq, ip));
+            }
+            // A new table: the repeated ones join it in our own tables.
+            for (shift, kind) in [(6, LL_KIND), (4, OF_KIND), (2, ML_KIND)] {
+                if (modes >> shift) & 3 == 3 {
+                    self.ent.seq.copy_kind(&e.seq, kind);
+                }
+            }
+            self.seq_dict = false;
+        }
         let fse_ok = self.ent.fse_ok;
         let t = &mut self.ent.seq;
         let cpu = self.cpu;
@@ -491,6 +597,21 @@ fn prefetch_l1(p: *const u8) {
     }
     #[cfg(not(all(target_arch = "x86_64", not(miri))))]
     let _ = p;
+}
+
+/// Loads a value from every cache line of `area`: libzstd's
+/// `PREFETCH_AREA` for the tables of a dictionary just installed (likely
+/// out of cache), before a block looks them up at random, one dependent
+/// miss after the other. With loads instead of libzstd's `prefetcht1`:
+/// independent misses that overlap, where the software prefetches did
+/// little on Zen 3 (EPYC 7543, 4 KiB frames with a 110 KiB dictionary:
+/// 24.5 us per frame with prefetches, 21.0 us with loads).
+#[inline]
+pub(crate) fn touch_area<T: Copy>(area: &[T]) {
+    let step = (64 / core::mem::size_of::<T>()).max(1);
+    for x in area.iter().step_by(step) {
+        core::hint::black_box(*x);
+    }
 }
 
 /// libzstd's `ZSTD_prefetchMatch`: prefetches the first two cache lines

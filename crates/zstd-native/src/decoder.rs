@@ -70,6 +70,7 @@ impl Decompressor {
 
     /// Replaces (or removes) the dictionary.
     pub fn set_dictionary(&mut self, dict: Option<Dictionary>) {
+        self.block.dict_changed();
         self.dict_fresh = dict.is_some();
         self.dict = dict;
     }
@@ -160,23 +161,21 @@ impl Decompressor {
         }
         let dict: &[u8] = match &self.dict {
             Some(d) => {
-                if fh.dict_id != 0 && fh.dict_id != d.id {
+                if fh.dict_id != 0 && fh.dict_id != d.id() {
                     return Err(Error::DictionaryMismatch);
                 }
-                match &d.entropy {
-                    Some(e) => self.block.ent.clone_from(e),
-                    None => self.block.ent.reset(),
-                }
-                &d.content
+                self.block.start_frame(d.entropy());
+                d.content()
             }
             None => {
                 if fh.dict_id != 0 {
                     return Err(Error::DictionaryMismatch);
                 }
-                self.block.ent.reset();
+                self.block.start_frame(None);
                 &[]
             }
         };
+        let dict_ent = self.dict.as_ref().and_then(Dictionary::entropy);
         // libzstd's `ddictIsCold`: the first frame after the dictionary was
         // installed (a frame without compressed blocks clears it too).
         self.block.dict_cold = core::mem::take(&mut self.dict_fresh) && self.dict.is_some();
@@ -255,8 +254,14 @@ impl Decompressor {
                     if let Sink::Vec(v) = sink {
                         reserve(v, out, block_max + WILDCOPY_OVERLENGTH)?;
                     }
-                    self.block
-                        .decode_block(&src[ip..ip + bsize], out, prefix, dict, block_max)?;
+                    self.block.decode_block(
+                        &src[ip..ip + bsize],
+                        out,
+                        prefix,
+                        dict,
+                        dict_ent,
+                        block_max,
+                    )?;
                     ip += bsize;
                 }
                 _ => return Err(Error::Corrupted),

@@ -1411,7 +1411,7 @@ mod tests {
     use super::*;
     use crate::cpu::Features;
     use crate::fse::decompress_weights;
-    use crate::huf::{HufTable, decode_1x, decode_4x};
+    use crate::huf::{HufRef, HufTable, decode_1x, decode_4x};
     use alloc::boxed::Box;
     use alloc::vec::Vec;
 
@@ -1719,6 +1719,7 @@ mod tests {
         let mut r = Rng(0xDEAD_BEEF);
         let cpu = Features::detect();
         let mut dt = Box::new(HufTable::new());
+        let mut scratch = Box::new(HufTable::new());
         for iter in 0..1500 {
             let len = 12 + r.below(if iter % 5 == 0 { 128 * 1024 - 12 } else { 3000 }) as usize;
             let src = skewed(&mut r, len, iter % 4);
@@ -1755,8 +1756,21 @@ mod tests {
             assert!(c1 > 0);
             assert!(c1 >= estimate && c1 <= estimate + 2, "iter {iter}");
             let mut out = alloc::vec![0u8; len];
-            decode_1x(&mut out, &buf[..c1], &dt).unwrap_or_else(|e| panic!("iter {iter}: {e:?}"));
+            decode_1x(&mut out, &buf[..c1], &dt, None)
+                .unwrap_or_else(|e| panic!("iter {iter}: {e:?}"));
             assert_eq!(out, src, "iter {iter}");
+            // The double-symbol table built aside, as for a dictionary's.
+            let dt2 = dt.x2_capable().then(|| {
+                let mut dt2 = Box::new([0u32; 2048]);
+                scratch.build_x2_of(&dt, &mut dt2);
+                dt2
+            });
+            if let Some(dt2) = &dt2 {
+                let mut out2 = alloc::vec![0u8; len];
+                decode_1x(&mut out2, &buf[..c1], &dt, Some(dt2))
+                    .unwrap_or_else(|e| panic!("iter {iter} x2: {e:?}"));
+                assert_eq!(out2, src, "iter {iter} x2");
+            }
             // Tight buffers (the bounds-checked loop): the same bytes, or 0
             // when the complete bytes reach `capacity - 8`
             // (HUF_closeCStream's `ptr >= endPtr`).
@@ -1777,9 +1791,14 @@ mod tests {
                 assert!(c4 > 0);
                 for x2 in [false, true] {
                     out.fill(0);
-                    decode_4x(&mut out, &buf[..c4], &mut dt, x2, cpu)
+                    decode_4x(&mut out, &buf[..c4], HufRef::Own(&mut dt), x2, cpu)
                         .unwrap_or_else(|e| panic!("iter {iter}: {e:?}"));
                     assert_eq!(out, src, "iter {iter}");
+                    out.fill(0);
+                    let shared = HufRef::Shared(&dt, dt2.as_deref());
+                    decode_4x(&mut out, &buf[..c4], shared, x2, cpu)
+                        .unwrap_or_else(|e| panic!("iter {iter} shared: {e:?}"));
+                    assert_eq!(out, src, "iter {iter} shared");
                 }
             }
         }
@@ -1809,7 +1828,7 @@ mod tests {
                 let c = huf_compress1x_using_ctable(&mut buf, &src, &ct);
                 if c > 0 {
                     let mut out = alloc::vec![0u8; len];
-                    decode_1x(&mut out, &buf[..c], &dt).unwrap();
+                    decode_1x(&mut out, &buf[..c], &dt, None).unwrap();
                     assert_eq!(out, src);
                 }
                 let _ = huf_compress4x_using_ctable(&mut buf, &src, &ct);
@@ -1874,9 +1893,9 @@ mod tests {
             };
             let mut out = alloc::vec![0u8; len];
             if four {
-                decode_4x(&mut out, streams, &mut dt, iter % 3 == 0, cpu)
+                decode_4x(&mut out, streams, HufRef::Own(&mut dt), iter % 3 == 0, cpu)
             } else {
-                decode_1x(&mut out, streams, &dt)
+                decode_1x(&mut out, streams, &dt, None)
             }
             .unwrap_or_else(|e| panic!("iter {iter}: {e:?}"));
             assert_eq!(out, src, "iter {iter}");
