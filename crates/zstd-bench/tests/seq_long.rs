@@ -10,7 +10,7 @@
 
 use std::sync::Mutex;
 
-use zstd_bench::{Rng, c_compress, log_corpus, numeric_corpus, source_corpus};
+use zstd_bench::{c_compress, log_corpus, numeric_corpus, source_corpus};
 use zstd_native::__private::{long_blocks, set_seq_loop};
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -19,6 +19,7 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+#[cfg(target_pointer_width = "64")]
 fn c_decompress(src: &[u8], cap: usize) -> Vec<u8> {
     zstd::bulk::Decompressor::new()
         .unwrap()
@@ -36,8 +37,9 @@ fn count_long<T>(f: impl FnOnce() -> T) -> (T, Option<usize>) {
 
 /// `a`, then `a` again in pieces of 200-600 bytes with 1-8 random bytes
 /// after each: every piece is a new match about `a.len()` back.
+#[cfg(target_pointer_width = "64")]
 fn far_copies(a_len: usize, seed: u64) -> Vec<u8> {
-    let mut r = Rng::new(seed);
+    let mut r = zstd_bench::Rng::new(seed);
     let a: Vec<u8> = (0..a_len).map(|_| r.next_u64() as u8).collect();
     let mut v = a.clone();
     let mut p = 0;
@@ -52,6 +54,7 @@ fn far_copies(a_len: usize, seed: u64) -> Vec<u8> {
     v
 }
 
+#[cfg(target_pointer_width = "64")]
 fn compress_far(data: &[u8], level: i32, wlog: u32) -> Vec<u8> {
     let mut enc = zstd::bulk::Compressor::new(level).unwrap();
     enc.long_distance_matching(true).unwrap();
