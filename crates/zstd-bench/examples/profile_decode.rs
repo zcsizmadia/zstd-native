@@ -16,6 +16,11 @@
 //! Dataset `cat-dup` is `cat` followed by a copy with a few bytes changed
 //! every 1-8 KiB (two versions of a big file: matches a whole `cat` back,
 //! for long distance matching).
+//!
+//! `$ZSTD_BENCH_DICT=<bytes>` decodes with a dictionary instead: the dataset
+//! cut into chunks of that size, each compressed on its own with a 110 KiB
+//! dictionary trained on them, all decoded per iteration by one
+//! decompressor holding the dictionary (lib `native*` or `c`).
 
 use std::time::Instant;
 
@@ -39,9 +44,19 @@ fn main() {
             .1
     };
     let params = CompressParams::from_env();
+    // `$ZSTD_BENCH_DICT`: the dictionary and the chunks' frames.
+    let dict_mode = std::env::var("ZSTD_BENCH_DICT").ok().map(|s| {
+        let chunk: usize = s.parse().unwrap();
+        let chunks: Vec<&[u8]> = data.chunks(chunk).collect();
+        let dict = zstd::dict::from_samples(&chunks, 110 << 10).unwrap();
+        let mut c = zstd::bulk::Compressor::with_dictionary(level, &dict).unwrap();
+        let frames: Vec<Vec<u8>> = chunks.iter().map(|ch| c.compress(ch).unwrap()).collect();
+        (dict, frames)
+    });
     // `ZSTD_BENCH_COMP_CACHE=dir` keeps the compressed input on disk, so
     // repeated A/B runs at high levels don't recompress every time.
     let comp = match std::env::var("ZSTD_BENCH_COMP_CACHE") {
+        _ if dict_mode.is_some() => Vec::new(),
         Ok(dir) => {
             let cut = match std::env::var("ZSTD_BENCH_CAT_MB") {
                 Ok(mb) if ds.starts_with("cat") => format!(".{mb}m"),
@@ -73,8 +88,16 @@ fn main() {
         "native-asm" => Some(true),
         _ => None,
     });
-    let mut native = zstd_native::Decompressor::new();
-    let mut c = zstd::bulk::Decompressor::new().unwrap();
+    let (mut native, mut c) = match &dict_mode {
+        Some((dict, _)) => (
+            zstd_native::Decompressor::with_dictionary(zstd_native::Dictionary::new(dict).unwrap()),
+            zstd::bulk::Decompressor::with_dictionary(dict).unwrap(),
+        ),
+        None => (
+            zstd_native::Decompressor::new(),
+            zstd::bulk::Decompressor::new().unwrap(),
+        ),
+    };
     let mut sd = structured_zstd::decoding::FrameDecoder::new();
     // `ZSTD_BENCH_ITERS=n` runs exactly n iterations instead of `secs`
     // (fixed work for `perf stat` instruction counts).
@@ -97,6 +120,19 @@ fn main() {
                 c_stream_mode(mode, &comp, &mut out, &mut c_push)
             };
             assert_eq!(len, data.len());
+            n += 1;
+            continue;
+        }
+        if let Some((_, frames)) = &dict_mode {
+            let mut o = 0;
+            for f in frames {
+                o += if lib.starts_with("native") {
+                    native.decompress_to_slice(f, &mut out[o..]).unwrap()
+                } else {
+                    c.decompress_to_buffer(f, &mut out[o..]).unwrap()
+                };
+            }
+            assert_eq!(o, data.len());
             n += 1;
             continue;
         }
@@ -139,9 +175,12 @@ fn main() {
         eprintln!("prefetching loop: {b} blocks in {n} runs");
     }
     let el = t.elapsed().as_secs_f64();
+    let comp_len = dict_mode
+        .as_ref()
+        .map_or(comp.len(), |(_, f)| f.iter().map(Vec::len).sum());
     println!(
         "{lib} {ds} L{level}: ratio {:.2}, {:.0} MiB/s",
-        data.len() as f64 / comp.len() as f64,
+        data.len() as f64 / comp_len as f64,
         (n as f64 * data.len() as f64) / el / (1 << 20) as f64
     );
 }
