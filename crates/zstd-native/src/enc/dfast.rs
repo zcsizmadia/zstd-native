@@ -935,9 +935,14 @@ fn ext_dict_generic<const MLS: u32, const CMOV: bool>(
                 }
 
                 let (valid, ml) = cand(match_long_index);
+                // A valid candidate is read in place (checked here, debug
+                // builds only), an invalid one may read the dummy array.
+                #[cfg(debug_assertions)]
+                if valid {
+                    w.chk(ml, 8);
+                }
                 if cand_match::<CMOV, true>(valid, ml, ip) {
                     let mut match_long = w.pos(match_long_index);
-                    w.chk(match_long, 8);
                     let match_end = w.seg_end(match_long_index);
                     let low_match_ptr = w.seg_start(match_long_index);
                     let mut ml = w.count2(ip.add(8), match_long.add(8), match_end) + 8;
@@ -967,9 +972,12 @@ fn ext_dict_generic<const MLS: u32, const CMOV: bool>(
                 }
 
                 let (valid, m) = cand(match_index);
+                #[cfg(debug_assertions)]
+                if valid {
+                    w.chk(m, 4);
+                }
                 if cand_match::<CMOV, false>(valid, m, ip) {
                     let mut mtch = w.pos(match_index);
-                    w.chk(mtch, 4);
                     let h3 = hash_l(ip.add(1));
                     let match_index3 = *hash_long.add(h3);
                     let mut match3 = w.pos(match_index3);
@@ -1280,8 +1288,11 @@ fn dms_generic<const MLS: u32>(
                 // their index tested once the bytes match (meta/zstd#4866):
                 // with a short prefix (small inputs), many candidates are
                 // below it, an unpredictable branch.
+                #[cfg(debug_assertions)]
+                if match_index_l >= prefix_lowest_index {
+                    chk(match_long, 8); // read in place (debug builds only)
+                }
                 if cand_match::<true, true>(match_index_l >= prefix_lowest_index, match_long, ip) {
-                    chk(match_long, 8);
                     // check prefix long match
                     m_length = count(ip.add(8), match_long.add(8), iend) + 8;
                     offset = (ip as usize - match_long as usize) as u32;
@@ -1319,11 +1330,14 @@ fn dms_generic<const MLS: u32>(
                         m_length += 1;
                     } // catch up
                 } else {
+                    #[cfg(debug_assertions)]
+                    if match_index_s > prefix_lowest_index {
+                        chk(mtch, 4); // read in place (debug builds only)
+                    }
                     let short_found =
                         if cand_match::<true, false>(match_index_s > prefix_lowest_index, mtch, ip)
                         {
                             // short match candidate
-                            chk(mtch, 4);
                             true
                         } else if dict_tags_match_s && match_index_s <= prefix_lowest_index {
                             // check dictMatchState short match
@@ -1357,12 +1371,15 @@ fn dms_generic<const MLS: u32>(
                     let mut match_l3 = base.wrapping_add(match_index_l3 as usize);
                     *hash_long.add(hl3) = curr + 1;
 
+                    #[cfg(debug_assertions)]
+                    if match_index_l3 >= prefix_lowest_index {
+                        chk(match_l3, 8); // read in place (debug builds only)
+                    }
                     if cand_match::<true, true>(
                         match_index_l3 >= prefix_lowest_index,
                         match_l3,
                         ip.add(1),
                     ) {
-                        chk(match_l3, 8);
                         // check prefix long +1 match
                         m_length = count(ip.add(9), match_l3.add(8), iend) + 8;
                         ip = ip.add(1);

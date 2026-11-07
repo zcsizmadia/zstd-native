@@ -2500,12 +2500,17 @@ fn dms_generic<const MLS: u32>(
                 }
 
                 // ZSTD_match4Found_cmov: with a short prefix (small inputs),
-                // many candidates are below it, an unpredictable branch
+                // many candidates are below it, an unpredictable branch.
+                // A valid candidate is read in place (checked here, debug
+                // builds only), an invalid one reads the dummy array.
+                #[cfg(debug_assertions)]
+                if match_index >= prefix_start_index {
+                    chk(mtch, 4);
+                }
                 if then_valid(
                     read32(ip0) == read32(select_addr(match_index >= prefix_start_index, mtch)),
                     match_index >= prefix_start_index,
                 ) {
-                    chk(mtch, 4);
                     // found a regular match of size >= 4
                     let mut mtch = mtch;
                     let offset = (ip0 as usize - mtch as usize) as u32;
