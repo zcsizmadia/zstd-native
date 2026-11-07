@@ -18,12 +18,14 @@ use crate::bits::{BitReader, SeqBits};
 use crate::cpu::Features;
 use crate::error::{Error, Result};
 use crate::fse::{self, LL_KIND, ML_KIND, OF_KIND, SeqSymbol, SeqTables};
-use crate::huf::{self, HufRef, HufTable};
+use crate::huf::{self, HufDt, HufRef, HufTable};
 
 pub(crate) const WILDCOPY_OVERLENGTH: usize = 32;
 pub(crate) const BLOCK_SIZE_MAX: usize = 128 << 10;
 const MIN_LITERALS_FOR_4_STREAMS: usize = 6;
 const LONGNBSEQ: usize = 0x7F00;
+/// The initial size of the literal buffer.
+const LIT_BUF_MIN: usize = 4096;
 
 /// Where decoded bytes go. `ptr[..cap]` must be writable (it may be
 /// uninitialized); `ptr[..pos]` holds the output so far.
@@ -63,6 +65,18 @@ impl Entropy {
     }
 }
 
+/// A dictionary's entropy tables and repeat offsets (libzstd's
+/// `ZSTD_entropyDTables_t` in a `ZSTD_DDict`), used in place by the
+/// frames that start on them: only the single-symbol Huffman table (the
+/// decoder builds the double-symbol one into its own space), and both
+/// kinds of table always valid.
+#[derive(Clone, Debug)]
+pub(crate) struct DictEntropy {
+    pub huf: HufDt,
+    pub seq: SeqTables,
+    pub rep: [u32; 3],
+}
+
 /// Decoder state for blocks: entropy tables plus the literals buffer.
 #[derive(Debug)]
 pub(crate) struct BlockDecoder {
@@ -75,12 +89,19 @@ pub(crate) struct BlockDecoder {
     huf_dict: bool,
     seq_dict: bool,
     /// The double-symbol table of the dictionary's Huffman table, built on
-    /// its first use after the first frame (`dict_x2_ready`, cleared when
-    /// the dictionary changes).
+    /// its first use after the dictionary's first frame on this decoder
+    /// (`dict_x2_ready`, cleared when the dictionary changes), or within
+    /// that frame when its literals pay for the build.
     dict_x2: Option<Box<huf::X2Table>>,
     dict_x2_ready: bool,
+    /// No frame has used the dictionary since it was installed
+    /// (`dict_first`: this frame is the first).
+    dict_new: bool,
+    dict_first: bool,
     /// Decoded literals, always with `WILDCOPY_OVERLENGTH` readable bytes
-    /// after the last literal.
+    /// after the last literal. Its first `LIT_BUF_MIN` bytes come with the
+    /// decoder (libzstd's `DCtx` holds its literal buffer from creation):
+    /// a fresh decompressor's first frame doesn't allocate and fault it in.
     lit_buf: Vec<u8>,
     pub cpu: Features,
     /// The dictionary was just installed and its content is likely out of
@@ -103,7 +124,9 @@ impl BlockDecoder {
             seq_dict: false,
             dict_x2: None,
             dict_x2_ready: false,
-            lit_buf: Vec::new(),
+            dict_new: true,
+            dict_first: false,
+            lit_buf: alloc::vec![0; LIT_BUF_MIN],
             cpu: Features::detect(),
             dict_cold: false,
         }
@@ -112,18 +135,20 @@ impl BlockDecoder {
     /// The decoder's dictionary was replaced (or removed).
     pub(crate) fn dict_changed(&mut self) {
         self.dict_x2_ready = false;
+        self.dict_new = true;
     }
 
     /// Entropy state at the start of a frame: the dictionary's tables and
     /// repeat offsets (`dict`, used in place), or none.
-    pub(crate) fn start_frame(&mut self, dict: Option<&Entropy>) {
+    pub(crate) fn start_frame(&mut self, dict: Option<&DictEntropy>) {
         match dict {
             Some(e) => {
-                self.ent.huf_ok = e.huf_ok;
-                self.ent.fse_ok = e.fse_ok;
+                self.ent.huf_ok = true;
+                self.ent.fse_ok = true;
                 self.ent.rep = e.rep;
                 self.huf_dict = true;
                 self.seq_dict = true;
+                self.dict_first = core::mem::replace(&mut self.dict_new, false);
             }
             None => {
                 self.ent.reset();
@@ -136,7 +161,7 @@ impl BlockDecoder {
     fn lit_space(&mut self, n: usize) -> &mut [u8] {
         let need = n + WILDCOPY_OVERLENGTH;
         if self.lit_buf.len() < need {
-            self.lit_buf.resize(need.max(4096), 0);
+            self.lit_buf.resize(need.max(LIT_BUF_MIN), 0);
         }
         &mut self.lit_buf[..n]
     }
@@ -151,7 +176,7 @@ impl BlockDecoder {
         out: &mut Output,
         prefix: usize,
         dict: &[u8],
-        dict_ent: Option<&Entropy>,
+        dict_ent: Option<&DictEntropy>,
         block_max: usize,
     ) -> Result<()> {
         if src.len() > block_max {
@@ -222,7 +247,7 @@ impl BlockDecoder {
         src: &[u8],
         block_max: usize,
         room: usize,
-        dict_ent: Option<&Entropy>,
+        dict_ent: Option<&DictEntropy>,
     ) -> Result<(Literals, usize)> {
         if src.len() < 2 {
             return Err(Error::Corrupted);
@@ -338,7 +363,7 @@ impl BlockDecoder {
                 let cpu = self.cpu;
                 let need = lit_size + WILDCOPY_OVERLENGTH;
                 if self.lit_buf.len() < need {
-                    self.lit_buf.resize(need.max(4096), 0);
+                    self.lit_buf.resize(need.max(LIT_BUF_MIN), 0);
                 }
                 let (table, x2) = match (self.huf_dict, dict_ent) {
                     (true, Some(e)) if self.dict_cold => {
@@ -351,10 +376,21 @@ impl BlockDecoder {
                         (HufRef::Shared(&e.huf, None), false)
                     }
                     (true, Some(e)) => {
-                        // A dictionary in use for more than one frame: its
-                        // double-symbol table (libzstd's dictionaries hold
-                        // only that one), built once into our own space.
-                        let x2 = e.huf.x2_capable() && huf::prefer_x2_built(lit_size, lit_csize);
+                        // A warm dictionary: its double-symbol table
+                        // (libzstd's dictionaries hold only that one),
+                        // built once into our own space. In the
+                        // dictionary's first frame (warm when it took the
+                        // place of the last one, as in libzstd), only when
+                        // these literals pay for the build (libzstd's
+                        // decoder choice with the table build): a
+                        // dictionary parsed per frame doesn't build it for
+                        // small frames.
+                        let x2 = e.huf.x2_capable()
+                            && if self.dict_first && !self.dict_x2_ready {
+                                huf::prefer_x2(lit_size, lit_csize)
+                            } else {
+                                huf::prefer_x2_built(lit_size, lit_csize)
+                            };
                         if x2 && !self.dict_x2_ready {
                             let dt2 = self.dict_x2.get_or_insert_with(|| Box::new([0; 2048]));
                             self.ent.huf.build_x2_of(&e.huf, dt2);
@@ -390,7 +426,7 @@ impl BlockDecoder {
     fn decode_seq_headers(
         &mut self,
         src: &[u8],
-        dict_ent: Option<&Entropy>,
+        dict_ent: Option<&DictEntropy>,
     ) -> Result<(usize, usize)> {
         let Some(&b0) = src.first() else {
             return Err(Error::Corrupted);

@@ -36,7 +36,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use crate::block::{BlockDecoder, Entropy, Output, WILDCOPY_OVERLENGTH};
+use crate::block::{BlockDecoder, DictEntropy, Output, WILDCOPY_OVERLENGTH};
 use crate::decoder::reserve;
 use crate::dict::Dictionary;
 use crate::error::{Error, Result};
@@ -781,7 +781,7 @@ fn write_block(
     out: &mut Output,
     prefix: usize,
     dict: &[u8],
-    dict_ent: Option<&Entropy>,
+    dict_ent: Option<&DictEntropy>,
     block_max: usize,
 ) -> Result<()> {
     match btype {
