@@ -15,7 +15,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::bits::{BitReader, SeqBits};
-use crate::cpu::Features;
+use crate::cpu::{Features, prefetch_l1};
 use crate::error::{Error, Result};
 use crate::fse::{self, LL_KIND, ML_KIND, OF_KIND, SeqSymbol, SeqTables};
 use crate::huf::{self, HufRef, HufTable};
@@ -595,23 +595,6 @@ fn use_prefetch_loop(cold: bool) -> bool {
 }
 
 const HAS_PREFETCH: bool = cfg!(target_arch = "x86_64");
-
-/// Prefetches the cache line at `p` into L1 (any address: a prefetch
-/// never faults).
-#[inline(always)]
-fn prefetch_l1(p: *const u8) {
-    #[cfg(all(target_arch = "x86_64", not(miri)))]
-    // SAFETY: `prefetcht0` only hints the cache; it doesn't dereference
-    // `p` (no fault, no memory access visible to the program) and SSE is
-    // in the x86-64 baseline.
-    #[allow(unsafe_code, unused_unsafe)]
-    unsafe {
-        use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-        _mm_prefetch::<_MM_HINT_T0>(p.cast());
-    }
-    #[cfg(not(all(target_arch = "x86_64", not(miri))))]
-    let _ = p;
-}
 
 /// Loads a value from every cache line of `area`: libzstd's
 /// `PREFETCH_AREA` for the tables of a dictionary just installed (likely

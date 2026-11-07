@@ -30,7 +30,7 @@ use super::lazy::Searcher;
 use super::seq_store::{
     PRIME4BYTES, PRIME5BYTES, PRIME6BYTES, REP_NUM, count, read_le32, read_le64, read32,
 };
-use crate::enc::fast::prefetch_l1;
+use crate::cpu::prefetch_l1;
 
 /// `ZSTD_ROW_HASH_CACHE_SIZE`: hashes of the next positions kept ahead.
 pub(crate) const ROW_HASH_CACHE_SIZE: usize = 8;

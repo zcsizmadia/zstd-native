@@ -124,3 +124,22 @@ fn amd() -> bool {
 fn amd() -> bool {
     false
 }
+
+/// Prefetches the cache line at `p` into L1 (`PREFETCH_L1`, `prefetcht0`):
+/// shared by the decoder's prefetching sequence loop and the encoder's
+/// match finders. Any address is fine: a prefetch never faults. A no-op
+/// off x86-64 and under Miri.
+#[inline(always)]
+pub(crate) fn prefetch_l1(p: *const u8) {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    // SAFETY: `prefetcht0` only hints the cache; it doesn't dereference
+    // `p` (no fault, no memory access visible to the program) and SSE is
+    // in the x86-64 baseline.
+    #[allow(unsafe_code, unused_unsafe)]
+    unsafe {
+        use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch::<_MM_HINT_T0>(p.cast());
+    }
+    #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+    let _ = p;
+}

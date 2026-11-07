@@ -7,13 +7,14 @@
 use super::fast::{
     DmsView, ExtWindow, HASH_READ_SIZE, K_SEARCH_STRENGTH, MatchState, SHORT_CACHE_TAG_BITS,
     TableLoadMethod, cand_match, compare_packed_tags, hash_mls, hash_prime, hash_with,
-    index_overlap_check, prefetch_l1, write_tagged_index,
+    index_overlap_check, write_tagged_index,
 };
 use super::params::Strategy;
 use super::seq_store::{
     PRIME8BYTES, REPCODE1_TO_OFFBASE, SeqStore, count, count_2segments, hash_at, hash8_ptr,
     offset_to_offbase, read_le64, read32,
 };
+use crate::cpu::prefetch_l1;
 
 /// `ZSTD_fillDoubleHashTableForCDict()`: as [`fill_double_hash_table`],
 /// with tagged entries (see
