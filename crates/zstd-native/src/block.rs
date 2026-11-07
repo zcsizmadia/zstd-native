@@ -1481,6 +1481,8 @@ unsafe fn overlapping_copy(dst: *mut u8, src: *const u8, len: usize) {
 
 /// A match that starts in the dictionary (rare: kept out of the hot loop
 /// so the dictionary's pointer and length don't take registers there).
+/// The output has `WILDCOPY_OVERLENGTH` writable bytes after the match
+/// (the fast path of `exec_seq!`).
 #[cold]
 #[inline(never)]
 #[allow(unsafe_code)]
@@ -1496,6 +1498,18 @@ fn dict_match(
         return Err(Error::Corrupted);
     }
     let back = offset - in_prefix;
+    if back >= match_len + WILDCOPY_OVERLENGTH {
+        // All in the dictionary, with `WILDCOPY_OVERLENGTH` readable bytes
+        // after it: copied in 16-byte chunks rather than by a `memcpy`
+        // call (libzstd's `ZSTD_execSequence` calls `memmove`). Most
+        // matches of a small frame are in its dictionary.
+        // SAFETY: `back <= dict.len()` and the bytes read and written past
+        // the match are in the dictionary and in the output's slack; the
+        // dictionary is another buffer than the output written (or window
+        // history after the output's capacity).
+        unsafe { copy::wildcopy(mop, dict.as_ptr().add(dict.len() - back), match_len) };
+        return Ok(());
+    }
     let n = back.min(match_len);
     // SAFETY: `back <= dict.len()`; the caller checked the output has room
     // for the match; the rest of the match starts at `prefix_start`, which
