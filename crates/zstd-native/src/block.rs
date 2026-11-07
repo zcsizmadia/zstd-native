@@ -18,7 +18,7 @@ use crate::bits::{BitReader, SeqBits};
 use crate::cpu::Features;
 use crate::error::{Error, Result};
 use crate::fse::{self, LL_KIND, ML_KIND, OF_KIND, SeqSymbol, SeqTables};
-use crate::huf::{self, HufRef, HufTable};
+use crate::huf::{self, HufDt, HufRef, HufTable};
 
 pub(crate) const WILDCOPY_OVERLENGTH: usize = 32;
 pub(crate) const BLOCK_SIZE_MAX: usize = 128 << 10;
@@ -61,6 +61,18 @@ impl Entropy {
         self.fse_ok = false;
         self.rep = [1, 4, 8];
     }
+}
+
+/// A dictionary's entropy tables and repeat offsets (libzstd's
+/// `ZSTD_entropyDTables_t` in a `ZSTD_DDict`), used in place by the
+/// frames that start on them: only the single-symbol Huffman table (the
+/// decoder builds the double-symbol one into its own space), and both
+/// kinds of table always valid.
+#[derive(Clone, Debug)]
+pub(crate) struct DictEntropy {
+    pub huf: HufDt,
+    pub seq: SeqTables,
+    pub rep: [u32; 3],
 }
 
 /// Decoder state for blocks: entropy tables plus the literals buffer.
@@ -116,11 +128,11 @@ impl BlockDecoder {
 
     /// Entropy state at the start of a frame: the dictionary's tables and
     /// repeat offsets (`dict`, used in place), or none.
-    pub(crate) fn start_frame(&mut self, dict: Option<&Entropy>) {
+    pub(crate) fn start_frame(&mut self, dict: Option<&DictEntropy>) {
         match dict {
             Some(e) => {
-                self.ent.huf_ok = e.huf_ok;
-                self.ent.fse_ok = e.fse_ok;
+                self.ent.huf_ok = true;
+                self.ent.fse_ok = true;
                 self.ent.rep = e.rep;
                 self.huf_dict = true;
                 self.seq_dict = true;
@@ -151,7 +163,7 @@ impl BlockDecoder {
         out: &mut Output,
         prefix: usize,
         dict: &[u8],
-        dict_ent: Option<&Entropy>,
+        dict_ent: Option<&DictEntropy>,
         block_max: usize,
     ) -> Result<()> {
         if src.len() > block_max {
@@ -222,7 +234,7 @@ impl BlockDecoder {
         src: &[u8],
         block_max: usize,
         room: usize,
-        dict_ent: Option<&Entropy>,
+        dict_ent: Option<&DictEntropy>,
     ) -> Result<(Literals, usize)> {
         if src.len() < 2 {
             return Err(Error::Corrupted);
@@ -390,7 +402,7 @@ impl BlockDecoder {
     fn decode_seq_headers(
         &mut self,
         src: &[u8],
-        dict_ent: Option<&Entropy>,
+        dict_ent: Option<&DictEntropy>,
     ) -> Result<(usize, usize)> {
         let Some(&b0) = src.first() else {
             return Err(Error::Corrupted);
