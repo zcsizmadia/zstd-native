@@ -220,6 +220,30 @@ fn matches_libzstd() {
     }
 }
 
+/// A dictionary parsed for each frame and dropped after it (libzstd's
+/// `ZSTD_createDDict` + `ZSTD_freeDDict` per frame: the allocator often
+/// gives the next one the same address, which counts as warm, as in
+/// libzstd), or dropped only when the next one replaces it (always cold);
+/// frames up to 300 KB, so first blocks with 128 KiB of literals.
+#[test]
+fn parsed_for_each_frame() {
+    let dicts = dictionaries();
+    let frames = frames(&dicts);
+    let mut dec = Decompressor::new();
+    for keep in [false, true] {
+        for (i, f) in frames.iter().enumerate() {
+            let Some(d) = f.dict else { continue };
+            dec.set_dictionary(Some(Dictionary::new(&dicts[d]).unwrap()));
+            let mut out = vec![0u8; f.data.len()];
+            assert_eq!(dec.decompress_to_slice(&f.comp, &mut out), Ok(f.data.len()));
+            assert!(out == f.data, "frame {i} keep {keep}");
+            if !keep {
+                dec.set_dictionary(None);
+            }
+        }
+    }
+}
+
 /// Every frame of one dictionary concatenated, through a fresh decompressor
 /// and a stream decoder (random input and output pieces).
 #[test]

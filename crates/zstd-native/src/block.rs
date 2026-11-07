@@ -89,10 +89,15 @@ pub(crate) struct BlockDecoder {
     huf_dict: bool,
     seq_dict: bool,
     /// The double-symbol table of the dictionary's Huffman table, built on
-    /// its first use after the first frame (`dict_x2_ready`, cleared when
-    /// the dictionary changes).
+    /// its first use after the dictionary's first frame on this decoder
+    /// (`dict_x2_ready`, cleared when the dictionary changes), or within
+    /// that frame when its literals pay for the build.
     dict_x2: Option<Box<huf::X2Table>>,
     dict_x2_ready: bool,
+    /// No frame has used the dictionary since it was installed
+    /// (`dict_first`: this frame is the first).
+    dict_new: bool,
+    dict_first: bool,
     /// Decoded literals, always with `WILDCOPY_OVERLENGTH` readable bytes
     /// after the last literal. Its first `LIT_BUF_MIN` bytes come with the
     /// decoder (libzstd's `DCtx` holds its literal buffer from creation):
@@ -119,6 +124,8 @@ impl BlockDecoder {
             seq_dict: false,
             dict_x2: None,
             dict_x2_ready: false,
+            dict_new: true,
+            dict_first: false,
             lit_buf: alloc::vec![0; LIT_BUF_MIN],
             cpu: Features::detect(),
             dict_cold: false,
@@ -128,6 +135,7 @@ impl BlockDecoder {
     /// The decoder's dictionary was replaced (or removed).
     pub(crate) fn dict_changed(&mut self) {
         self.dict_x2_ready = false;
+        self.dict_new = true;
     }
 
     /// Entropy state at the start of a frame: the dictionary's tables and
@@ -140,6 +148,7 @@ impl BlockDecoder {
                 self.ent.rep = e.rep;
                 self.huf_dict = true;
                 self.seq_dict = true;
+                self.dict_first = core::mem::replace(&mut self.dict_new, false);
             }
             None => {
                 self.ent.reset();
@@ -367,10 +376,21 @@ impl BlockDecoder {
                         (HufRef::Shared(&e.huf, None), false)
                     }
                     (true, Some(e)) => {
-                        // A dictionary in use for more than one frame: its
-                        // double-symbol table (libzstd's dictionaries hold
-                        // only that one), built once into our own space.
-                        let x2 = e.huf.x2_capable() && huf::prefer_x2_built(lit_size, lit_csize);
+                        // A warm dictionary: its double-symbol table
+                        // (libzstd's dictionaries hold only that one),
+                        // built once into our own space. In the
+                        // dictionary's first frame (warm when it took the
+                        // place of the last one, as in libzstd), only when
+                        // these literals pay for the build (libzstd's
+                        // decoder choice with the table build): a
+                        // dictionary parsed per frame doesn't build it for
+                        // small frames.
+                        let x2 = e.huf.x2_capable()
+                            && if self.dict_first && !self.dict_x2_ready {
+                                huf::prefer_x2(lit_size, lit_csize)
+                            } else {
+                                huf::prefer_x2_built(lit_size, lit_csize)
+                            };
                         if x2 && !self.dict_x2_ready {
                             let dt2 = self.dict_x2.get_or_insert_with(|| Box::new([0; 2048]));
                             self.ent.huf.build_x2_of(&e.huf, dt2);
