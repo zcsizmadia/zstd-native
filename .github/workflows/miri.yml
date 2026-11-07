@@ -77,7 +77,9 @@ jobs:
               | test(~opt::tests::long_matches)
               | test(~presplit::tests::split_points_are_valid)
               | test(~presplit::tests::split_points_match_libzstd)
-              | test(~fse::build_tests::fast_build_matches_reference))'
+              | test(~fse::build_tests::fast_build_matches_reference)
+              | test(~opt::tests::incremental_prices_match_libzstd)
+              | test(~stream::tests::direct_and_buffered_agree))'
           fi
           filter=$(echo "$filter" | tr -s '\n ' '  ')
           cargo miri nextest run -p zstd-native --lib --features portable \
