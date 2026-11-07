@@ -9,6 +9,38 @@ section.
 
 ## [Unreleased]
 
+Speed only: no API change, and the compressed output is still the same
+bytes as libzstd 1.5.7. Numbers are for an AMD EPYC 7543 (Zen 3), one
+core; see BENCHMARK.md.
+
+### Changed
+- **Short match offsets:** matches with an offset under 16 are decoded 16
+  bytes per store, with a byte shuffle (SSSE3; NEON on AArch64), from
+  meta/zstd#4718. Data with short repeating periods or runs of small
+  integers decompresses 1.3x to 12x faster; Silesia is unchanged (#60,
+  #70).
+- **Levels 1-4 with dictionaries or frequent flushes:** faster `fast` and
+  `dfast` loops for dictionaries (dictMatchState, extDict) and for
+  streaming once the buffer wraps (extDict), with ports of meta/zstd#4764
+  and #4866. 1-4 KiB dictionary frames are up to 14% faster, and flushes
+  at levels 3-4 3-9% faster (#62, #71).
+- **Small blocks:** less Huffman and FSE table work per block, and a
+  context with an attached dictionary continues its indices instead of
+  clearing its hash table, as libzstd does. 1-4 KiB frames, with or
+  without a dictionary, and frequent flushes are 3-14% faster (#72, #74).
+- **`dfast` extDict loop in assembly** (levels 3-4, streaming with flushes
+  and copied dictionaries): 2-5% faster. **Optimal parser** (levels
+  16-22): only the prices of changed codes are recomputed, 4-42% faster
+  on 4-16 KiB frames; dickens at level 19 in 4 KiB frames is 19% faster
+  (#75, #77).
+- **Streaming decompression into the caller's buffer:** `StreamDecoder`
+  decodes blocks straight into the output when they fit, and
+  `Decoder::read_to_end` straight into the `Vec`. Whole-output streaming
+  is 2-12% faster and `read_to_end` 7% to 3.5x faster (#12, #73).
+- **Cold dictionaries:** the first block after a dictionary is installed
+  uses libzstd's prefetching sequence loop. 4 KiB frames with a cold
+  110 KiB dictionary decode 23-27% faster (#11, #76).
+
 ## [0.1.1+zstd.1.5.7]
 
 Speed only: no API change, and the compressed output is the same bytes as
