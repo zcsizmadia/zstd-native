@@ -49,6 +49,15 @@ core; see BENCHMARK.md.
   par with libzstd to 7% less) and 28-34% less right after switching
   dictionaries (17-21% less than libzstd); Silesia in 4 KiB dictionary
   frames decodes 29-51% faster (#80).
+- **Dictionary parsing and fresh decompressors:** a `Dictionary` keeps
+  only the tables frames use (18 KB instead of 34.5 KB, built in place),
+  FSE tables with low-probability symbols are built without libzstd's
+  slow spread, a decompressor's literal buffer comes with it, and a
+  dictionary's first frame doesn't build its double-symbol table for
+  small literal sections. With a 110 KiB dictionary, parsing is 3-8%
+  faster, and 4 KiB frames through a fresh decompressor take 12-14% less
+  time (13-26% less than libzstd); parsing a dictionary per frame is on par
+  with libzstd. Silesia decodes about 1% faster.
 
 ## [0.1.1+zstd.1.5.7]
 

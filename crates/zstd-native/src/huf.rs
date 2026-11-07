@@ -18,10 +18,19 @@ use crate::fse;
 pub(crate) const HUF_TABLELOG_MAX: u32 = 12;
 const FAST_TABLELOG: u32 = 11;
 
+/// A single-symbol (X1) table: all a dictionary keeps (8 KiB). The
+/// decoder's own [`HufTable`] adds the double-symbol table and its scratch.
 #[derive(Clone)]
-pub(crate) struct HufTable {
+pub(crate) struct HufDt {
     pub dt: [u16; 1 << HUF_TABLELOG_MAX],
     pub log: u32,
+}
+
+/// The decoder's own Huffman table: the X1 table, plus its double-symbol
+/// table built on demand.
+#[derive(Clone)]
+pub(crate) struct HufTable {
+    x1: HufDt,
     /// Double-symbol table (libzstd's `X2`), built on demand from `dt`
     /// when `log` is 11: `s1 | s2 << 8 | bits << 16 | count << 24`.
     dt2: [u32; 1 << FAST_TABLELOG],
@@ -33,19 +42,63 @@ pub(crate) struct HufTable {
 impl core::fmt::Debug for HufTable {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("HufTable")
+            .field("log", &self.x1.log)
+            .finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Debug for HufDt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HufDt")
             .field("log", &self.log)
             .finish_non_exhaustive()
+    }
+}
+
+impl core::ops::Deref for HufTable {
+    type Target = HufDt;
+    #[inline(always)]
+    fn deref(&self) -> &HufDt {
+        &self.x1
     }
 }
 
 impl HufTable {
     pub(crate) const fn new() -> Self {
         HufTable {
-            dt: [0; 1 << HUF_TABLELOG_MAX],
-            log: 0,
+            x1: HufDt::new(),
             dt2: [0; 1 << FAST_TABLELOG],
             x2_ready: false,
             x2_tmpl: [0; 1 << FAST_TABLELOG],
+        }
+    }
+
+    /// [`HufDt::read`], invalidating the double-symbol table.
+    pub(crate) fn read(&mut self, src: &[u8]) -> Result<usize> {
+        let n = self.x1.read(src)?;
+        self.x2_ready = false;
+        Ok(n)
+    }
+
+    fn build_x2(&mut self) {
+        debug_assert_eq!(self.x1.log, FAST_TABLELOG);
+        build_x2_table(&self.x1.dt, &mut self.dt2, &mut self.x2_tmpl);
+        self.x2_ready = true;
+    }
+
+    /// Builds the double-symbol table of `shared` (a dictionary's, used
+    /// read-only) into `dt2`, with this table's scratch space.
+    pub(crate) fn build_x2_of(&mut self, shared: &HufDt, dt2: &mut X2Table) {
+        debug_assert!(shared.x2_capable());
+        build_x2_table(&shared.dt, dt2, &mut self.x2_tmpl);
+    }
+}
+
+impl HufDt {
+    pub(crate) const fn new() -> Self {
+        HufDt {
+            dt: [0; 1 << HUF_TABLELOG_MAX],
+            log: 0,
         }
     }
 
@@ -79,7 +132,6 @@ impl HufTable {
         #[cfg(not(all(target_arch = "x86_64", not(feature = "portable"))))]
         let log = self.build_sorted(&mut weights, osize)?;
         self.log = log;
-        self.x2_ready = false;
         Ok(isize + 1)
     }
 
@@ -330,19 +382,6 @@ impl HufTable {
     pub(crate) fn x2_capable(&self) -> bool {
         self.log == FAST_TABLELOG
     }
-
-    fn build_x2(&mut self) {
-        debug_assert_eq!(self.log, FAST_TABLELOG);
-        build_x2_table(&self.dt, &mut self.dt2, &mut self.x2_tmpl);
-        self.x2_ready = true;
-    }
-
-    /// Builds the double-symbol table of `shared` (a dictionary's, used
-    /// read-only) into `dt2`, with this table's scratch space.
-    pub(crate) fn build_x2_of(&mut self, shared: &HufTable, dt2: &mut X2Table) {
-        debug_assert!(shared.x2_capable());
-        build_x2_table(&shared.dt, dt2, &mut self.x2_tmpl);
-    }
 }
 
 /// A double-symbol table (libzstd's `X2`): `s1 | s2 << 8 | bits << 16 |
@@ -453,7 +492,7 @@ fn decode_symbol(br: &mut BitReader<'_>, dt: &[u16; 1 << HUF_TABLELOG_MAX], log:
 
 /// Decodes `out.len()` symbols from `br` (libzstd's `HUF_decodeStreamX1`).
 #[inline(always)]
-fn decode_stream(out: &mut [u8], br: &mut BitReader<'_>, t: &HufTable) {
+fn decode_stream(out: &mut [u8], br: &mut BitReader<'_>, t: &HufDt) {
     let (dt, log) = (&t.dt, t.log);
     let mut p = 0;
     let end = out.len();
@@ -477,7 +516,7 @@ fn decode_stream(out: &mut [u8], br: &mut BitReader<'_>, t: &HufTable) {
 /// Decodes `out.len()` symbols from `br` with the double-symbol table, up
 /// to 10 per reload (libzstd's `HUF_decodeStreamX2`), the last ones with
 /// the single-symbol table (the two decode identically).
-fn decode_stream_x2(out: &mut [u8], br: &mut BitReader<'_>, t: &HufTable, dt2: &X2Table) {
+fn decode_stream_x2(out: &mut [u8], br: &mut BitReader<'_>, t: &HufDt, dt2: &X2Table) {
     debug_assert!(t.x2_capable());
     let mut p = 0;
     let end = out.len();
@@ -501,7 +540,7 @@ fn decode_stream_x2(out: &mut [u8], br: &mut BitReader<'_>, t: &HufTable, dt2: &
 pub(crate) fn decode_1x(
     out: &mut [u8],
     src: &[u8],
-    t: &HufTable,
+    t: &HufDt,
     dt2: Option<&X2Table>,
 ) -> Result<()> {
     let mut br = BitReader::new(src)?;
@@ -522,12 +561,12 @@ pub(crate) fn decode_1x(
 /// double-symbol table if the caller has one.
 pub(crate) enum HufRef<'a> {
     Own(&'a mut HufTable),
-    Shared(&'a HufTable, Option<&'a X2Table>),
+    Shared(&'a HufDt, Option<&'a X2Table>),
 }
 
 impl HufRef<'_> {
     #[inline(always)]
-    pub(crate) fn get(&self) -> &HufTable {
+    pub(crate) fn get(&self) -> &HufDt {
         match self {
             HufRef::Own(t) => t,
             HufRef::Shared(t, _) => t,
@@ -1031,7 +1070,7 @@ mod tests {
             // Make about half the cases valid: fix the total up to a power
             // of two minus a power of two by construction is hard, so just
             // compare whatever comes out.
-            let (mut a, mut b) = (HufTable::new(), HufTable::new());
+            let (mut a, mut b) = (HufDt::new(), HufDt::new());
             let (mut wa, mut wb) = (w, w);
             let ra = a.build_sorted(&mut wa, osize);
             let rb = b.build_from_masks(&mut wb, osize);

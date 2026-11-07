@@ -1,12 +1,15 @@
 //! Dictionaries (RFC 8878 section 5): zstd-format dictionaries with
 //! entropy tables, and raw content dictionaries.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::block::Entropy;
+use crate::block::DictEntropy;
 use crate::error::{Error, Result};
+use crate::fse::SeqTables;
 use crate::fse::{self, LL_KIND, ML_KIND, OF_KIND};
+use crate::huf::HufDt;
 
 const DICT_MAGIC: u32 = 0xEC30_A437;
 
@@ -25,7 +28,7 @@ struct Inner {
     id: u32,
     content: Vec<u8>,
     /// Entropy tables of a zstd-format dictionary; `None` for raw content.
-    entropy: Option<Entropy>,
+    entropy: Option<Box<DictEntropy>>,
 }
 
 impl core::fmt::Debug for Dictionary {
@@ -51,24 +54,19 @@ impl Dictionary {
             return Ok(Self::raw(data));
         }
         let id = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        // The tables are built in place in the shared allocation.
-        let mut inner = Arc::new(Inner {
-            id,
-            content: Vec::new(),
-            entropy: Some(Entropy::new()),
+        // The tables are built in place in their own allocation (as a field
+        // of the `Arc`'s value, they were zeroed on the stack and copied
+        // twice).
+        let mut ent = Box::new(DictEntropy {
+            huf: HufDt::new(),
+            seq: SeqTables::new(),
+            rep: [0; 3],
         });
-        let Some(this) = Arc::get_mut(&mut inner) else {
-            unreachable!()
-        };
-        let Some(ent) = this.entropy.as_mut() else {
-            unreachable!()
-        };
         let mut p = 8;
         p += ent
             .huf
             .read(&data[p..])
             .map_err(|_| Error::InvalidDictionary)?;
-        ent.huf_ok = true;
         for kind in [OF_KIND, ML_KIND, LL_KIND] {
             let mut norm = [0i16; fse::MAX_ML + 1];
             let (max_sym, log, used) = fse::read_ncount(&data[p..], kind.max, &mut norm)
@@ -85,7 +83,6 @@ impl Dictionary {
             );
             p += used;
         }
-        ent.fse_ok = true;
         if p + 12 > data.len() {
             return Err(Error::InvalidDictionary);
         }
@@ -98,8 +95,13 @@ impl Dictionary {
             }
             ent.rep[i] = r;
         }
-        this.content = data[p..].to_vec();
-        Ok(Dictionary { inner })
+        Ok(Dictionary {
+            inner: Arc::new(Inner {
+                id,
+                content: data[p..].to_vec(),
+                entropy: Some(ent),
+            }),
+        })
     }
 
     /// A raw content dictionary (ID 0): `data` is only history for matches.
@@ -128,7 +130,7 @@ impl Dictionary {
     }
 
     /// The entropy tables and repeat offsets frames start with.
-    pub(crate) fn entropy(&self) -> Option<&Entropy> {
-        self.inner.entropy.as_ref()
+    pub(crate) fn entropy(&self) -> Option<&DictEntropy> {
+        self.inner.entropy.as_deref()
     }
 }
