@@ -320,48 +320,104 @@ impl HufTable {
         debug_assert_eq!(pos, 1 << log);
         Ok(log)
     }
-    /// Builds the double-symbol table: each entry decodes the first symbol
-    /// and, when its code fits in the remaining bits of the 11-bit window,
-    /// the next one too. Same symbols and bit counts as two X1 lookups, so
-    /// X1 and X2 decode identically.
+
+    /// Loads the table into the cache: `block::touch_area`.
+    pub(crate) fn touch(&self) {
+        crate::block::touch_area(&self.dt[..1 << self.log]);
+    }
+
+    /// Whether the double-symbol decoders can use this table.
+    pub(crate) fn x2_capable(&self) -> bool {
+        self.log == FAST_TABLELOG
+    }
+
     fn build_x2(&mut self) {
         debug_assert_eq!(self.log, FAST_TABLELOG);
-        const SIZE: usize = 1 << FAST_TABLELOG;
-        // An X1 entry with code length n1 fills a run of 2^(11 - n1) cells
-        // starting at a multiple of the run length, so cell k of every such
-        // run sees the same next bits, `k << n1`. The second-symbol part is
-        // therefore one template per code length, ORed with the first symbol.
-        // (Templates of distinct lengths, 1 to 11 bits, sum to under SIZE cells.)
-        let tmpl = &mut self.x2_tmpl;
-        let mut tmpl_at = [usize::MAX; FAST_TABLELOG as usize + 1];
-        let mut used = 0;
-        let mut i = 0;
-        while i < SIZE {
-            let e1 = u32::from(self.dt[i]);
-            let n1 = e1 & 0xFF;
-            let s1 = e1 >> 8;
-            let r = FAST_TABLELOG - n1;
-            let run = 1usize << r;
-            if tmpl_at[n1 as usize] == usize::MAX {
-                tmpl_at[n1 as usize] = used;
-                for (k, t) in tmpl[used..used + run].iter_mut().enumerate() {
-                    let e2 = u32::from(self.dt[k << n1]);
-                    let n2 = e2 & 0xFF;
-                    *t = if n2 <= r {
-                        ((e2 >> 8) << 8) | ((n1 + n2) << 16) | (2 << 24)
-                    } else {
-                        (n1 << 16) | (1 << 24)
-                    };
-                }
-                used += run;
-            }
-            let t = &tmpl[tmpl_at[n1 as usize]..][..run];
-            for (o, &t) in self.dt2[i..i + run].iter_mut().zip(t) {
-                *o = t | s1;
-            }
-            i += run;
-        }
+        build_x2_table(&self.dt, &mut self.dt2, &mut self.x2_tmpl);
         self.x2_ready = true;
+    }
+
+    /// Builds the double-symbol table of `shared` (a dictionary's, used
+    /// read-only) into `dt2`, with this table's scratch space.
+    pub(crate) fn build_x2_of(&mut self, shared: &HufTable, dt2: &mut X2Table) {
+        debug_assert!(shared.x2_capable());
+        build_x2_table(&shared.dt, dt2, &mut self.x2_tmpl);
+    }
+}
+
+/// A double-symbol table (libzstd's `X2`): `s1 | s2 << 8 | bits << 16 |
+/// count << 24` for each 11-bit window.
+pub(crate) type X2Table = [u32; 1 << FAST_TABLELOG];
+
+/// Builds the double-symbol table of the single-symbol table `dt` (of log
+/// 11) into `dt2`, with `tmpl` as scratch: each entry decodes the first
+/// symbol and, when its code fits in the remaining bits of the 11-bit
+/// window, the next one too. Same symbols and bit counts as two X1
+/// lookups, so X1 and X2 decode identically.
+fn build_x2_table(dt: &[u16; 1 << HUF_TABLELOG_MAX], dt2: &mut X2Table, tmpl: &mut X2Table) {
+    const SIZE: usize = 1 << FAST_TABLELOG;
+    // An X1 entry with code length n1 fills a run of 2^(11 - n1) cells
+    // starting at a multiple of the run length, so cell k of every such
+    // run sees the same next bits, `k << n1`. The second-symbol part is
+    // therefore one template per code length, ORed with the first symbol.
+    // (Templates of distinct lengths, 1 to 11 bits, sum to under SIZE cells.)
+    let mut tmpl_at = [usize::MAX; FAST_TABLELOG as usize + 1];
+    let mut used = 0;
+    let mut i = 0;
+    while i < SIZE {
+        let e1 = u32::from(dt[i]);
+        let n1 = e1 & 0xFF;
+        let s1 = e1 >> 8;
+        let r = FAST_TABLELOG - n1;
+        let run = 1usize << r;
+        if tmpl_at[n1 as usize] == usize::MAX {
+            tmpl_at[n1 as usize] = used;
+            for (k, t) in tmpl[used..used + run].iter_mut().enumerate() {
+                let e2 = u32::from(dt[k << n1]);
+                let n2 = e2 & 0xFF;
+                *t = if n2 <= r {
+                    ((e2 >> 8) << 8) | ((n1 + n2) << 16) | (2 << 24)
+                } else {
+                    (n1 << 16) | (1 << 24)
+                };
+            }
+            used += run;
+        }
+        let t = &tmpl[tmpl_at[n1 as usize]..][..run];
+        for (o, &t) in dt2[i..i + run].iter_mut().zip(t) {
+            *o = t | s1;
+        }
+        i += run;
+    }
+}
+
+/// libzstd's `HUF_selectDecoder` times (table build, decode of 256 bytes) of
+/// the single- and the double-symbol decoders by compression ratio class.
+const ALGO_TIME: [[(u32, u32); 2]; 16] = [
+    [(0, 0), (1, 1)],
+    [(0, 0), (1, 1)],
+    [(150, 216), (381, 119)],
+    [(170, 205), (514, 112)],
+    [(177, 199), (539, 110)],
+    [(197, 194), (644, 107)],
+    [(221, 192), (735, 107)],
+    [(256, 189), (881, 106)],
+    [(359, 188), (1167, 109)],
+    [(582, 187), (1570, 114)],
+    [(688, 187), (1712, 122)],
+    [(825, 186), (1965, 136)],
+    [(976, 185), (2131, 150)],
+    [(1180, 186), (2070, 175)],
+    [(1377, 185), (1731, 202)],
+    [(1412, 185), (1695, 202)],
+];
+
+/// The compressed/regenerated size ratio in 16ths (15 for incompressible).
+fn ratio_class(dst_size: usize, csrc_size: usize) -> usize {
+    if csrc_size >= dst_size {
+        15
+    } else {
+        csrc_size * 16 / dst_size
     }
 }
 
@@ -369,38 +425,22 @@ impl HufTable {
 /// expected to be faster, from the literals' size and compression ratio
 /// (libzstd's measured table-build and decode times).
 pub(crate) fn prefer_x2(dst_size: usize, csrc_size: usize) -> bool {
-    const ALGO_TIME: [[(u32, u32); 2]; 16] = [
-        [(0, 0), (1, 1)],
-        [(0, 0), (1, 1)],
-        [(150, 216), (381, 119)],
-        [(170, 205), (514, 112)],
-        [(177, 199), (539, 110)],
-        [(197, 194), (644, 107)],
-        [(221, 192), (735, 107)],
-        [(256, 189), (881, 106)],
-        [(359, 188), (1167, 109)],
-        [(582, 187), (1570, 114)],
-        [(688, 187), (1712, 122)],
-        [(825, 186), (1965, 136)],
-        [(976, 185), (2131, 150)],
-        [(1180, 186), (2070, 175)],
-        [(1377, 185), (1731, 202)],
-        [(1412, 185), (1695, 202)],
-    ];
     if dst_size == 0 {
         return false;
     }
-    let q = if csrc_size >= dst_size {
-        15
-    } else {
-        csrc_size * 16 / dst_size
-    };
     let d256 = (dst_size >> 8) as u32;
-    let [(t0, d0), (t1, d1)] = ALGO_TIME[q];
+    let [(t0, d0), (t1, d1)] = ALGO_TIME[ratio_class(dst_size, csrc_size)];
     let time0 = t0 + d0 * d256;
     let mut time1 = t1 + d1 * d256;
     time1 += time1 >> 5;
     time1 < time0
+}
+
+/// [`prefer_x2`] for a table whose double-symbol table is built already (a
+/// dictionary's): the decode times only.
+pub(crate) fn prefer_x2_built(dst_size: usize, csrc_size: usize) -> bool {
+    let [(_, d0), (_, d1)] = ALGO_TIME[ratio_class(dst_size, csrc_size)];
+    d1 + (d1 >> 5) < d0
 }
 
 /// Decodes one symbol (libzstd's `HUF_decodeSymbolX1`).
@@ -434,14 +474,73 @@ fn decode_stream(out: &mut [u8], br: &mut BitReader<'_>, t: &HufTable) {
     }
 }
 
-/// Single-stream literals.
-pub(crate) fn decode_1x(out: &mut [u8], src: &[u8], t: &HufTable) -> Result<()> {
+/// Decodes `out.len()` symbols from `br` with the double-symbol table, up
+/// to 10 per reload (libzstd's `HUF_decodeStreamX2`), the last ones with
+/// the single-symbol table (the two decode identically).
+fn decode_stream_x2(out: &mut [u8], br: &mut BitReader<'_>, t: &HufTable, dt2: &X2Table) {
+    debug_assert!(t.x2_capable());
+    let mut p = 0;
+    let end = out.len();
+    if end >= 10 {
+        // 5 lookups of at most 11 bits each (55 of the 57 available), at
+        // most 10 symbols: each lookup writes 2 bytes and advances 1 or 2.
+        while (br.reload_short() == Status::Unfinished) & (p < end - 9) {
+            for _ in 0..5 {
+                let e = dt2[br.peek_fast(FAST_TABLELOG) as usize];
+                out[p] = e as u8;
+                out[p + 1] = (e >> 8) as u8;
+                br.skip((e >> 16) & 0xFF);
+                p += (e >> 24) as usize;
+            }
+        }
+    }
+    decode_stream(&mut out[p..], br, t);
+}
+
+/// Single-stream literals, with `dt2` (`t`'s double-symbol table) if given.
+pub(crate) fn decode_1x(
+    out: &mut [u8],
+    src: &[u8],
+    t: &HufTable,
+    dt2: Option<&X2Table>,
+) -> Result<()> {
     let mut br = BitReader::new(src)?;
-    decode_stream(out, &mut br, t);
+    if let Some(dt2) = dt2 {
+        decode_stream_x2(out, &mut br, t, dt2);
+    } else {
+        decode_stream(out, &mut br, t);
+    }
     if !br.is_end() {
         return Err(Error::Corrupted);
     }
     Ok(())
+}
+
+/// The Huffman table a block decodes with: the decoder's own (its
+/// double-symbol table built on first use) or a dictionary's, shared and
+/// read-only, as libzstd's `HUFptr` points into the `ZSTD_DDict`, with its
+/// double-symbol table if the caller has one.
+pub(crate) enum HufRef<'a> {
+    Own(&'a mut HufTable),
+    Shared(&'a HufTable, Option<&'a X2Table>),
+}
+
+impl HufRef<'_> {
+    #[inline(always)]
+    pub(crate) fn get(&self) -> &HufTable {
+        match self {
+            HufRef::Own(t) => t,
+            HufRef::Shared(t, _) => t,
+        }
+    }
+
+    /// A shared table's double-symbol table, if given.
+    pub(crate) fn shared_x2(&self) -> Option<&X2Table> {
+        match self {
+            HufRef::Own(_) => None,
+            HufRef::Shared(_, dt2) => *dt2,
+        }
+    }
 }
 
 /// Four-stream literals; `x2` selects the double-symbol fast loop (when the
@@ -449,7 +548,7 @@ pub(crate) fn decode_1x(out: &mut [u8], src: &[u8], t: &HufTable) -> Result<()> 
 pub(crate) fn decode_4x(
     out: &mut [u8],
     src: &[u8],
-    t: &mut HufTable,
+    mut t: HufRef<'_>,
     x2: bool,
     cpu: Features,
 ) -> Result<()> {
@@ -475,7 +574,8 @@ pub(crate) fn decode_4x(
     // (ip, bits-consumed) per stream after the fast loop.
     let mut resume: [Option<(usize, u32)>; 4] = [None; 4];
     let mut op = seg_starts;
-    if t.log == FAST_TABLELOG && lens.iter().all(|&l| l >= 8) && 3 * seg < n {
+    let log = t.get().log;
+    if log == FAST_TABLELOG && lens.iter().all(|&l| l >= 8) && 3 * seg < n {
         let mut ip = [0usize; 4];
         let mut bits = [0u64; 4];
         for s in 0..4 {
@@ -487,13 +587,19 @@ pub(crate) fn decode_4x(
             bits[s] = (read_u64_le(src, ip[s]) | 1) << (last.leading_zeros() + 1);
         }
         let mut st = FastState { ip, op, bits };
-        if x2 {
-            if !t.x2_ready {
-                t.build_x2();
-            }
-            fast_loop_x2_dispatch(&mut st, out, src, &starts, &seg_ends, &t.dt2, cpu);
-        } else {
-            fast_loop_dispatch(&mut st, out, src, &starts, &t.dt, cpu);
+        if x2
+            && let HufRef::Own(t) = &mut t
+            && !t.x2_ready
+        {
+            t.build_x2();
+        }
+        let dt2 = match &t {
+            HufRef::Own(t) => (x2 && t.x2_ready).then_some(&t.dt2),
+            HufRef::Shared(_, dt2) => dt2.filter(|_| x2),
+        };
+        match dt2 {
+            Some(dt2) => fast_loop_x2_dispatch(&mut st, out, src, &starts, &seg_ends, dt2, cpu),
+            None => fast_loop_dispatch(&mut st, out, src, &starts, &t.get().dt, cpu),
         }
         op = st.op;
         for s in 0..4 {
@@ -506,7 +612,7 @@ pub(crate) fn decode_4x(
             Some((pos, consumed)) => BitReader::from_parts(stream, pos, consumed),
             None => BitReader::new(stream)?,
         };
-        decode_stream(&mut out[op[s]..seg_ends[s]], &mut br, &*t);
+        decode_stream(&mut out[op[s]..seg_ends[s]], &mut br, t.get());
         if !br.is_end() {
             return Err(Error::Corrupted);
         }

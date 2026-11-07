@@ -1,7 +1,7 @@
 //! Dictionaries (RFC 8878 section 5): zstd-format dictionaries with
 //! entropy tables, and raw content dictionaries.
 
-use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::block::Entropy;
@@ -10,21 +10,30 @@ use crate::fse::{self, LL_KIND, ML_KIND, OF_KIND};
 
 const DICT_MAGIC: u32 = 0xEC30_A437;
 
-/// A decompression dictionary, parsed once and reused for many frames.
+/// A decompression dictionary, parsed once and reused for many frames
+/// (libzstd's `ZSTD_DDict`).
+///
+/// Cloning is cheap: clones share the parsed content and tables (like
+/// `ZSTD_DCtx_refDDict`), and a decompressor uses the tables in place
+/// rather than copying them for each frame.
 #[derive(Clone)]
 pub struct Dictionary {
-    pub(crate) id: u32,
-    pub(crate) content: Vec<u8>,
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    id: u32,
+    content: Vec<u8>,
     /// Entropy tables of a zstd-format dictionary; `None` for raw content.
-    pub(crate) entropy: Option<Box<Entropy>>,
+    entropy: Option<Entropy>,
 }
 
 impl core::fmt::Debug for Dictionary {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Dictionary")
-            .field("id", &self.id)
-            .field("content_len", &self.content.len())
-            .field("has_entropy", &self.entropy.is_some())
+            .field("id", &self.inner.id)
+            .field("content_len", &self.inner.content.len())
+            .field("has_entropy", &self.inner.entropy.is_some())
             .finish()
     }
 }
@@ -42,7 +51,18 @@ impl Dictionary {
             return Ok(Self::raw(data));
         }
         let id = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        let mut ent = Box::new(Entropy::new());
+        // The tables are built in place in the shared allocation.
+        let mut inner = Arc::new(Inner {
+            id,
+            content: Vec::new(),
+            entropy: Some(Entropy::new()),
+        });
+        let Some(this) = Arc::get_mut(&mut inner) else {
+            unreachable!()
+        };
+        let Some(ent) = this.entropy.as_mut() else {
+            unreachable!()
+        };
         let mut p = 8;
         p += ent
             .huf
@@ -78,24 +98,37 @@ impl Dictionary {
             }
             ent.rep[i] = r;
         }
-        Ok(Dictionary {
-            id,
-            content: data[p..].to_vec(),
-            entropy: Some(ent),
-        })
+        this.content = data[p..].to_vec();
+        Ok(Dictionary { inner })
     }
 
     /// A raw content dictionary (ID 0): `data` is only history for matches.
     pub fn raw(data: &[u8]) -> Dictionary {
         Dictionary {
-            id: 0,
-            content: data.to_vec(),
-            entropy: None,
+            inner: Arc::new(Inner {
+                id: 0,
+                content: data.to_vec(),
+                entropy: None,
+            }),
         }
     }
 
     /// The dictionary ID (0 for raw content).
     pub fn id(&self) -> u32 {
-        self.id
+        self.inner.id
+    }
+
+    /// Whether `other` is a clone of this dictionary.
+    pub(crate) fn same(&self, other: &Dictionary) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(crate) fn content(&self) -> &[u8] {
+        &self.inner.content
+    }
+
+    /// The entropy tables and repeat offsets frames start with.
+    pub(crate) fn entropy(&self) -> Option<&Entropy> {
+        self.inner.entropy.as_ref()
     }
 }

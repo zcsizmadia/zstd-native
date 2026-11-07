@@ -40,6 +40,15 @@ core; see BENCHMARK.md.
 - **Cold dictionaries:** the first block after a dictionary is installed
   uses libzstd's prefetching sequence loop. 4 KiB frames with a cold
   110 KiB dictionary decode 23-27% faster (#11, #76).
+- **Dictionary decompression:** frames use a dictionary's tables in place
+  instead of copying them (`Dictionary` clones now share them, like
+  `ZSTD_DCtx_refDDict`), load a cold dictionary's tables up front, use
+  its double-symbol Huffman table once warm, and copy matches in the
+  dictionary in 16-byte chunks; a dictionary installed again stays warm.
+  4 KiB frames with a 110 KiB dictionary take 28-31% less time warm (on
+  par with libzstd to 7% less) and 28-34% less right after switching
+  dictionaries (17-21% less than libzstd); Silesia in 4 KiB dictionary
+  frames decodes 29-51% faster (#80).
 
 ## [0.1.1+zstd.1.5.7]
 

@@ -157,6 +157,32 @@ fn selected_for_cold_dictionary() {
             }
         }
     }
+    // Installed again: still warm; another dictionary (also while the
+    // first is alive, so at another address): cold.
+    let d = zstd_native::Dictionary::new(&dict).unwrap();
+    let other = zstd_native::Dictionary::new(&dict).unwrap();
+    let mut one = zstd_native::Decompressor::with_dictionary(d.clone());
+    let long = usize::from(cfg!(target_arch = "x86_64"));
+    for (step, (install, want)) in [
+        (None, long),
+        (Some(&d), 0),
+        (None, 0),
+        (Some(&other), long),
+        (Some(&other), 0),
+        (Some(&d), long),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let Some(x) = install {
+            one.set_dictionary(Some(x.clone()));
+        }
+        let (got, n) = count_long(|| one.decompress(&frames[0]).unwrap());
+        assert!(got == samples[0], "step {step}");
+        if let Some(n) = n {
+            assert_eq!(n, want, "step {step}");
+        }
+    }
 }
 
 /// Every block through the prefetching loop: levels, sizes (blocks of a

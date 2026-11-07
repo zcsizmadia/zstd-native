@@ -580,6 +580,15 @@ impl SeqTables {
         self.log[kind.index] = kind.default_log;
     }
 
+    /// Copies `kind`'s table from `src` (the states of a `log`-bit table
+    /// stay in the first `1 << log` cells of its region).
+    pub(crate) fn copy_kind(&mut self, src: &SeqTables, kind: CodeKind) {
+        let log = src.log[kind.index];
+        let r = kind.region..kind.region + (1 << log);
+        self.cells[r.clone()].copy_from_slice(&src.cells[r]);
+        self.log[kind.index] = log;
+    }
+
     /// Builds `kind`'s table from normalized counts.
     pub(crate) fn build(
         &mut self,

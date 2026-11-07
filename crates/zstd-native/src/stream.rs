@@ -36,7 +36,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use crate::block::{BlockDecoder, Output, WILDCOPY_OVERLENGTH};
+use crate::block::{BlockDecoder, Entropy, Output, WILDCOPY_OVERLENGTH};
 use crate::decoder::reserve;
 use crate::dict::Dictionary;
 use crate::error::{Error, Result};
@@ -432,14 +432,12 @@ impl StreamDecoder {
         if fh.window_size > self.window_max {
             return Err(Error::WindowTooLarge);
         }
-        let dict_id = self.dict.as_ref().map_or(0, |d| d.id);
+        let dict_id = self.dict.as_ref().map_or(0, Dictionary::id);
         if fh.dict_id != 0 && fh.dict_id != dict_id {
             return Err(Error::DictionaryMismatch);
         }
-        match self.dict.as_ref().and_then(|d| d.entropy.as_deref()) {
-            Some(e) => self.block.ent.clone_from(e),
-            None => self.block.ent.reset(),
-        }
+        self.block
+            .start_frame(self.dict.as_ref().and_then(Dictionary::entropy));
         self.block_max = fh.block_size_max();
         // libzstd's `ddictIsCold`: the first frame after the dictionary was
         // installed, or after a frame that wrapped the window buffer (libzstd
@@ -554,7 +552,7 @@ impl StreamDecoder {
             let (prefix, dict): (usize, &[u8]) = match old {
                 None => (
                     out.pos - start,
-                    self.dict.as_ref().map_or(&[][..], |d| &d.content[..]),
+                    self.dict.as_ref().map_or(&[][..], |d| d.content()),
                 ),
                 Some((_, hist)) => (out.pos - start - hist, &[]),
             };
@@ -567,6 +565,7 @@ impl StreamDecoder {
                 out,
                 prefix,
                 dict,
+                self.dict.as_ref().and_then(Dictionary::entropy),
                 self.block_max,
             )
             // With room for `need`, a block that doesn't fit is corrupt (as
@@ -589,7 +588,7 @@ impl StreamDecoder {
             let base = self.win.as_mut_ptr();
             let (dict, cap): (&[u8], usize) = match old {
                 None => (
-                    self.dict.as_ref().map_or(&[][..], |d| &d.content[..]),
+                    self.dict.as_ref().map_or(&[][..], |d| d.content()),
                     self.win_size,
                 ),
                 Some((old_end, hist)) => {
@@ -620,6 +619,7 @@ impl StreamDecoder {
                 &mut wout,
                 self.prefix,
                 dict,
+                self.dict.as_ref().and_then(Dictionary::entropy),
                 self.block_max,
             )?;
             self.cur = wout.pos;
@@ -724,6 +724,7 @@ fn write_block(
     out: &mut Output,
     prefix: usize,
     dict: &[u8],
+    dict_ent: Option<&Entropy>,
     block_max: usize,
 ) -> Result<()> {
     match btype {
@@ -748,7 +749,7 @@ fn write_block(
         }
         _ => {
             let start = out.pos;
-            block.decode_block(src, out, prefix, dict, block_max)?;
+            block.decode_block(src, out, prefix, dict, dict_ent, block_max)?;
             // `decode_block` bounds a block by `block_max`.
             debug_assert!(out.pos - start <= block_max);
         }
