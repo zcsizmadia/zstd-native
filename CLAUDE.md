@@ -41,7 +41,9 @@ On this Windows machine, cargo is in `~/.cargo/bin` (not on PATH in Bash).
   sequence execution and copies (and the match-source prefetch of the
   prefetching sequence loop, `prefetch_l1`), the encoder's match finders
   and `enc/block_asm.rs` (asm! noDict block loops of `fast` and `dfast`,
-  the extDict loop of `dfast`), the
+  the extDict loop of `dfast`), `enc/seq_asm.rs` (asm! sequence
+  bitstream loop, `ZSTD_encodeSequences`, and its call in
+  `enc/sequences.rs`), the
   encoder's bit writers (`enc/bitwriter.rs`, `enc/huf_enc.rs`: 8-byte
   flushes) and its run-time dispatch to `#[target_feature]` loops
   (`enc/seq_store.rs`, the BMI2 lazy parsers and searches in

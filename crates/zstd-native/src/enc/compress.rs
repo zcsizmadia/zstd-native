@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 
 use super::cdict::{CDict, DictSlot, frame_cparams, should_attach, use_cdict_tables};
 use super::fast::{MatchState, SHORT_CACHE_TAG_BITS, build_seq_store};
-use super::hist::hist_count_fast;
+use super::hist::hist_count_codes;
 use super::huf_enc::HufRepeat;
 use super::ldm::{LdmState, RawSeq, RawSeqStore, build_seq_store_ext, build_seq_store_ldm};
 use super::literals::{HufCTables, compress_literals, min_gain};
@@ -20,11 +20,10 @@ use super::params::{
 };
 use super::presplit::{FpStats, optimal_block_size};
 use super::seq_store::{
-    LongLengthType, MAX_LL, MAX_ML, REP_START_VALUE, SeqDef, SeqStore, fill_codes, max_nb_seq,
+    LongLengthType, MAX_LL, MAX_ML, REP_START_VALUE, SeqStore, fill_codes, max_nb_seq,
 };
 use super::sequences::{
-    FseCTables, FseRepeat, SET_COMPRESSED, SeqFields, build_ctable, encode_sequences,
-    select_encoding_type,
+    FseCTables, FseRepeat, SET_COMPRESSED, build_ctable, encode_sequences, select_encoding_type,
 };
 use crate::error::{Error, Result};
 use crate::fse::{
@@ -39,21 +38,6 @@ pub(super) const LONGNBSEQ: usize = 0x7F00;
 pub(super) const DEFAULT_MAX_OFF: u32 = 28;
 pub(super) const RLE_MAX_LENGTH: usize = 25;
 const SUSPECT_UNCOMPRESSIBLE_LITERAL_RATIO: usize = 20;
-
-impl SeqFields for SeqDef {
-    #[inline(always)]
-    fn off_base(&self) -> u32 {
-        self.off_base
-    }
-    #[inline(always)]
-    fn lit_length(&self) -> u32 {
-        u32::from(self.lit_length)
-    }
-    #[inline(always)]
-    fn ml_base(&self) -> u32 {
-        u32::from(self.ml_base)
-    }
-}
 
 /// libzstd's `ZSTD_entropyCTables_t`.
 #[derive(Clone)]
@@ -189,7 +173,7 @@ pub(crate) fn build_sequences_statistics(
 
     // build CTable for Literal Lengths
     let mut max = FSE_MAX_LL as u32;
-    let most = hist_count_fast(&mut count, &mut max, ll_codes) as usize;
+    let most = hist_count_codes(&mut count, &mut max, ll_codes) as usize;
     next.ll_repeat = prev.ll_repeat;
     stats.ll_type = select_encoding_type(
         &mut next.ll_repeat,
@@ -224,7 +208,7 @@ pub(crate) fn build_sequences_statistics(
 
     // build CTable for Offsets
     let mut max = FSE_MAX_OFF as u32;
-    let most = hist_count_fast(&mut count, &mut max, of_codes) as usize;
+    let most = hist_count_codes(&mut count, &mut max, of_codes) as usize;
     // the basic table can only be used if max <= DefaultMaxOff, otherwise
     // the offsets are too large
     let default_allowed = max <= DEFAULT_MAX_OFF;
@@ -262,7 +246,7 @@ pub(crate) fn build_sequences_statistics(
 
     // build CTable for MatchLengths
     let mut max = FSE_MAX_ML as u32;
-    let most = hist_count_fast(&mut count, &mut max, ml_codes) as usize;
+    let most = hist_count_codes(&mut count, &mut max, ml_codes) as usize;
     next.ml_repeat = prev.ml_repeat;
     stats.ml_type = select_encoding_type(
         &mut next.ml_repeat,
@@ -379,12 +363,10 @@ fn entropy_compress_internal(
     let (s, e) = (ch.seq_start, ch.seq_end);
     let bitstream = encode_sequences(
         &mut dst[op..],
-        &next.fse.ml,
-        &ss.ml_code[s..e],
-        &next.fse.of,
-        &ss.of_code[s..e],
-        &next.fse.ll,
+        &next.fse,
         &ss.ll_code[s..e],
+        &ss.of_code[s..e],
+        &ss.ml_code[s..e],
         &ss.sequences[s..e],
     )?;
     op += bitstream;
