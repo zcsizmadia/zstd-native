@@ -118,6 +118,11 @@ impl Dictionary {
         self.inner.id
     }
 
+    /// Whether `other` is a clone of this dictionary.
+    pub(crate) fn same(&self, other: &Dictionary) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub(crate) fn content(&self) -> &[u8] {
         &self.inner.content
     }

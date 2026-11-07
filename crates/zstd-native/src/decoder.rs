@@ -24,9 +24,11 @@ use crate::xxhash::Xxh64;
 pub struct Decompressor {
     block: Box<BlockDecoder>,
     dict: Option<Dictionary>,
-    /// The dictionary was installed and no frame has used it yet (its
-    /// content is cold: see `BlockDecoder::dict_cold`).
-    dict_fresh: bool,
+    /// Where the content of the dictionary of the last frame ends (an
+    /// address; 0 for none). A frame whose dictionary ends elsewhere finds
+    /// it cold (libzstd's `ddictIsCold`: `dctx->dictEnd != dictEnd`), see
+    /// `BlockDecoder::dict_cold`.
+    dict_end: usize,
 }
 
 impl core::fmt::Debug for Decompressor {
@@ -55,7 +57,7 @@ impl Decompressor {
         Decompressor {
             block: Box::new(BlockDecoder::new()),
             dict: None,
-            dict_fresh: false,
+            dict_end: 0,
         }
     }
 
@@ -64,14 +66,17 @@ impl Decompressor {
         Decompressor {
             block: Box::new(BlockDecoder::new()),
             dict: Some(dict),
-            dict_fresh: true,
+            dict_end: 0,
         }
     }
 
     /// Replaces (or removes) the dictionary.
     pub fn set_dictionary(&mut self, dict: Option<Dictionary>) {
-        self.block.dict_changed();
-        self.dict_fresh = dict.is_some();
+        // The same dictionary installed again keeps what was built for it.
+        let same = matches!((&self.dict, &dict), (Some(a), Some(b)) if a.same(b));
+        if !same {
+            self.block.dict_changed();
+        }
         self.dict = dict;
     }
 
@@ -176,9 +181,15 @@ impl Decompressor {
             }
         };
         let dict_ent = self.dict.as_ref().and_then(Dictionary::entropy);
-        // libzstd's `ddictIsCold`: the first frame after the dictionary was
-        // installed (a frame without compressed blocks clears it too).
-        self.block.dict_cold = core::mem::take(&mut self.dict_fresh) && self.dict.is_some();
+        // libzstd's `ddictIsCold`: another dictionary than the last frame's
+        // (one installed again stays warm, and so does a new one where the
+        // last one was, just written; a frame without compressed blocks
+        // uses it up too).
+        let end = self
+            .dict
+            .as_ref()
+            .map_or(0, |d| d.content().as_ptr_range().end as usize);
+        self.block.dict_cold = end != 0 && end != core::mem::replace(&mut self.dict_end, end);
         let block_max = fh.block_size_max();
         let prefix = out.pos;
 
