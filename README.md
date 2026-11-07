@@ -42,27 +42,33 @@ risk. Sibling of [xz-native](https://github.com/zcsizmadia/xz-native).
 
   | zstd-native speed (1.25x = 25% faster) | vs C libzstd 1.5.7 | vs [structured-zstd](https://crates.io/crates/structured-zstd) 0.2.6 |
   |---|---:|---:|
-  | Compression, level 1 | 1.04x | 1.07x |
-  | Compression, level 3 (default) | 1.05x | 1.33x |
-  | Compression, level 9 | 1.13x | 1.28x |
-  | Compression, level 19 | 1.38x | 1.17x |
-  | Decompression (frames of levels 1-19) | 1.07-1.11x | 1.20-1.29x |
-  | Compression, 16 threads (levels 1-19) | 1.03-1.26x | no multithreading |
+  | Compression, level 1 | 1.03x | 1.07x |
+  | Compression, level 3 (default) | 1.00x | 1.33x |
+  | Compression, level 9 | 1.16x | 1.35x |
+  | Compression, level 19 | 1.40x | 1.20x |
+  | Decompression (frames of levels 1-19) | 1.06-1.10x | 1.21-1.30x |
+  | Compression, 16 threads (levels 1-19) | 1.09-1.31x | no multithreading |
 
-  zstd-native is faster than both on every Silesia file, level and
-  direction. structured-zstd is the fastest other pure-Rust zstd, and its
-  compressed output differs from libzstd's.
+  zstd-native is faster than structured-zstd on every Silesia file, level
+  and direction. Against libzstd it is faster on every file in
+  decompression and at levels 5 and up, and on par at levels 1-4 (a few
+  files 1-2% behind). structured-zstd is the fastest other pure-Rust zstd,
+  and its compressed output differs from libzstd's.
   [ruzstd](https://crates.io/crates/ruzstd) decompresses 3-7x slower than
   zstd-native.
 
   Against every C libzstd 1.5.7 build, including upstream's own gcc and
   clang builds and `-march=native`:
   - **Decompression:** zstd-native is 1.05-1.09x faster at levels 1-19.
-  - **Compression:** it is 1.01-1.16x faster at levels 5-15 and 1.15x or
-    more at level 19. At levels 1-4 it is 1.04-1.05x faster than the
+  - **Compression:** it is 1.06-1.26x faster at levels 5-15 and 1.15x or
+    more at level 19. At levels 1-4 it is 1.00-1.04x the speed of the
     `zstd` crate's build.
-  - **Multithreaded:** it is 1.03-1.26x faster with 16 workers, one-shot
+  - **Multithreaded:** it is 1.09-1.31x faster with 16 workers, one-shot
     or streaming.
+  - **Small frames, flushes, dictionaries** (against the `zstd` crate):
+    1.01-1.06x at levels 1-4 and 1.23-1.36x at level 19 (geomeans).
+    Streaming decompression is 1.07-1.10x, and `read_to_end` 1.23-1.38x.
+    Decoding with a cold dictionary is still 0.79-0.83x.
 
   Ports in other languages (Go, C#, Java, JavaScript) are slower at every
   level. They were measured once, as recorded in
