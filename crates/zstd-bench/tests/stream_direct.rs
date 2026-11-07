@@ -391,3 +391,49 @@ fn read_to_end_errors() {
     assert!(Decoder::new(&bin[..]).read_to_string(&mut s).is_err());
     assert_eq!(s, "keep");
 }
+
+/// A tiny frame claiming a huge content size (independent review): the
+/// `Vec` of `read_to_end` isn't grown by that claim, only by what the
+/// input at hand can produce, while real frames still decode.
+#[test]
+fn read_to_end_huge_content_size_claim() {
+    // Magic, 8-byte content size, 1 KiB window, then one raw block of 1
+    // byte (the last), followed by `tail` bytes of junk.
+    fn claim(cs: u64, tail: usize) -> Vec<u8> {
+        let mut f = vec![0x28, 0xb5, 0x2f, 0xfd, 0xC0, 0x00];
+        f.extend_from_slice(&cs.to_le_bytes());
+        f.extend_from_slice(&[0x09, 0x00, 0x00, b'a']);
+        f.resize(f.len() + tail, 0);
+        f
+    }
+    for (cs, wlog, tail, bound) in [
+        (1u64 << 27, None, 0, 4 << 10),
+        (1 << 40, Some(31), 0, 4 << 10),
+        // 1000 more input bytes make at most 250 blocks of 1 KiB.
+        (1 << 40, Some(31), 1000, 1 << 20),
+    ] {
+        let f = claim(cs, tail);
+        let mut d = Decoder::new(&f[..]);
+        if let Some(l) = wlog {
+            d.set_window_log_max(l);
+        }
+        let mut v = Vec::new();
+        assert!(d.read_to_end(&mut v).is_err());
+        assert!(
+            v.capacity() <= bound,
+            "content size {cs}: capacity {}",
+            v.capacity()
+        );
+    }
+    // Real frames, whole and through a small reader buffer.
+    let data = log_corpus(300_000);
+    let c = c_frame(&data, 3, Some(12), true, None);
+    let mut v = Vec::new();
+    Decoder::new(&c[..]).read_to_end(&mut v).unwrap();
+    assert!(v == data);
+    let mut v = Vec::new();
+    Decoder::new(io::BufReader::with_capacity(16, &c[..]))
+        .read_to_end(&mut v)
+        .unwrap();
+    assert!(v == data);
+}
