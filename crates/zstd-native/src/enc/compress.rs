@@ -20,11 +20,10 @@ use super::params::{
 };
 use super::presplit::{FpStats, optimal_block_size};
 use super::seq_store::{
-    LongLengthType, MAX_LL, MAX_ML, REP_START_VALUE, SeqDef, SeqStore, fill_codes, max_nb_seq,
+    LongLengthType, MAX_LL, MAX_ML, REP_START_VALUE, SeqStore, fill_codes, max_nb_seq,
 };
 use super::sequences::{
-    FseCTables, FseRepeat, SET_COMPRESSED, SeqFields, build_ctable, encode_sequences,
-    select_encoding_type,
+    FseCTables, FseRepeat, SET_COMPRESSED, build_ctable, encode_sequences, select_encoding_type,
 };
 use crate::error::{Error, Result};
 use crate::fse::{
@@ -39,21 +38,6 @@ pub(super) const LONGNBSEQ: usize = 0x7F00;
 pub(super) const DEFAULT_MAX_OFF: u32 = 28;
 pub(super) const RLE_MAX_LENGTH: usize = 25;
 const SUSPECT_UNCOMPRESSIBLE_LITERAL_RATIO: usize = 20;
-
-impl SeqFields for SeqDef {
-    #[inline(always)]
-    fn off_base(&self) -> u32 {
-        self.off_base
-    }
-    #[inline(always)]
-    fn lit_length(&self) -> u32 {
-        u32::from(self.lit_length)
-    }
-    #[inline(always)]
-    fn ml_base(&self) -> u32 {
-        u32::from(self.ml_base)
-    }
-}
 
 /// libzstd's `ZSTD_entropyCTables_t`.
 #[derive(Clone)]
@@ -379,12 +363,10 @@ fn entropy_compress_internal(
     let (s, e) = (ch.seq_start, ch.seq_end);
     let bitstream = encode_sequences(
         &mut dst[op..],
-        &next.fse.ml,
-        &ss.ml_code[s..e],
-        &next.fse.of,
-        &ss.of_code[s..e],
-        &next.fse.ll,
+        &next.fse,
         &ss.ll_code[s..e],
+        &ss.of_code[s..e],
+        &ss.ml_code[s..e],
         &ss.sequences[s..e],
     )?;
     op += bitstream;

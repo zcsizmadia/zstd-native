@@ -104,6 +104,40 @@ impl<'a> BitWriter<'a> {
         self.container >>= nb_bytes * 8;
     }
 
+    /// The bytes the write position may still advance by (the flushes'
+    /// 8-byte writes stay inside the buffer while it does).
+    #[inline(always)]
+    pub(crate) fn room(&self) -> usize {
+        self.end - self.pos
+    }
+
+    /// The container, its bit count and the write position, for a writer
+    /// loop outside this type (`seq_asm`); [`set_raw_state`] takes them
+    /// back.
+    ///
+    /// [`set_raw_state`]: Self::set_raw_state
+    #[inline(always)]
+    pub(crate) fn raw_state(&mut self) -> (u64, u32, *mut u8) {
+        (
+            self.container,
+            self.bit_pos,
+            self.dst.as_mut_ptr().wrapping_add(self.pos),
+        )
+    }
+
+    /// Takes back the state of [`raw_state`](Self::raw_state) after the
+    /// writes: `out` must not have moved past [`room`](Self::room) (checked)
+    /// and at most 7 bits may be pending.
+    #[inline(always)]
+    pub(crate) fn set_raw_state(&mut self, container: u64, bit_pos: u32, out: *mut u8) {
+        let pos = (out as usize).wrapping_sub(self.dst.as_mut_ptr() as usize);
+        assert!(pos >= self.pos && pos <= self.end && bit_pos < 8);
+        debug_assert!(container >> bit_pos == 0);
+        self.container = container;
+        self.bit_pos = bit_pos;
+        self.pos = pos;
+    }
+
     /// libzstd's `BIT_flushBitsFast` (used when the output is known to be
     /// large enough). Same as [`flush`](Self::flush): the clamp is kept so
     /// the writer stays in bounds whatever the caller does.
