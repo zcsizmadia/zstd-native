@@ -725,11 +725,25 @@ impl FseCState {
         ct: &FseCTable<N, S>,
         symbol: u32,
     ) {
+        let (value, nb_bits) = self.step(ct, symbol);
+        bw.add_bits(value, nb_bits);
+    }
+
+    /// [`encode`](Self::encode) without the write: moves to the next state
+    /// and returns the old one (unmasked) with the number of its low bits
+    /// that `FSE_encodeSymbol` writes.
+    #[inline(always)]
+    pub(crate) fn step<const N: usize, const S: usize>(
+        &mut self,
+        ct: &FseCTable<N, S>,
+        symbol: u32,
+    ) -> (u64, u32) {
         let tt = ct.tt(symbol);
         let nb_bits_out = (self.value.wrapping_add(tt.delta_nb_bits as usize) >> 16) as u32;
-        bw.add_bits(self.value as u64, nb_bits_out);
+        let value = self.value as u64;
         let idx = (self.value >> nb_bits_out).wrapping_add(tt.delta_find_state as isize as usize);
         self.value = ct.next_state(idx);
+        (value, nb_bits_out)
     }
 
     /// libzstd's `FSE_flushCState`: writes the final state.
