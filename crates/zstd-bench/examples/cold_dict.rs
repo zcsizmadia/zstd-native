@@ -20,16 +20,30 @@
 //!   `ZSTD_decompress_usingDDict` with the next `DDict`.
 //! - `create`: one reused decompressor; each frame parses its own (cold)
 //!   copy of the dictionary bytes, installs it, decodes and drops it:
-//!   native `Dictionary::new`, libzstd `ZSTD_createDDict` +
-//!   `ZSTD_decompress_usingDDict` + `ZSTD_freeDDict`.
+//!   native `Dictionary::new` + `set_dictionary(Some(dict))` + decode +
+//!   `set_dictionary(None)`, libzstd `ZSTD_createDDict` +
+//!   `ZSTD_decompress_usingDDict` + `ZSTD_freeDDict`. Both sides free the
+//!   dictionary before parsing the next one, so the allocator may hand the
+//!   next one the same address, which both libraries then treat as warm
+//!   (`ddictIsCold` compares addresses).
+//! - `create-keep`: `create` with the previous dictionary freed only after
+//!   the next one is parsed (native: replaced by `set_dictionary`; libzstd:
+//!   `ZSTD_freeDDict` of the previous `DDict` after `ZSTD_createDDict`),
+//!   so every dictionary has a new address and is cold.
 //! - `parse`: only the dictionary parse (and drop) of `create`.
+//! - `parse-warm`: `parse` from one copy of the bytes, in cache: the table
+//!   builds without the cold content copy.
 //! - `warm`: one decompressor and one dictionary for all the frames (the
 //!   dictionary installed once, before the timing).
 //! - `reinstall`: `warm`, installing the same dictionary again before each
 //!   frame (`set_dictionary(Some(dict.clone()))`; libzstd: `warm`, the
 //!   same `DDict` passed each time).
 //!
-//! `size` cuts the frames to fewer bytes (default and maximum 4096).
+//! `size` sets the frame size (default 4096): smaller cuts the 4 KiB
+//! frames, larger (up to 1 MiB, for literals sections up to 128 KiB) takes
+//! 64 frames of `size` bytes from the same kind of data after the
+//! training samples. `$COLD_DICT_DATA=<file>` takes the samples and frames
+//! from that file (repeated as needed) instead of the generated logs.
 
 use std::time::Instant;
 
@@ -38,14 +52,32 @@ fn main() {
     let level: i32 = std::env::args().nth(2).map_or(3, |s| s.parse().unwrap());
     let mode = std::env::args().nth(3).unwrap_or_else(|| "ctx".into());
     let size: usize = std::env::args().nth(4).map_or(4096, |s| s.parse().unwrap());
-    let corpus = zstd_bench::log_corpus(8 << 20);
+    assert!(size <= 1 << 20, "size over 1 MiB");
+    let len = (8 << 20).max(1000 * 4096 + 64 * size);
+    // `$COLD_DICT_DATA=<file>`: that file (repeated as needed) instead of
+    // the generated logs, e.g. a Silesia file for literals-heavy blocks.
+    let corpus = match std::env::var("COLD_DICT_DATA") {
+        Ok(path) => {
+            let f = std::fs::read(path).unwrap();
+            f.iter().copied().cycle().take(len).collect()
+        }
+        Err(_) => zstd_bench::log_corpus(len),
+    };
     let samples: Vec<&[u8]> = corpus.chunks(4096).collect();
     let dict = zstd::dict::from_samples(&samples[..1000], 110 << 10).unwrap();
     let mut c = zstd::bulk::Compressor::with_dictionary(level, &dict).unwrap();
-    let frames: Vec<Vec<u8>> = samples[1000..1064]
-        .iter()
-        .map(|s| c.compress(&s[..size]).unwrap())
-        .collect();
+    let frames: Vec<Vec<u8>> = if size <= 4096 {
+        samples[1000..1064]
+            .iter()
+            .map(|s| c.compress(&s[..size]).unwrap())
+            .collect()
+    } else {
+        corpus[1000 * 4096..]
+            .chunks_exact(size)
+            .take(64)
+            .map(|s| c.compress(s).unwrap())
+            .collect()
+    };
     zstd_native::__private::set_seq_loop(match lib.as_str() {
         "native-long" => Some(true),
         "native-short" => Some(false),
@@ -53,7 +85,7 @@ fn main() {
     });
     let native = lib != "c";
     let copies = 2048;
-    let mut out = vec![0u8; 8192];
+    let mut out = vec![0u8; size.max(8192)];
     let frame = |i: usize| &frames[i % frames.len()][..];
     let mut best = f64::MAX;
     for _ in 0..7 {
@@ -112,9 +144,10 @@ fn main() {
                     assert_eq!(n, size);
                 }
             }
-            ("create" | "parse", _) => {
+            ("create" | "create-keep" | "parse", _) => {
                 let raw: Vec<Vec<u8>> = (0..copies).map(|_| dict.clone()).collect();
                 let parse_only = mode == "parse";
+                let keep = mode == "create-keep";
                 if native {
                     let mut d = zstd_native::Decompressor::new();
                     t = Instant::now();
@@ -124,12 +157,18 @@ fn main() {
                             std::hint::black_box(&dict);
                             continue;
                         }
+                        // Replacing drops the previous dictionary.
                         d.set_dictionary(Some(dict));
                         let n = d.decompress_to_slice(frame(i), &mut out).unwrap();
                         assert_eq!(n, size);
+                        if !keep {
+                            // `ZSTD_freeDDict` right after the frame.
+                            d.set_dictionary(None);
+                        }
                     }
                 } else {
                     let mut dctx = zstd::zstd_safe::DCtx::create();
+                    let mut prev = None;
                     t = Instant::now();
                     for (i, r) in raw.iter().enumerate() {
                         let dd = zstd::zstd_safe::DDict::create(r);
@@ -137,10 +176,26 @@ fn main() {
                             std::hint::black_box(&dd);
                             continue;
                         }
+                        // Frees the previous `DDict` (create-keep).
+                        prev = None;
                         let n = dctx
                             .decompress_using_ddict(&mut out[..], frame(i), &dd)
                             .unwrap();
                         assert_eq!(n, size);
+                        if keep {
+                            prev = Some(dd);
+                        }
+                    }
+                    drop(prev);
+                }
+            }
+            ("parse-warm", _) => {
+                t = Instant::now();
+                for _ in 0..copies {
+                    if native {
+                        std::hint::black_box(zstd_native::Dictionary::new(&dict).unwrap());
+                    } else {
+                        std::hint::black_box(zstd::zstd_safe::DDict::create(&dict));
                     }
                 }
             }
