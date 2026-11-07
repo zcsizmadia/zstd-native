@@ -24,13 +24,11 @@ use crate::xxhash::Xxh64;
 pub struct Decompressor {
     block: Box<BlockDecoder>,
     dict: Option<Dictionary>,
-    /// The dictionary was installed (another one than before, by identity:
-    /// `Dictionary::same`) and no frame has used it yet: the next frame
-    /// finds it cold (libzstd's `ddictIsCold`), see
-    /// `BlockDecoder::dict_cold`. The same rule as [`StreamDecoder`]'s.
-    ///
-    /// [`StreamDecoder`]: crate::StreamDecoder
-    dict_fresh: bool,
+    /// Where the content of the dictionary of the last frame ends (an
+    /// address; 0 for none). A frame whose dictionary ends elsewhere finds
+    /// it cold (libzstd's `ddictIsCold`: `dctx->dictEnd != dictEnd`), see
+    /// `BlockDecoder::dict_cold`.
+    dict_end: usize,
 }
 
 impl core::fmt::Debug for Decompressor {
@@ -59,7 +57,7 @@ impl Decompressor {
         Decompressor {
             block: Box::new(BlockDecoder::new()),
             dict: None,
-            dict_fresh: false,
+            dict_end: 0,
         }
     }
 
@@ -68,7 +66,7 @@ impl Decompressor {
         Decompressor {
             block: Box::new(BlockDecoder::new()),
             dict: Some(dict),
-            dict_fresh: true,
+            dict_end: 0,
         }
     }
 
@@ -78,7 +76,6 @@ impl Decompressor {
         let same = matches!((&self.dict, &dict), (Some(a), Some(b)) if a.same(b));
         if !same {
             self.block.dict_changed();
-            self.dict_fresh = true;
         }
         self.dict = dict;
     }
@@ -184,14 +181,15 @@ impl Decompressor {
             }
         };
         let dict_ent = self.dict.as_ref().and_then(Dictionary::entropy);
-        // libzstd's `ddictIsCold`: the first frame after another dictionary
-        // was installed (one installed again stays warm; a frame without
-        // compressed blocks uses it up too). libzstd compares the content's
-        // end address with the last frame's; identity is the same for
-        // dictionaries that stay alive, and a new one at a freed one's
-        // address is cold here.
-        let fresh = core::mem::take(&mut self.dict_fresh);
-        self.block.dict_cold = self.dict.is_some() && fresh;
+        // libzstd's `ddictIsCold`: another dictionary than the last frame's
+        // (one installed again stays warm, and so does a new one where the
+        // last one was, just written; a frame without compressed blocks
+        // uses it up too).
+        let end = self
+            .dict
+            .as_ref()
+            .map_or(0, |d| d.content().as_ptr_range().end as usize);
+        self.block.dict_cold = end != 0 && end != core::mem::replace(&mut self.dict_end, end);
         let block_max = fh.block_size_max();
         let prefix = out.pos;
 
