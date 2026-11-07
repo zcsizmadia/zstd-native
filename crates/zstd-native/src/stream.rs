@@ -139,6 +139,13 @@ pub struct StreamDecoder {
     direct: bool,
     produced: u64,
     xxh: Option<Xxh64>,
+    /// An error found after output had already gone into the caller's
+    /// buffer (allocating the window buffer when leaving direct output):
+    /// that call reported its progress, the next one returns this.
+    pending: Option<Error>,
+    /// Tests: allocating the window buffer fails.
+    #[cfg(test)]
+    fail_window: bool,
 }
 
 impl core::fmt::Debug for StreamDecoder {
@@ -180,6 +187,9 @@ impl StreamDecoder {
             direct: false,
             produced: 0,
             xxh: None,
+            pending: None,
+            #[cfg(test)]
+            fail_window: false,
         }
     }
 
@@ -211,11 +221,15 @@ impl StreamDecoder {
         self.flush = 0;
         self.direct = false;
         self.fh = None;
+        self.pending = None;
     }
 
     /// True between frames with no output pending.
     pub fn at_frame_boundary(&self) -> bool {
-        self.stage == Stage::Magic && self.hdr_len == 0 && self.flush == self.cur
+        self.stage == Stage::Magic
+            && self.hdr_len == 0
+            && self.flush == self.cur
+            && self.pending.is_none()
     }
 
     /// Consumes input and writes output until the input is used up or the
@@ -224,8 +238,15 @@ impl StreamDecoder {
     /// # Errors
     ///
     /// Any [`Error`] for corrupt or unsupported input; the decoder must
-    /// then be [`reset`](Self::reset) before reuse.
+    /// then be [`reset`](Self::reset) before reuse. Output written by an
+    /// erroring call is lost (as libzstd's), except when the window buffer
+    /// can't be allocated ([`Error::OutputTooLarge`]) after output already
+    /// went straight into `output`: that call returns its progress (not at
+    /// a frame boundary) and the next call returns the error.
     pub fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress> {
+        if let Some(e) = self.pending {
+            return Err(e);
+        }
         let mut out = Output {
             ptr: output.as_mut_ptr(),
             cap: output.len(),
@@ -234,8 +255,11 @@ impl StreamDecoder {
         let read = self
             .run(input, &mut out, None)
             .inspect_err(|_| self.drop_direct())?;
-        // The caller's buffer is gone after this call.
-        self.leave_direct(&output[..out.pos])?;
+        // The caller's buffer is gone after this call. If the window buffer
+        // can't take the history, the output written stays reported.
+        if let Err(e) = self.leave_direct(&output[..out.pos]) {
+            self.pending = Some(e);
+        }
         Ok(Progress {
             read,
             written: out.pos,
@@ -251,6 +275,9 @@ impl StreamDecoder {
     /// any other kind of call.
     #[cfg(feature = "std")]
     pub(crate) fn decode_vec(&mut self, input: &[u8], v: &mut Vec<u8>) -> Result<usize> {
+        if let Some(e) = self.pending {
+            return Err(e);
+        }
         let mut out = Output {
             ptr: v.as_mut_ptr(),
             cap: v.capacity(),
@@ -349,12 +376,12 @@ impl StreamDecoder {
                 }
                 Stage::Block { btype, size, last } => {
                     let need = if btype == 1 { 1 } else { size };
-                    if self.in_buf.is_empty() && rest.len() >= need {
+                    let r = if self.in_buf.is_empty() && rest.len() >= need {
                         // The whole block is in the input: decode in place.
                         ip += need;
                         let src = &input[ip - need..ip];
                         let left = input.len() - ip;
-                        self.decode_block(btype, size, src, left, out, vec.as_deref_mut())?;
+                        self.decode_block(btype, size, src, left, out, vec.as_deref_mut())
                     } else {
                         let take = (need - self.in_buf.len()).min(rest.len());
                         self.in_buf.extend_from_slice(&rest[..take]);
@@ -367,7 +394,15 @@ impl StreamDecoder {
                         let r = self.decode_block(btype, size, &buf, left, out, vec.as_deref_mut());
                         self.in_buf = buf;
                         self.in_buf.clear();
-                        r?;
+                        r
+                    };
+                    if let Err(e) = r {
+                        if self.pending.is_some() {
+                            // The output so far stands; the error is the
+                            // next call's (see `decode_block`).
+                            break;
+                        }
+                        return Err(e);
                     }
                     self.stage = if !last {
                         Stage::BlockHeader
@@ -537,7 +572,13 @@ impl StreamDecoder {
                 // (initialized: written by the caller or this decoder).
                 #[allow(unsafe_code)]
                 let done = unsafe { core::slice::from_raw_parts(out.ptr, out.pos) };
-                self.leave_direct(done)?;
+                if let Err(e) = self.leave_direct(done) {
+                    // This call's output so far went straight into the
+                    // caller's buffer: `run` stops and reports it (this
+                    // block's input counted as read), the error comes next.
+                    self.pending = Some(e);
+                    return Err(e);
+                }
             }
         }
         // Wrap when the block (plus wildcopy overrun) wouldn't fit. Tracked
@@ -646,6 +687,10 @@ impl StreamDecoder {
     /// Allocates the window buffer for the current frame.
     fn ensure_window(&mut self) -> Result<()> {
         if self.win.capacity() < self.win_size {
+            #[cfg(test)]
+            if self.fail_window {
+                return Err(Error::OutputTooLarge);
+            }
             self.win = Vec::new();
             self.win
                 .try_reserve_exact(self.win_size)
@@ -903,6 +948,47 @@ mod tests {
                     let _ = d.decode(&f[f.len() / 2..], &mut buf[..1]);
                     let _ = d.decode(&f[f.len() / 2..], &mut buf);
                 }
+            }
+        }
+    }
+
+    /// The window buffer can't be allocated when leaving direct output
+    /// (independent review): the call that wrote output straight into the
+    /// caller's buffer reports it, the next call returns the error, until
+    /// `reset`.
+    #[test]
+    fn window_alloc_failure_keeps_progress() {
+        let data = text(5000);
+        let f = frame(&data, 10, false);
+        // Leaving direct output at the end of the call (input runs out
+        // mid-frame), and mid-call (a block doesn't fit the output).
+        for (input, out_size) in [(&f[..f.len() / 2], 2 * data.len()), (&f[..], 3000)] {
+            let mut d = StreamDecoder::new();
+            d.fail_window = true;
+            let mut buf = vec![0u8; out_size];
+            let p = d.decode(input, &mut buf).unwrap();
+            assert!(p.written > 0 && !p.at_frame_boundary);
+            assert!(buf[..p.written] == data[..p.written]);
+            assert!(!d.at_frame_boundary());
+            assert_eq!(d.decode(&f[p.read..], &mut buf), Err(Error::OutputTooLarge));
+            assert_eq!(d.decode(&f[p.read..], &mut buf), Err(Error::OutputTooLarge));
+            d.reset();
+            d.fail_window = false;
+            assert_eq!(stream_with(&mut d, &f), data);
+        }
+    }
+
+    fn stream_with(d: &mut StreamDecoder, src: &[u8]) -> Vec<u8> {
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 777];
+        let mut ip = 0;
+        loop {
+            let p = d.decode(&src[ip..], &mut buf).unwrap();
+            ip += p.read;
+            got.extend_from_slice(&buf[..p.written]);
+            if p.read == 0 && p.written == 0 {
+                assert!(p.at_frame_boundary);
+                return got;
             }
         }
     }
