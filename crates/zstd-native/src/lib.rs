@@ -64,7 +64,7 @@
 #![warn(missing_docs)]
 
 extern crate alloc;
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", test))]
 extern crate std;
 
 /// Aligns the code that follows to a 64-byte boundary plus `$pad` bytes

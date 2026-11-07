@@ -535,6 +535,14 @@ pub fn set_seq_loop(long: Option<bool>) {
     SEQ_LOOP.store(v, Ordering::Relaxed);
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// The library's unit tests choose the loop per thread
+    /// (`tests::set_thread_seq_loop`): they run in parallel, and the
+    /// process-wide [`SEQ_LOOP`] would force it for the others too.
+    static THREAD_SEQ_LOOP: core::cell::Cell<u8> = const { core::cell::Cell::new(LOOP_AUTO) };
+}
+
 /// Blocks decoded by the prefetching loop, in builds with debug
 /// assertions (for tests that must prove they reach it).
 #[cfg(debug_assertions)]
@@ -568,7 +576,13 @@ pub fn long_blocks() -> Option<usize> {
 /// every block).
 #[inline]
 fn use_prefetch_loop(cold: bool) -> bool {
-    let long = match SEQ_LOOP.load(Ordering::Relaxed) {
+    let choice = SEQ_LOOP.load(Ordering::Relaxed);
+    #[cfg(test)]
+    let choice = match THREAD_SEQ_LOOP.with(core::cell::Cell::get) {
+        LOOP_AUTO => choice,
+        c => c,
+    };
+    let long = match choice {
         LOOP_LONG => true,
         LOOP_SHORT => false,
         _ => HAS_PREFETCH && cold,
@@ -1624,6 +1638,17 @@ mod tests {
         v
     }
 
+    /// Forces the sequence loop as [`set_seq_loop`] does, for this thread
+    /// only (the tests run in parallel).
+    fn set_thread_seq_loop(long: Option<bool>) {
+        let v = match long {
+            None => LOOP_AUTO,
+            Some(true) => LOOP_LONG,
+            Some(false) => LOOP_SHORT,
+        };
+        THREAD_SEQ_LOOP.with(|c| c.set(v));
+    }
+
     /// The prefetching loop decodes what the fused loop does: blocks of 1
     /// to many sequences (ending with the ring partly full), and matches
     /// reaching into a dictionary.
@@ -1643,7 +1668,7 @@ mod tests {
                 let plain = crate::compress(src, level).unwrap();
                 let with_dict = crate::compress_with_dictionary(src, &dict, level).unwrap();
                 for long in [false, true] {
-                    set_seq_loop(Some(long));
+                    set_thread_seq_loop(Some(long));
                     let got = crate::decompress(&plain).unwrap();
                     assert!(got == src, "{n} bytes L{level} long={long}");
                     let mut d = crate::Decompressor::with_dictionary(crate::Dictionary::raw(&dict));
@@ -1655,6 +1680,6 @@ mod tests {
                 }
             }
         }
-        set_seq_loop(None);
+        set_thread_seq_loop(None);
     }
 }

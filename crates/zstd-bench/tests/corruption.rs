@@ -5,8 +5,23 @@
 //!
 //! Run with debug assertions (`--profile ci`) so the `unsafe` hot paths'
 //! assertions are checked. `ZSTD_NATIVE_CORRUPTION_ITERS` scales it up.
+//!
+//! The tests switch the process-wide sequence loop choice
+//! (`set_seq_loop`), so they run one at a time.
+
+use std::sync::{Mutex, MutexGuard};
 
 use zstd_bench::{Rng, c_compress, log_corpus, numeric_corpus, source_corpus};
+
+static SERIAL: Mutex<()> = Mutex::new(());
+
+/// Held by every test: each sets the sequence loop for its own decodes.
+/// Starts from the automatic choice (a failed test may have left one set).
+fn serial() -> MutexGuard<'static, ()> {
+    let g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    zstd_native::__private::set_seq_loop(None);
+    g
+}
 
 fn c_decompress(src: &[u8], cap: usize) -> Option<Vec<u8>> {
     zstd::bulk::Decompressor::new()
@@ -17,6 +32,7 @@ fn c_decompress(src: &[u8], cap: usize) -> Option<Vec<u8>> {
 
 #[test]
 fn mutated_frames() {
+    let _serial = serial();
     let iters: usize = std::env::var("ZSTD_NATIVE_CORRUPTION_ITERS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -103,6 +119,7 @@ fn mutated_frames() {
 #[test]
 fn mutated_streams() {
     use std::io::Write;
+    let _serial = serial();
     let iters: usize = std::env::var("ZSTD_NATIVE_CORRUPTION_ITERS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -174,6 +191,7 @@ fn mutated_streams() {
 #[test]
 fn mutated_streams_direct() {
     use std::io::{Read, Write};
+    let _serial = serial();
     let iters: usize = std::env::var("ZSTD_NATIVE_CORRUPTION_ITERS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -283,6 +301,7 @@ fn mutated_streams_direct() {
 /// accepts with the same output.
 #[test]
 fn mutated_dictionary_frames() {
+    let _serial = serial();
     let iters: usize = std::env::var("ZSTD_NATIVE_CORRUPTION_ITERS")
         .ok()
         .and_then(|v| v.parse().ok())
