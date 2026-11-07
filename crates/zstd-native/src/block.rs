@@ -24,6 +24,8 @@ pub(crate) const WILDCOPY_OVERLENGTH: usize = 32;
 pub(crate) const BLOCK_SIZE_MAX: usize = 128 << 10;
 const MIN_LITERALS_FOR_4_STREAMS: usize = 6;
 const LONGNBSEQ: usize = 0x7F00;
+/// The initial size of the literal buffer.
+const LIT_BUF_MIN: usize = 4096;
 
 /// Where decoded bytes go. `ptr[..cap]` must be writable (it may be
 /// uninitialized); `ptr[..pos]` holds the output so far.
@@ -92,7 +94,9 @@ pub(crate) struct BlockDecoder {
     dict_x2: Option<Box<huf::X2Table>>,
     dict_x2_ready: bool,
     /// Decoded literals, always with `WILDCOPY_OVERLENGTH` readable bytes
-    /// after the last literal.
+    /// after the last literal. Its first `LIT_BUF_MIN` bytes come with the
+    /// decoder (libzstd's `DCtx` holds its literal buffer from creation):
+    /// a fresh decompressor's first frame doesn't allocate and fault it in.
     lit_buf: Vec<u8>,
     pub cpu: Features,
     /// The dictionary was just installed and its content is likely out of
@@ -115,7 +119,7 @@ impl BlockDecoder {
             seq_dict: false,
             dict_x2: None,
             dict_x2_ready: false,
-            lit_buf: Vec::new(),
+            lit_buf: alloc::vec![0; LIT_BUF_MIN],
             cpu: Features::detect(),
             dict_cold: false,
         }
@@ -148,7 +152,7 @@ impl BlockDecoder {
     fn lit_space(&mut self, n: usize) -> &mut [u8] {
         let need = n + WILDCOPY_OVERLENGTH;
         if self.lit_buf.len() < need {
-            self.lit_buf.resize(need.max(4096), 0);
+            self.lit_buf.resize(need.max(LIT_BUF_MIN), 0);
         }
         &mut self.lit_buf[..n]
     }
@@ -350,7 +354,7 @@ impl BlockDecoder {
                 let cpu = self.cpu;
                 let need = lit_size + WILDCOPY_OVERLENGTH;
                 if self.lit_buf.len() < need {
-                    self.lit_buf.resize(need.max(4096), 0);
+                    self.lit_buf.resize(need.max(LIT_BUF_MIN), 0);
                 }
                 let (table, x2) = match (self.huf_dict, dict_ent) {
                     (true, Some(e)) if self.dict_cold => {
