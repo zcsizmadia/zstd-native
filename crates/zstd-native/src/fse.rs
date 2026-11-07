@@ -370,10 +370,12 @@ pub(crate) const fn build_seq_table(
     }
 }
 
-/// Run-time version of [`build_seq_table`] with libzstd's fast spread for
-/// tables without low-probability (-1) symbols: lay the symbols down in
-/// order 8 bytes at a time, then build the cells in order, reading that
-/// layout with the inverse stride ([`inv_table_step`], meta/zstd#4836).
+/// Run-time version of [`build_seq_table`] with libzstd's fast spread: lay
+/// the symbols down in order 8 bytes at a time, then build the cells in
+/// order, reading that layout with the inverse stride ([`inv_table_step`],
+/// meta/zstd#4836) for tables without low-probability (-1) symbols, or
+/// through a branch-free scatter of it for tables with them (where libzstd
+/// takes its slow spread).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_seq_table_fast(
     dt: &mut [SeqSymbol],
@@ -423,16 +425,29 @@ fn build_fast_body(
     bits: &[u8],
     state_offset: u16,
 ) {
+    const CELL_MASK: usize = (1 << LL_FSE_LOG) - 1;
     let norm = &norm[..max_sv1];
-    if norm.contains(&-1) {
-        build_seq_table(dt, norm, max_sv1, table_log, base, bits, state_offset);
-        return;
-    }
     let table_size = 1usize << table_log;
     let mask = table_size - 1;
+    // The sorted layout of the symbols with a positive count; the
+    // low-probability (-1) ones take one cell each at the top instead.
     let mut spread = [0u8; (1 << LL_FSE_LOG) + 8];
     let mut pos = 0usize;
+    let mut low = 0usize;
+    // 64-entry local tables indexed with `s & 63` (every code is under 53):
+    // no bounds checks in the per-cell loop.
+    let mut next = [0u16; 64];
+    let mut sym_base = [0u32; 64];
+    let mut sym_bits = [0u8; 64];
     for (s, &n) in norm.iter().enumerate() {
+        sym_base[s] = base[s];
+        sym_bits[s] = bits[s];
+        if n == -1 {
+            next[s] = 1;
+            low += 1;
+            continue;
+        }
+        next[s] = n as u16;
         let n = n as usize;
         let v = (s as u64 * 0x0101_0101_0101_0101).to_le_bytes();
         let mut i = 0;
@@ -445,25 +460,9 @@ fn build_fast_body(
         }
         pos += n;
     }
-    debug_assert_eq!(pos, table_size);
-    // 64-entry local tables indexed with `s & 63` (every code is under 53):
-    // no bounds checks in the per-cell loop.
-    let mut next = [0u16; 64];
-    let mut sym_base = [0u32; 64];
-    let mut sym_bits = [0u8; 64];
-    for (s, &n) in norm.iter().enumerate() {
-        next[s] = n as u16;
-        sym_base[s] = base[s];
-        sym_bits[s] = bits[s];
-    }
-    // Fused spread and build (meta/zstd#4836): cell `u` holds the sorted
-    // symbol at `(u * inv) & mask` (see `inv_table_step`).
-    let inv = inv_table_step(table_size as u32) as usize;
-    let mut si = 0usize;
-    for d in dt[..table_size].iter_mut() {
-        // `si <= mask < 512`: the `& 511` only drops the bounds check.
-        let s = (spread[si & ((1 << LL_FSE_LOG) - 1)] & 63) as usize;
-        si = (si + inv) & mask;
+    debug_assert_eq!(pos + low, table_size);
+    let mut cell = |d: &mut SeqSymbol, s: usize| {
+        let s = s & 63;
         let ns = u32::from(next[s]);
         next[s] += 1;
         let nb = table_log - highbit32(ns);
@@ -473,8 +472,49 @@ fn build_fast_body(
             nb_bits: nb as u8,
             base: sym_base[s],
         };
+    };
+    if low == 0 {
+        // Fused spread and build (meta/zstd#4836): cell `u` holds the
+        // sorted symbol at `(u * inv) & mask` (see `inv_table_step`).
+        let inv = inv_table_step(table_size as u32) as usize;
+        let mut si = 0usize;
+        for d in dt[..table_size].iter_mut() {
+            // `si <= mask < 512`: the `& 511` only drops the bounds check.
+            cell(d, spread[si & CELL_MASK] as usize);
+            si = (si + inv) & mask;
+        }
+        debug_assert_eq!(si, 0, "visited every cell");
+        return;
     }
-    debug_assert_eq!(si, 0, "visited every cell");
+    // With low-probability symbols, libzstd's spread skips the cells above
+    // `high`: walk every cell in stride order (the stride is odd, so that
+    // visits each once) and write the next sorted symbol to each, taking
+    // the next one only after a cell at or below `high`. The cells above
+    // get the low-probability symbols after. No branches, unlike the
+    // reference's skip loop, and the same table.
+    let high = table_size - 1 - low;
+    let step = table_step(table_size as u32) as usize;
+    let mut syms = [0u8; 1 << LL_FSE_LOG];
+    let mut position = 0usize;
+    let mut k = 0usize;
+    for _ in 0..table_size {
+        // `position <= mask` and `k <= high < 512`: the masks only drop
+        // the bounds checks.
+        syms[position & CELL_MASK] = spread[k & CELL_MASK];
+        k += usize::from(position <= high);
+        position = (position + step) & mask;
+    }
+    debug_assert_eq!((position, k), (0, high + 1));
+    let mut top = table_size - 1;
+    for (s, &n) in norm.iter().enumerate() {
+        if n == -1 {
+            syms[top] = s as u8;
+            top -= 1;
+        }
+    }
+    for (d, &s) in dt[..table_size].iter_mut().zip(&syms) {
+        cell(d, s as usize);
+    }
 }
 
 /// The three tables live in one array, so the sequence loop needs a single
@@ -758,6 +798,76 @@ mod build_tests {
                     (b[u].next_state, b[u].nb_bits, b[u].base, b[u].nb_add_bits),
                     "case {case} cell {u}"
                 );
+            }
+        }
+    }
+
+    /// Tables with low-probability (-1) symbols, from one to all but one
+    /// of the symbols (the branch-free scatter of the fast build), give
+    /// exactly the reference table, with and without BMI2.
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn fast_build_low_probability_matches_reference() {
+        let mut r = 99u64;
+        let mut next = || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        let detected = Features::detect();
+        for case in 0..if cfg!(miri) { 2 } else { 3000 } {
+            let log = 5 + (next() % 5) as u32;
+            let size = 1usize << log;
+            let max_sv1 = 2 + next() as usize % (MAX_ML - 1);
+            let low = 1 + next() as usize % (max_sv1 - 1).min(size - 1);
+            let mut norm = [0i16; MAX_ML + 1];
+            // `low` random symbols at -1, the other cells spread over the
+            // rest (some at 0, at least one positive).
+            let mut picked = 0;
+            while picked < low {
+                let s = next() as usize % max_sv1;
+                if norm[s] == 0 {
+                    norm[s] = -1;
+                    picked += 1;
+                }
+            }
+            let mut rest = [0usize; MAX_ML + 1];
+            let mut nr = 0;
+            for s in 0..max_sv1 {
+                if norm[s] == 0 {
+                    rest[nr] = s;
+                    nr += 1;
+                }
+            }
+            let mut left = size - low;
+            for (i, &s) in rest[..nr].iter().enumerate() {
+                let v = if i + 1 == nr {
+                    left
+                } else {
+                    next() as usize % (left + 1) / 2
+                };
+                norm[s] = v as i16;
+                left -= v;
+            }
+            let mut a = [ZERO; 512];
+            build_seq_table(&mut a, &norm, max_sv1, log, &ML_BASE, &ML_BITS, 3);
+            for cpu in [
+                detected,
+                Features {
+                    bmi2: false,
+                    ..detected
+                },
+            ] {
+                let mut b = [ZERO; 512];
+                build_seq_table_fast(&mut b, &norm, max_sv1, log, &ML_BASE, &ML_BITS, 3, cpu);
+                for u in 0..size {
+                    assert_eq!(
+                        (a[u].next_state, a[u].nb_bits, a[u].base, a[u].nb_add_bits),
+                        (b[u].next_state, b[u].nb_bits, b[u].base, b[u].nb_add_bits),
+                        "case {case} cell {u}"
+                    );
+                }
             }
         }
     }
