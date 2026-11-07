@@ -127,7 +127,7 @@ fn main() {
     }
     let el = t.elapsed().as_secs_f64();
     println!(
-        "{lib} {ds} L{level}: ratio {:.3}, {:.3} MiB/s",
+        "{lib} {ds} L{level}: ratio {:.3}, {:.3} MiB/s, {size} bytes",
         data.len() as f64 / size as f64,
         (n as f64 * data.len() as f64) / el / (1 << 20) as f64
     );
@@ -148,7 +148,7 @@ fn run(name: &str, secs: f64, mut f: impl FnMut() -> (usize, usize)) {
     }
     let el = t.elapsed().as_secs_f64();
     println!(
-        "{name}: ratio {:.3}, {:.3} MiB/s",
+        "{name}: ratio {:.3}, {:.3} MiB/s, {outs} bytes",
         ins as f64 / outs as f64,
         (n as f64 * ins as f64) / el / (1 << 20) as f64
     );
