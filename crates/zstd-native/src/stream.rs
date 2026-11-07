@@ -478,6 +478,9 @@ impl StreamDecoder {
         // libzstd's `ddictIsCold`: the first frame after the dictionary was
         // installed, or after a frame that wrapped the window buffer (libzstd
         // then compares the history end it moved with the dictionary's end).
+        // The same rule as `Decompressor`'s address comparison: this
+        // decoder's dictionary is fixed at construction, so its content's
+        // end changes only before the first frame.
         let fresh = core::mem::take(&mut self.dict_fresh);
         self.block.dict_cold = self.dict.is_some() && (fresh || self.old_end.is_some());
         // The window never needs to exceed the frame's size.
