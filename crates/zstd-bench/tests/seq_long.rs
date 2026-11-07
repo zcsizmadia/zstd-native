@@ -183,6 +183,17 @@ fn selected_for_cold_dictionary() {
             assert_eq!(n, want, "step {step}");
         }
     }
+    // Another dictionary, likely where a dropped one was (the same
+    // address): cold too, by identity (libzstd compares addresses).
+    for step in 0..3 {
+        one.set_dictionary(None); // drops the last one (from step 1 on)
+        one.set_dictionary(Some(zstd_native::Dictionary::new(&dict).unwrap()));
+        let (got, n) = count_long(|| one.decompress(&frames[0]).unwrap());
+        assert!(got == samples[0], "new dictionary {step}");
+        if let Some(n) = n {
+            assert_eq!(n, long, "new dictionary {step}");
+        }
+    }
 }
 
 /// Every block through the prefetching loop: levels, sizes (blocks of a
