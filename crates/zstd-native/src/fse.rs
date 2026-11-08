@@ -491,25 +491,32 @@ fn build_fast_body(
     // visits each once) and write the next sorted symbol to each, taking
     // the next one only after a cell at or below `high`. The cells above
     // get the low-probability symbols after. No branches, unlike the
-    // reference's skip loop, and the same table.
-    let high = table_size - 1 - low;
+    // reference's skip loop, and the same table. `high` would be
+    // `table_size - 1 - low`, which is -1 when every symbol is a
+    // low-probability one (a valid table, and corrupt input can declare
+    // it), so the test is `position < lim` with `lim = high + 1`
+    // (`low <= table_size`: the counts sum to the table size).
+    debug_assert!(low <= table_size);
+    let lim = table_size - low;
     let step = table_step(table_size as u32) as usize;
     let mut syms = [0u8; 1 << LL_FSE_LOG];
     let mut position = 0usize;
     let mut k = 0usize;
     for _ in 0..table_size {
-        // `position <= mask` and `k <= high < 512`: the masks only drop
-        // the bounds checks.
+        // `position <= mask` and `k <= lim <= 512`: the masks
+        // only drop the bounds checks.
         syms[position & CELL_MASK] = spread[k & CELL_MASK];
-        k += usize::from(position <= high);
+        k += usize::from(position < lim);
         position = (position + step) & mask;
     }
-    debug_assert_eq!((position, k), (0, high + 1));
+    debug_assert_eq!((position, k + low), (0, table_size));
+    // The low-probability symbols, from the top cell down; `top` wraps
+    // past cell 0 after the last one when they fill the table.
     let mut top = table_size - 1;
     for (s, &n) in norm.iter().enumerate() {
         if n == -1 {
-            syms[top] = s as u8;
-            top -= 1;
+            syms[top & CELL_MASK] = s as u8;
+            top = top.wrapping_sub(1);
         }
     }
     for (d, &s) in dt[..table_size].iter_mut().zip(&syms) {
@@ -867,6 +874,53 @@ mod build_tests {
                         (b[u].next_state, b[u].nb_bits, b[u].base, b[u].nb_add_bits),
                         "case {case} cell {u}"
                     );
+                }
+            }
+        }
+    }
+
+    /// Tables where every symbol, or all but one, is a low-probability (-1)
+    /// symbol: valid, and corrupt input can declare them (the fuzz target
+    /// `decode` found the first). The fast build must not underflow and
+    /// must give the reference table.
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn fast_build_all_low_probability_matches_reference() {
+        let detected = Features::detect();
+        // Log 5: the largest table that 53 match length codes can fill.
+        {
+            let log = 5;
+            let size = 1usize << log;
+            for positive in [0usize, 1] {
+                // `size - positive` symbols at -1, then one symbol holding
+                // the remaining cell (if any).
+                let mut norm = [0i16; MAX_ML + 1];
+                let low = size - positive;
+                for n in &mut norm[..low] {
+                    *n = -1;
+                }
+                if positive == 1 {
+                    norm[low] = 1;
+                }
+                let max_sv1 = low + positive;
+                let mut a = [ZERO; 512];
+                build_seq_table(&mut a, &norm, max_sv1, log, &ML_BASE, &ML_BITS, 3);
+                for cpu in [
+                    detected,
+                    Features {
+                        bmi2: false,
+                        ..detected
+                    },
+                ] {
+                    let mut b = [ZERO; 512];
+                    build_seq_table_fast(&mut b, &norm, max_sv1, log, &ML_BASE, &ML_BITS, 3, cpu);
+                    for u in 0..size {
+                        assert_eq!(
+                            (a[u].next_state, a[u].nb_bits, a[u].base, a[u].nb_add_bits),
+                            (b[u].next_state, b[u].nb_bits, b[u].base, b[u].nb_add_bits),
+                            "log {log} positive {positive} cell {u}"
+                        );
+                    }
                 }
             }
         }
