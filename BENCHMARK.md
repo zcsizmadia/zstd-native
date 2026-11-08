@@ -1,6 +1,6 @@
 # Benchmarks
 
-zstd-native 0.1.1 plus the unreleased changes (main `61e24a1`; the
+zstd-native 0.1.2 (main `61e24a1`; the
 dictionary compression table at main `6f19057`) against C libzstd 1.5.7 and
 [structured-zstd](https://crates.io/crates/structured-zstd) 0.2.6, the
 fastest other pure-Rust zstd crate. [ruzstd](https://crates.io/crates/ruzstd)

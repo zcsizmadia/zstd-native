@@ -5,7 +5,7 @@ default-members = ["crates/zstd-native"]
 exclude = ["fuzz", "third_party"]
 
 [workspace.package]
-version = "0.1.1+zstd.1.5.7"
+version = "0.1.2+zstd.1.5.7"
 edition = "2024"
 rust-version = "1.89"
 license = "BSD-3-Clause"
