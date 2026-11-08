@@ -55,8 +55,8 @@ core; see BENCHMARK.md.
   slow spread, a decompressor's literal buffer comes with it, and a
   dictionary's first frame doesn't build its double-symbol table for
   small literal sections. With a 110 KiB dictionary, parsing is 3-8%
-  faster, and 4 KiB frames through a fresh decompressor take 12-14% less
-  time (13-26% less than libzstd); parsing a dictionary per frame is on par
+  faster, and 4 KiB frames through a fresh decompressor take 14-15% less
+  time (8-29% less than libzstd); parsing a dictionary per frame is on par
   with libzstd. Silesia decodes about 1% faster.
 
 ## [0.1.1+zstd.1.5.7]
