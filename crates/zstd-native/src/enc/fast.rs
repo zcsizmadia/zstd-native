@@ -60,6 +60,7 @@ use super::seq_store::{
     REPCODE1_TO_OFFBASE, SeqStore, count, count_2segments, hash4_ptr, hash5_ptr, hash6_ptr,
     hash7_ptr, hash8_ptr, offset_to_offbase, read_le64, read32,
 };
+use crate::cpu::prefetch_l1;
 
 /// `ZSTD_WINDOW_START_INDEX`: the index of a fresh window's first byte.
 pub(crate) const WINDOW_START_INDEX: u32 = 2;
@@ -928,19 +929,6 @@ pub(crate) unsafe fn hash_mls<const MLS: u32>(p: *const u8, h_bits: u32) -> usiz
             _ => hash4_ptr(p, h_bits),
         }
     }
-}
-
-/// `PREFETCH_L1`.
-#[inline(always)]
-pub(crate) fn prefetch_l1(p: *const u8) {
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: prefetching never faults, whatever the address.
-    #[allow(unsafe_code, unused_unsafe)]
-    unsafe {
-        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(p.cast::<i8>());
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = p;
 }
 
 /// Loop invariants of the noDict position search ([`fast_search_rust`]).

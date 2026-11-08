@@ -53,9 +53,11 @@ On this Windows machine, cargo is in `~/.cargo/bin` (not on PATH in Bash).
   the output writes in `decoder.rs` and `stream.rs` (direct output into
   the caller's buffer or `Vec`, the window history copy), the
   `align_hot_loop!` macro in `lib.rs` (an `asm!` alignment directive
-  before the hot loops) and
+  before the hot loops),
   `then_valid` in `enc/fast.rs` (an empty `asm!` that keeps a branch
-  order). New `unsafe` needs a benchmark showing the gain.
+  order) and `prefetch_l1` in `cpu.rs` (the `prefetcht0` hint shared by
+  the decoder's prefetching sequence loop and the match finders). New
+  `unsafe` needs a benchmark showing the gain.
 - Every performance-related change, however small (a prefetch, an
   alignment directive, a refactor of hot code), is benchmarked on the
   EPYC host before it's committed: several binary copies run interleaved,

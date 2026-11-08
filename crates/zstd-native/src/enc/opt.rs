@@ -55,9 +55,7 @@
 //! Debug builds check every read with `chk`.
 
 use super::compress::EntropyTables;
-use super::fast::{
-    DmsView, ExtWindow, HASH_READ_SIZE, MatchState, hash_mls, index_overlap_check, prefetch_l1,
-};
+use super::fast::{DmsView, ExtWindow, HASH_READ_SIZE, MatchState, hash_mls, index_overlap_check};
 use super::hist::hist_count_simple;
 use super::huf_enc::HufRepeat;
 use super::ldm::RawSeq;
@@ -66,6 +64,7 @@ use super::seq_store::{
     MAX_LL, MAX_ML, MAX_OFF, MINMATCH, REP_NUM, SeqStore, count, count_2segments, hash3_ptr,
     highbit32, ll_code, ml_code, offset_to_offbase, read32, update_rep,
 };
+use crate::cpu::prefetch_l1;
 use crate::fse::{LL_BITS, ML_BITS};
 use alloc::vec;
 use alloc::vec::Vec;

@@ -7,13 +7,14 @@
 use super::fast::{
     DmsView, ExtWindow, HASH_READ_SIZE, K_SEARCH_STRENGTH, MatchState, SHORT_CACHE_TAG_BITS,
     TableLoadMethod, cand_match, compare_packed_tags, hash_mls, hash_prime, hash_with,
-    index_overlap_check, prefetch_l1, write_tagged_index,
+    index_overlap_check, write_tagged_index,
 };
 use super::params::Strategy;
 use super::seq_store::{
     PRIME8BYTES, REPCODE1_TO_OFFBASE, SeqStore, count, count_2segments, hash_at, hash8_ptr,
     offset_to_offbase, read_le64, read32,
 };
+use crate::cpu::prefetch_l1;
 
 /// `ZSTD_fillDoubleHashTableForCDict()`: as [`fill_double_hash_table`],
 /// with tagged entries (see
@@ -668,7 +669,7 @@ pub(crate) fn compress_block_double_fast_ext_dict(
     if ms.window.dict_limit.max(low_limit) == low_limit {
         return compress_block_double_fast(ms, ss, rep, buf, start, end);
     }
-    ext_dict(ms, ss, rep, buf, start, end)
+    ext_dict(ms, ss, rep, buf, start, end, low_limit)
 }
 
 /// The extDict match finder proper, out of line (with a BMI2 version).
@@ -680,14 +681,15 @@ fn ext_dict(
     buf: &[u8],
     start: usize,
     end: usize,
+    low_limit: u32,
 ) -> usize {
     #[cfg(all(target_arch = "x86_64", not(feature = "portable")))]
     if crate::cpu::Features::detect().bmi2 {
         // SAFETY: BMI2 (with BMI1 and LZCNT) was detected on this CPU.
         #[allow(unsafe_code)]
-        return unsafe { ext_dict_bmi2(ms, ss, rep, buf, start, end) };
+        return unsafe { ext_dict_bmi2(ms, ss, rep, buf, start, end, low_limit) };
     }
-    ext_dict_mls(ms, ss, rep, buf, start, end)
+    ext_dict_mls(ms, ss, rep, buf, start, end, low_limit)
 }
 
 /// [`ext_dict`] compiled with BMI1, BMI2 and LZCNT (`shrx` hashes, `tzcnt`
@@ -702,8 +704,9 @@ fn ext_dict_bmi2(
     buf: &[u8],
     start: usize,
     end: usize,
+    low_limit: u32,
 ) -> usize {
-    ext_dict_mls(ms, ss, rep, buf, start, end)
+    ext_dict_mls(ms, ss, rep, buf, start, end, low_limit)
 }
 
 /// The `ZSTD_compressBlock_doubleFast_extDict_<mls>` variant like libzstd
@@ -716,6 +719,7 @@ fn ext_dict_mls(
     buf: &[u8],
     start: usize,
     end: usize,
+    low_limit: u32,
 ) -> usize {
     // Candidate checks with a `cmov` (meta/zstd#4764 always uses it in
     // extDict mode) once the window is about as large as the short table.
@@ -726,14 +730,14 @@ fn ext_dict_mls(
     // `cmov` 3-10% faster from `chainLog` up and with the default windows.
     let use_cmov = ms.cparams.window_log >= ms.cparams.chain_log.max(16);
     match (ms.cparams.min_match, use_cmov) {
-        (5, true) => ext_dict_generic::<5, true>(ms, ss, rep, buf, start, end),
-        (6, true) => ext_dict_generic::<6, true>(ms, ss, rep, buf, start, end),
-        (7, true) => ext_dict_generic::<7, true>(ms, ss, rep, buf, start, end),
-        (_, true) => ext_dict_generic::<4, true>(ms, ss, rep, buf, start, end),
-        (5, false) => ext_dict_generic::<5, false>(ms, ss, rep, buf, start, end),
-        (6, false) => ext_dict_generic::<6, false>(ms, ss, rep, buf, start, end),
-        (7, false) => ext_dict_generic::<7, false>(ms, ss, rep, buf, start, end),
-        (_, false) => ext_dict_generic::<4, false>(ms, ss, rep, buf, start, end),
+        (5, true) => ext_dict_generic::<5, true>(ms, ss, rep, buf, start, end, low_limit),
+        (6, true) => ext_dict_generic::<6, true>(ms, ss, rep, buf, start, end, low_limit),
+        (7, true) => ext_dict_generic::<7, true>(ms, ss, rep, buf, start, end, low_limit),
+        (_, true) => ext_dict_generic::<4, true>(ms, ss, rep, buf, start, end, low_limit),
+        (5, false) => ext_dict_generic::<5, false>(ms, ss, rep, buf, start, end, low_limit),
+        (6, false) => ext_dict_generic::<6, false>(ms, ss, rep, buf, start, end, low_limit),
+        (7, false) => ext_dict_generic::<7, false>(ms, ss, rep, buf, start, end, low_limit),
+        (_, false) => ext_dict_generic::<4, false>(ms, ss, rep, buf, start, end, low_limit),
     }
 }
 
@@ -752,6 +756,9 @@ fn ext_dict_mls(
 /// segments; candidates are read above `dictStartIndex`, in the segment of
 /// their index; repcodes pass `ZSTD_index_overlap_check` and the window
 /// check before being read).
+///
+/// `low_limit` is `ZSTD_getLowestMatchIndex()` at the block's end, computed
+/// once by [`compress_block_double_fast_ext_dict`].
 #[allow(unsafe_code)]
 #[inline(always)]
 fn ext_dict_generic<const MLS: u32, const CMOV: bool>(
@@ -761,14 +768,17 @@ fn ext_dict_generic<const MLS: u32, const CMOV: bool>(
     buf: &[u8],
     start: usize,
     end: usize,
+    low_limit: u32,
 ) -> usize {
     let cparams = ms.cparams;
     let h_bits_l = cparams.hash_log;
     let h_bits_s = cparams.chain_log;
     assert!(ms.hash_table.len() == 1usize << h_bits_l && (1..=32).contains(&h_bits_l));
     assert!(ms.chain_table.len() == 1usize << h_bits_s && (1..=32).contains(&h_bits_s));
-    let end_index = ms.window.index(end);
-    let low_limit = ms.lowest_match_index(end_index, cparams.window_log);
+    debug_assert_eq!(
+        low_limit,
+        ms.lowest_match_index(ms.window.index(end), cparams.window_log)
+    );
     let dict_start_index = low_limit;
     let dict_limit = ms.window.dict_limit;
     let prefix_start_index = dict_limit.max(low_limit);
