@@ -64,9 +64,9 @@ risk. Sibling of [xz-native](https://github.com/zcsizmadia/xz-native).
   - **Multithreaded:** it is 1.11-1.34x faster with 16 workers, one-shot
     or streaming.
   - **Small frames, flushes, dictionaries** (against the `zstd` crate):
-    1.01-1.08x at levels 1-4 and 1.24-1.38x at level 19 (geomeans).
-    Some dictionary frames at levels 3-4 are 0.96-0.99x, a regression
-    since the previous measurement. Streaming decompression is
+    1.03-1.08x at levels 1-4 and 1.24-1.38x at level 19 (geomeans).
+    Raw xml in 4 and 16 KiB dictionary frames is 0.98-1.00x at levels
+    1-4. Streaming decompression is
     1.11-1.12x, and `read_to_end` 1.25-1.40x. Decoding 4 KiB frames with
     a dictionary is 1.00-1.08x warm, 1.29-1.39x right after switching
     dictionaries and 1.08-1.13x with a new decompressor against

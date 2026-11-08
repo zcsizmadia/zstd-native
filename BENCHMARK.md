@@ -1,7 +1,7 @@
 # Benchmarks
 
-zstd-native 0.1.1 plus the unreleased changes (main `61e24a1`) against C
-libzstd 1.5.7 and
+zstd-native 0.1.1 plus the unreleased changes (main `61e24a1`; the
+dictionary compression table at main `6f19057`) against C libzstd 1.5.7 and
 [structured-zstd](https://crates.io/crates/structured-zstd) 0.2.6, the
 fastest other pure-Rust zstd crate. [ruzstd](https://crates.io/crates/ruzstd)
 decompresses 3-7x slower than zstd-native, so it isn't in the tables.
@@ -43,7 +43,9 @@ frames, flushes, dictionaries and streaming decompression are in
   spread as the repeat alone (0.989-1.005).
 - **Against the previous run:** a build of `96cdb56`, the main of the
   previous tables, ran interleaved in the same rounds at levels 1-4, in
-  decompression, and with flushes and dictionaries at levels 1 and 3.
+  decompression, and with flushes at levels 1 and 3. The dictionary
+  compression table, re-measured at `6f19057`, had a `61e24a1` build
+  interleaved instead.
 - **Why three copies:** speed can move several percent with where the
   binary's data and stack land in memory (see
   [#34](https://github.com/zcsizmadia/zstd-native/issues/34)). libzstd
@@ -202,17 +204,18 @@ No cell is below 1.00x. The fixes behind these are in
 
 ## Small frames, flushes, dictionaries, streaming
 
-Against C libzstd (the `zstd` crate) at main `61e24a1`, with structured-zstd
-where it has the same API. Median of the runs: 3 copies of the binary, 2
-rounds (2 more for cells whose copies differed by over 5%, or whose best
-and median fell on different sides of 1.00x), all runs of one table on
-one core (the flushes on CPU 8, the rest on CPU 40) in random order, at
-least 1.5 s each (1 s for decompression). zstd-native / libzstd; above
+Against C libzstd (the `zstd` crate) at main `61e24a1` (dictionary
+compression at `6f19057`), with structured-zstd where it has the same
+API. Median of the runs: 3 copies of the binary, 2 rounds (2 more for
+cells whose copies differed by over 5%, or whose best and median fell on
+different sides of 1.00x), all runs of one table on one core (the
+flushes and dictionary compression at levels 1, 2 and 19 on CPU 8, the
+rest on CPU 40) in random order, at least 1.5 s each (1 s for
+decompression). zstd-native / libzstd; above
 1.00x, zstd-native is faster. The compressed sizes were equal in every
 cell. The best of the runs is on the same side of 1.00x as the median
-in every cell but two dictionary cells (raw xml at L1 in 4 KiB frames,
-trained samba at L3 in 1 KiB frames: 1.001x and 1.009x by the best
-run).
+in every cell but one (dictionary compression of raw xml at L2 in 4 KiB
+frames: 1.001x by the best run).
 
 ### 4 KiB frames
 
@@ -273,46 +276,37 @@ with a prepared 16 KiB dictionary (`EncoderDictionary` /
 
 | Dictionary, file, frame size | L1 | L2 | L3 | L4 | L19 |
 |---|---:|---:|---:|---:|---:|
-| raw, dickens, 1 KiB | 1.07x | 1.04x | 1.03x | 1.06x | 1.12x |
-| raw, dickens, 4 KiB | 1.03x | 1.05x | 1.04x | 1.07x | 1.11x |
-| raw, dickens, 16 KiB | 1.10x | 1.15x | 1.04x | 1.02x | 1.19x |
-| raw, samba, 1 KiB | 1.07x | 1.03x | 1.02x | 1.06x | 1.25x |
-| raw, samba, 4 KiB | 1.01x | 1.03x | 1.00x | 1.05x | 1.35x |
-| raw, samba, 16 KiB | 1.12x | 1.13x | 1.00x | 1.00x | 1.44x |
-| raw, xml, 1 KiB | 1.07x | 1.04x | 1.03x | 1.05x | 1.48x |
-| raw, xml, 4 KiB | 1.00x | 1.00x | 0.96x | 1.00x | 1.67x |
-| raw, xml, 16 KiB | 1.15x | 1.03x | 0.97x | 0.98x | 1.70x |
-| trained, dickens, 1 KiB | 1.03x | 1.03x | 1.01x | 1.05x | 1.13x |
-| trained, dickens, 4 KiB | 1.04x | 1.07x | 1.04x | 1.08x | 1.12x |
-| trained, dickens, 16 KiB | 1.10x | 1.12x | 1.03x | 1.03x | 1.20x |
-| trained, samba, 1 KiB | 1.04x | 1.02x | 0.99x | 1.04x | 1.33x |
-| trained, samba, 4 KiB | 1.03x | 1.04x | 1.00x | 1.06x | 1.36x |
-| trained, samba, 16 KiB | 1.10x | 1.13x | 1.00x | 1.02x | 1.47x |
-| trained, xml, 1 KiB | 1.03x | 1.02x | 1.00x | 1.03x | 1.61x |
-| trained, xml, 4 KiB | 1.03x | 1.03x | 0.99x | 1.03x | 1.63x |
-| trained, xml, 16 KiB | 1.15x | 1.07x | 1.00x | 1.01x | 1.72x |
-| **raw, geomean** | **1.07x** | **1.05x** | **1.01x** | **1.03x** | **1.35x** |
-| **trained, geomean** | **1.06x** | **1.06x** | **1.01x** | **1.04x** | **1.38x** |
+| raw, dickens, 1 KiB | 1.07x | 1.03x | 1.05x | 1.06x | 1.11x |
+| raw, dickens, 4 KiB | 1.02x | 1.05x | 1.07x | 1.07x | 1.11x |
+| raw, dickens, 16 KiB | 1.10x | 1.14x | 1.07x | 1.02x | 1.18x |
+| raw, samba, 1 KiB | 1.06x | 1.02x | 1.05x | 1.04x | 1.25x |
+| raw, samba, 4 KiB | 1.00x | 1.02x | 1.03x | 1.04x | 1.35x |
+| raw, samba, 16 KiB | 1.12x | 1.12x | 1.02x | 1.01x | 1.44x |
+| raw, xml, 1 KiB | 1.06x | 1.03x | 1.04x | 1.04x | 1.47x |
+| raw, xml, 4 KiB | 0.99x | 1.00x | 0.99x | 1.00x | 1.69x |
+| raw, xml, 16 KiB | 1.14x | 1.03x | 0.99x | 0.98x | 1.70x |
+| trained, dickens, 1 KiB | 1.04x | 1.03x | 1.04x | 1.05x | 1.14x |
+| trained, dickens, 4 KiB | 1.04x | 1.05x | 1.06x | 1.09x | 1.12x |
+| trained, dickens, 16 KiB | 1.10x | 1.12x | 1.06x | 1.03x | 1.19x |
+| trained, samba, 1 KiB | 1.04x | 1.02x | 1.05x | 1.05x | 1.32x |
+| trained, samba, 4 KiB | 1.04x | 1.05x | 1.05x | 1.06x | 1.37x |
+| trained, samba, 16 KiB | 1.10x | 1.12x | 1.03x | 1.01x | 1.46x |
+| trained, xml, 1 KiB | 1.04x | 1.02x | 1.04x | 1.05x | 1.61x |
+| trained, xml, 4 KiB | 1.02x | 1.03x | 1.01x | 1.04x | 1.63x |
+| trained, xml, 16 KiB | 1.15x | 1.06x | 1.02x | 1.00x | 1.72x |
+| **raw, geomean** | **1.06x** | **1.05x** | **1.03x** | **1.03x** | **1.35x** |
+| **trained, geomean** | **1.06x** | **1.06x** | **1.04x** | **1.04x** | **1.38x** |
 
-Level 3 is 3% slower than in the previous table (1.01x geomean, was
-1.04-1.05x), and level 4 1% slower: a regression from
-[#85](https://github.com/zcsizmadia/zstd-native/pull/85), which moved
-the debug-build bounds checks of the `dfast` dictMatchState loop and so
-changed its release code (the function grew by 187 bytes). Builds of
-each commit since `96cdb56`, run interleaved, put the whole step at #85:
-against `96cdb56`, main is 0.967x at L3 (geomean of the medians,
-0.957-0.984 by cell) and 0.990x at L4, and within 0.4% of #85's build.
-`perf stat` over fixed iterations (3 copies, 2 rounds) gives the same
-instruction and branch-miss counts as `96cdb56` and 2-3% more cycles
-(trained samba at L3 in 4 KiB frames: 10.13 billion instructions both,
-4.156 against 4.064 billion cycles; raw xml at L3 in 16 KiB frames:
-3.90 billion, 1.569 against 1.520).
+A regression from [#85](https://github.com/zcsizmadia/zstd-native/pull/85)
+in dictionary compression at levels 3 and 4 (3% and 1%) was found by
+this re-measure and fixed in
+[#90](https://github.com/zcsizmadia/zstd-native/pull/90); against an
+interleaved `61e24a1` build, `6f19057` is 1.03x at L3 (1.02-1.04x by
+cell), 1.01x at L4 and within 0.5% at L1, L2 and L19.
 
-Below 1.00x, at L3: raw xml in 4 and 16 KiB frames (0.96x and 0.97x),
-trained samba in 1 and 16 KiB frames (0.99x and 0.996x) and trained xml
-in 1, 4 and 16 KiB frames (0.99-0.997x); at L4, raw xml in 16 KiB frames
-(0.98x); at L1, raw xml in 4 KiB frames (0.997x, 1.001x by the best
-run).
+Below 1.00x: raw xml in 4 KiB frames at L1, L2, L3 and L4 (0.986x,
+0.996x, 0.987x and 0.997x) and in 16 KiB frames at L3 and L4 (0.989x and
+0.982x).
 
 ### Streaming decompression
 
