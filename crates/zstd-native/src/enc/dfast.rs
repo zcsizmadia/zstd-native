@@ -1298,11 +1298,20 @@ fn dms_generic<const MLS: u32>(
                 // their index tested once the bytes match (meta/zstd#4866):
                 // with a short prefix (small inputs), many candidates are
                 // below it, an unpredictable branch.
+                //
+                // Each candidate is debug-checked before the read and again
+                // once it matched. The second check is redundant, but keep
+                // it: its call (empty in release builds) shapes this loop's
+                // register allocation. Without it (#85) the loop spilled
+                // differently and L3/L4 dictionary compression ran 2-4%
+                // slower on the same instruction count. After changes here,
+                // compare the function's size (nm) and speed with main.
                 #[cfg(debug_assertions)]
                 if match_index_l >= prefix_lowest_index {
                     chk(match_long, 8); // read in place (debug builds only)
                 }
                 if cand_match::<true, true>(match_index_l >= prefix_lowest_index, match_long, ip) {
+                    chk(match_long, 8); // redundant, kept for codegen
                     // check prefix long match
                     m_length = count(ip.add(8), match_long.add(8), iend) + 8;
                     offset = (ip as usize - match_long as usize) as u32;
@@ -1348,6 +1357,7 @@ fn dms_generic<const MLS: u32>(
                         if cand_match::<true, false>(match_index_s > prefix_lowest_index, mtch, ip)
                         {
                             // short match candidate
+                            chk(mtch, 4); // redundant, kept for codegen (see above)
                             true
                         } else if dict_tags_match_s && match_index_s <= prefix_lowest_index {
                             // check dictMatchState short match
@@ -1390,6 +1400,7 @@ fn dms_generic<const MLS: u32>(
                         match_l3,
                         ip.add(1),
                     ) {
+                        chk(match_l3, 8); // redundant, kept for codegen (see above)
                         // check prefix long +1 match
                         m_length = count(ip.add(9), match_l3.add(8), iend) + 8;
                         ip = ip.add(1);
