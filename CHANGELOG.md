@@ -9,9 +9,12 @@ section.
 
 ## [Unreleased]
 
-Speed only: no API change, and the compressed output is still the same
-bytes as libzstd 1.5.7. Numbers are for an AMD EPYC 7543 (Zen 3), one
-core; see BENCHMARK.md.
+## [0.1.2+zstd.1.5.7]
+
+Speed, and two fixes in streaming decompression from an independent code
+review. No API change, and the compressed output is still the same bytes
+as libzstd 1.5.7. Numbers are for an AMD EPYC 7543 (Zen 3), one core; see
+BENCHMARK.md.
 
 ### Changed
 - **Short match offsets:** matches with an offset under 16 are decoded 16
@@ -58,6 +61,21 @@ core; see BENCHMARK.md.
   faster, and 4 KiB frames through a fresh decompressor take 14-15% less
   time (8-29% less than libzstd); parsing a dictionary per frame is on par
   with libzstd. Silesia decodes about 1% faster.
+
+### Fixed
+- **`read_to_end` reservation from an untrusted header:** at the start of
+  a frame, `Decoder::read_to_end` reserved the frame's declared content
+  size, capped only by the window limit, so a ~20-byte frame claiming a
+  large content size made it reserve 128 MiB (2 GiB with
+  `set_window_log_max(31)`) before any block was checked. The reservation
+  is now also bounded by what the input at hand can produce; real frames
+  reserve as before (#85).
+- **Progress kept when the window buffer can't be allocated:** when
+  `StreamDecoder::decode` had already written part of a frame into the
+  caller's buffer and then failed to allocate its window buffer, it
+  returned an error and dropped the counts of what was read and written.
+  It now returns that progress, and the next call returns the error until
+  `reset()` (#85).
 
 ## [0.1.1+zstd.1.5.7]
 
@@ -129,6 +147,7 @@ compressed input.
   - MSRV 1.89
   - fuzzing, Miri, cargo-deny and OpenSSF Scorecard
 
-[Unreleased]: https://github.com/zcsizmadia/zstd-native/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/zcsizmadia/zstd-native/compare/v0.1.2...HEAD
+[0.1.2+zstd.1.5.7]: https://github.com/zcsizmadia/zstd-native/releases/tag/v0.1.2
 [0.1.1+zstd.1.5.7]: https://github.com/zcsizmadia/zstd-native/releases/tag/v0.1.1
 [0.1.0+zstd.1.5.7]: https://github.com/zcsizmadia/zstd-native/releases/tag/v0.1.0
