@@ -45,9 +45,9 @@ risk. Sibling of [xz-native](https://github.com/zcsizmadia/xz-native).
   | Compression, level 1 | 1.07x | 1.11x |
   | Compression, level 3 (default) | 1.07x | 1.37x |
   | Compression, level 9 | 1.19x | 1.37x |
-  | Compression, level 19 | 1.40x | 1.18x |
-  | Decompression (frames of levels 1-19) | 1.07-1.12x | 1.20-1.29x |
-  | Compression, 16 threads (levels 1-19) | 1.08-1.33x | no multithreading |
+  | Compression, level 19 | 1.41x | 1.18x |
+  | Decompression (frames of levels 1-19) | 1.08-1.12x | 1.21-1.30x |
+  | Compression, 16 threads (levels 1-19) | 1.11-1.34x | no multithreading |
 
   zstd-native is faster than libzstd and structured-zstd on every Silesia
   file, level and direction. structured-zstd is the fastest other
@@ -58,18 +58,20 @@ risk. Sibling of [xz-native](https://github.com/zcsizmadia/xz-native).
   Against every C libzstd 1.5.7 build, including upstream's own gcc and
   clang builds and `-march=native`:
   - **Decompression:** zstd-native is 1.05-1.09x faster at levels 1-19.
-  - **Compression:** it is 1.08-1.26x faster at levels 5-15 and 1.15x or
+  - **Compression:** it is 1.07-1.26x faster at levels 5-15 and 1.15x or
     more at level 19. At levels 1-4 it is 1.06-1.08x faster than the
     `zstd` crate's build.
-  - **Multithreaded:** it is 1.08-1.33x faster with 16 workers, one-shot
+  - **Multithreaded:** it is 1.11-1.34x faster with 16 workers, one-shot
     or streaming.
   - **Small frames, flushes, dictionaries** (against the `zstd` crate):
-    1.04-1.08x at levels 1-4 and 1.24-1.38x at level 19 (geomeans).
-    Streaming decompression is 1.10-1.12x, and `read_to_end` 1.24-1.39x.
-    Decoding 4 KiB frames with a dictionary is 1.00-1.08x warm and
-    1.19-1.28x right after switching dictionaries. Parsing a new
-    dictionary for every frame, or a new decompressor against libzstd's
-    reused one, is still 0.92-0.98x.
+    1.03-1.08x at levels 1-4 and 1.24-1.38x at level 19 (geomeans).
+    Raw xml in 4 and 16 KiB dictionary frames is 0.98-1.00x at levels
+    1-4. Streaming decompression is
+    1.11-1.12x, and `read_to_end` 1.25-1.40x. Decoding 4 KiB frames with
+    a dictionary is 1.00-1.08x warm, 1.29-1.39x right after switching
+    dictionaries and 1.08-1.13x with a new decompressor against
+    libzstd's reused one. Parsing a new dictionary for every frame is
+    0.97-1.05x.
 
   Ports in other languages (Go, C#, Java, JavaScript) are slower at every
   level. They were measured once, as recorded in
