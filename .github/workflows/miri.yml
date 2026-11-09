@@ -6,11 +6,13 @@ name: Miri
 # unsafe: the bit reader and writer, Huffman and FSE tables, sequence
 # execution, match finders) runs.
 #
-# Pushes and pull requests skip the slowest tests (the encoder round
-# trips and the other tests below take minutes each under Miri, even with
-# their Miri sizes: a few KiB of input, see `MIRI` in enc/fast.rs). The
-# weekly and manual runs take every test. A test is killed after 30
-# minutes (.config/nextest.toml).
+# Every test is sized for Miri (a few KiB of input, fewer cases: see
+# `MIRI` in enc/fast.rs and the other test modules), to a few minutes at
+# most there. Pushes and pull requests run one job per target and skip the
+# slowest tests (listed below, a minute or more each). The weekly and
+# manual runs take every test, split into four jobs per target (nextest's
+# hash partitions; the doc examples run in the first). A test is reported
+# SLOW after 5 minutes and killed after 10 (.config/nextest.toml).
 on:
   push:
     branches: [main]
@@ -36,14 +38,18 @@ permissions:
 
 jobs:
   miri:
-    name: miri ${{ matrix.target }}
+    # (pushes and PRs: partition 0, no suffix)
+    name: miri ${{ matrix.target }}${{ matrix.partition && format(' {0}/4', matrix.partition) || '' }}
     runs-on: ubuntu-26.04
-    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 360 || 60 }}
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 120 || 60 }}
     strategy:
       fail-fast: false
       matrix:
         # Little endian and big endian.
         target: [x86_64-unknown-linux-gnu, s390x-unknown-linux-gnu]
+        # The weekly and manual runs: partitions 1 to 4 of every test.
+        # Pushes and PRs: 0, one job with the fast tests.
+        partition: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '[1, 2, 3, 4]' || '[0]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -61,32 +67,41 @@ jobs:
         # nextest runs each test in its own Miri process, one per CPU.
         shell: bash
         run: |
+          partition=()
           if [ "$FULL" = true ]; then
             filter='all()'
+            partition=(--partition "hash:${{ matrix.partition }}/4")
           else
-            filter='not (test(/::roundtrip_/) | test(/::small_blocks$/)
-              | test(~cdict::tests::round_trip_every_mode)
-              | test(~huf_enc::tests::)
-              | test(~fse_enc::tests::normalize_write_read_round_trip)
-              | test(~fse_enc::tests::compress_using_ctable_decodes)
-              | test(~opt::tests::weights)
-              | test(~presplit::tests::optimal_size)
-              | test(~mt::tests::jobs_run_in_the_calling_thread_without_workers)
-              | test(~hist::tests::matches_reference)
-              | test(~lazy::tests::salt_advances)
-              | test(~lazy::tests::stale_tags)
-              | test(~ldm::tests::round_trip_forced)
-              | test(~opt::tests::long_matches)
-              | test(~presplit::tests::split_points_are_valid)
-              | test(~presplit::tests::split_points_match_libzstd)
-              | test(~fse::build_tests::fast_build_matches_reference)
-              | test(~opt::tests::incremental_prices_match_libzstd)
-              | test(~stream::tests::direct_and_buffered_agree))'
+            filter='not (test(=enc::cdict::tests::round_trip_every_mode)
+              | test(=enc::dfast::tests::roundtrip_ring_variants)
+              | test(=enc::fast::tests::roundtrip_levels)
+              | test(=enc::fast::tests::roundtrip_ring_variants)
+              | test(=enc::fse_enc::tests::normalize_write_read_round_trip)
+              | test(=enc::hist::tests::matches_reference)
+              | test(=enc::huf_enc::tests::compress_repeat_round_trip)
+              | test(=enc::huf_enc::tests::small_outputs)
+              | test(=enc::huf_enc::tests::write_read_and_decode_round_trip)
+              | test(=enc::lazy::tests::roundtrip_all_variants)
+              | test(=enc::lazy::tests::roundtrip_ring_variants)
+              | test(=enc::lazy::tests::small_blocks)
+              | test(=enc::lazy::tests::stale_tags)
+              | test(=enc::ldm::tests::round_trip_forced)
+              | test(=enc::opt::tests::incremental_prices_match_libzstd)
+              | test(=enc::opt::tests::long_matches)
+              | test(=enc::opt::tests::roundtrip_all_variants)
+              | test(=enc::opt::tests::roundtrip_levels)
+              | test(=enc::opt::tests::roundtrip_ring_variants)
+              | test(=enc::opt::tests::small_blocks)
+              | test(=enc::presplit::tests::optimal_size)
+              | test(=enc::presplit::tests::split_points_are_valid)
+              | test(=enc::presplit::tests::split_points_match_libzstd)
+              | test(=stream::tests::direct_and_buffered_agree))'
           fi
           filter=$(echo "$filter" | tr -s '\n ' '  ')
           cargo miri nextest run -p zstd-native --lib --features portable \
-            --target ${{ matrix.target }} --no-fail-fast -E "$filter"
+            --target ${{ matrix.target }} --no-fail-fast -E "$filter" "${partition[@]}"
       - name: Doc examples
+        if: matrix.partition <= 1
         shell: bash
         # The set_workers example compresses 2.4 MB with four threads.
         run: |
