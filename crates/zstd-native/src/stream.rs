@@ -888,7 +888,7 @@ mod tests {
     /// (1-byte outputs).
     #[test]
     fn direct_and_buffered_agree() {
-        let len = if cfg!(miri) { 5000 } else { 300_000 };
+        let len = if cfg!(miri) { 3000 } else { 300_000 };
         let data = text(len);
         let mut two = data.clone();
         two.extend_from_slice(&data);

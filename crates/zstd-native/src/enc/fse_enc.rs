@@ -834,6 +834,10 @@ mod tests {
         }
     }
 
+    /// Under Miri, the randomized tests run fewer and smaller cases (a
+    /// minute or two each there, instead of hours).
+    const MIRI: bool = cfg!(miri);
+
     /// A random histogram: `nsym` symbols (some zero), skewed.
     fn random_counts(r: &mut Rng, nsym: usize) -> (Vec<u32>, usize) {
         let mut count = alloc::vec![0u32; nsym];
@@ -983,7 +987,7 @@ mod tests {
     #[test]
     fn normalize_write_read_round_trip() {
         let mut r = Rng(0x9E37_79B9_7F4A_7C15);
-        for iter in 0..3000 {
+        for iter in 0..if MIRI { 60 } else { 3000 } {
             let nsym = 2 + r.below(255) as usize;
             let (count, total) = random_counts(&mut r, nsym);
             let max_sv = (nsym - 1) as u32;
@@ -1074,9 +1078,10 @@ mod tests {
     #[test]
     fn compress_using_ctable_decodes() {
         let mut r = Rng(777);
-        for iter in 0..300 {
+        let (iters, max_len) = if MIRI { (20, 1000) } else { (300, 3000) };
+        for iter in 0..iters {
             let nsym = 2 + r.below(60) as usize;
-            let len = 3 + r.below(3000) as usize;
+            let len = 3 + r.below(max_len) as usize;
             let src: Vec<u8> = (0..len)
                 .map(|_| {
                     let a = r.below(nsym as u64);

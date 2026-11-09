@@ -2180,23 +2180,27 @@ fn opt_generic<
 
 #[cfg(test)]
 mod tests {
-    use super::super::fast::tests::{random, roundtrip, roundtrip_ring, texty, xorshift};
+    use super::super::fast::tests::{
+        MIN_SEQUENCES, MIRI, miri_pick, random, ring_input, roundtrip, roundtrip_ring, texty,
+        variants_input, xorshift,
+    };
     use super::super::params::{CParams, Strategy, block_size_max, one_shot_cparams};
     use super::*;
 
     const OPT: [Strategy; 3] = [Strategy::BtOpt, Strategy::BtUltra, Strategy::BtUltra2];
 
     fn inputs() -> [Vec<u8>; 6] {
+        let k = if MIRI { 100 } else { 1 }; // sizes divided by k
         [
             texty(1000, 1),
-            texty(300_000, 3),
-            random(50_000, 4),
-            alloc::vec![0u8; 200_000],
-            (0..70_000u32).map(|i| (i % 251) as u8).collect(),
+            texty(300_000 / k, 3),
+            random(50_000 / k, 4),
+            alloc::vec![0u8; 200_000 / k],
+            (0..(70_000 / k) as u32).map(|i| (i % 251) as u8).collect(),
             {
-                let mut v = random(20_000, 5);
-                v.extend_from_slice(&texty(30_000, 6));
-                v.extend_from_within(..25_000);
+                let mut v = random(20_000 / k, 5);
+                v.extend_from_slice(&texty(30_000 / k, 6));
+                v.extend_from_within(..25_000 / k);
                 v
             },
         ]
@@ -2204,8 +2208,10 @@ mod tests {
 
     #[test]
     fn roundtrip_levels() {
-        for src in &inputs() {
-            for level in 11..=22 {
+        let inputs = inputs();
+        for level in 11..=22 {
+            // Miri: one input per level, each across the levels
+            for src in miri_pick(&inputs, level as usize) {
                 let cp = one_shot_cparams(level, src.len() as u64);
                 if !OPT.contains(&cp.strategy) {
                     continue;
@@ -2217,14 +2223,23 @@ mod tests {
 
     #[test]
     fn roundtrip_all_variants() {
-        let mut src = texty(150_000, 7);
-        src.extend_from_slice(&random(5000, 8));
-        src.extend_from_slice(&src.clone()[..40_000]);
+        let src = variants_input();
+        type Search = &'static [(u32, u32)];
+        let (mlss, searches, window_logs): (&[u32], Search, &[u32]) = if MIRI {
+            (&[3, 4, 5, 6], &[(1, 4), (7, 256)], &[10, 22])
+        } else {
+            (
+                &[3, 4, 5, 6, 7],
+                &[(1, 4), (4, 32), (7, 256), (9, 999)],
+                &[10, 17, 22],
+            )
+        };
         for strategy in OPT {
-            // mls 3, 4, 5, 6 (7 is clamped to 6)
-            for mls in 3..=7 {
-                for (search_log, target_length) in [(1, 4), (4, 32), (7, 256), (9, 999)] {
-                    for window_log in [10, 17, 22] {
+            // mls 3, 4, 5, 6 (7 is clamped to 6); Miri: one search and
+            // window per mls, every pair of them across the mls
+            for &mls in mlss {
+                for &(search_log, target_length) in miri_pick(searches, mls as usize) {
+                    for &window_log in miri_pick(window_logs, mls as usize / 2) {
                         let cp = CParams {
                             window_log,
                             chain_log: 16,
@@ -2236,7 +2251,7 @@ mod tests {
                         };
                         let n = roundtrip(&src, cp, (1 << 17).min(1 << window_log));
                         assert!(
-                            n > 1000,
+                            n > MIN_SEQUENCES,
                             "{strategy:?} mls {mls} slog {search_log} wlog {window_log}: {n} sequences"
                         );
                     }
@@ -2247,14 +2262,21 @@ mod tests {
 
     #[test]
     fn small_blocks() {
-        let src = texty(5000, 9);
+        // Miri: less input, and sizes up to 8 and two above for the tiny
+        // inputs
+        let src = texty(if MIRI { 200 } else { 5000 }, 9);
         for level in [16, 18, 19, 22] {
             let cp = one_shot_cparams(level, src.len() as u64);
             for bs in [1, 6, 7, 8, 9, 16, 17, 20, 33, 100, 1000] {
                 roundtrip(&src, cp, bs);
             }
         }
-        for n in 0..60 {
+        let ns: Vec<usize> = if MIRI {
+            (0..=8).chain([16, 59]).collect()
+        } else {
+            (0..60).collect()
+        };
+        for n in ns {
             let s = texty(n, 10);
             for level in [12, 16, 19, 22] {
                 roundtrip(&s, one_shot_cparams(level, n as u64), 1 << 17);
@@ -2265,16 +2287,30 @@ mod tests {
     #[test]
     fn long_matches() {
         // Matches longer than ZSTD_OPT_NUM and than a block, and repetitive
-        // patterns (tree insertion skipping).
-        let mut src = random(10_000, 11);
-        src.extend_from_within(..10_000);
-        src.extend(core::iter::repeat_n(b'a', 20_000));
-        src.extend_from_slice(&texty(10_000, 12));
-        src.extend_from_within(5_000..25_000);
-        src.extend((0..200_000u32).map(|i| (i % 3) as u8));
-        for level in [16, 17, 18, 19, 22] {
+        // patterns (tree insertion skipping). Miri: less input (the run of
+        // 'a' still longer than ZSTD_OPT_NUM), the blocks cut to 4 KiB so
+        // that matches still span blocks, one level per strategy.
+        let k = if MIRI { 20 } else { 1 }; // sizes divided by k
+        let (run, period3) = if MIRI {
+            (5000, 6000)
+        } else {
+            (20_000, 200_000)
+        };
+        let mut src = random(10_000 / k, 11);
+        src.extend_from_within(..10_000 / k);
+        src.extend(core::iter::repeat_n(b'a', run));
+        src.extend_from_slice(&texty(10_000 / k, 12));
+        src.extend_from_within(5_000 / k..25_000 / k);
+        src.extend((0..period3).map(|i: u32| (i % 3) as u8));
+        let levels: &[i32] = if MIRI {
+            &[16, 19, 22]
+        } else {
+            &[16, 17, 18, 19, 22]
+        };
+        for &level in levels {
             let cp = one_shot_cparams(level, src.len() as u64);
-            roundtrip(&src, cp, block_size_max(&cp, src.len() as u64));
+            let bs = block_size_max(&cp, src.len() as u64);
+            roundtrip(&src, cp, if MIRI { bs.min(4 << 10) } else { bs });
         }
     }
 
@@ -2364,16 +2400,18 @@ mod tests {
         let lens: Vec<u32> = (0..=300u32)
             .chain([1000, 4095, 65_535, 65_536, 131_071, BLOCKSIZE_MAX as u32])
             .collect();
-        let rounds = if cfg!(miri) { 2 } else { 40 };
+        // Miri: fewer blocks, smaller ones, fewer statistics updates
+        let (rounds, updates) = if MIRI { (2, 4) } else { (40, 50) };
         for round in 0..rounds {
             // a new block: the first of a frame now and then, small (the
             // predefined prices) or not
             if round % 7 == 0 {
                 s.lit_length_sum = 0;
             }
-            let n = [10, 5000, 100_000][(xorshift(&mut r) % 3) as usize];
+            let n =
+                [10, 5000, if MIRI { 20_000 } else { 100_000 }][(xorshift(&mut r) % 3) as usize];
             s.rescale_freqs::<L>(&texty(n, xorshift(&mut r)), None);
-            for _ in 0..(xorshift(&mut r) % 50) {
+            for _ in 0..(xorshift(&mut r) % updates) {
                 for _ in 0..(xorshift(&mut r) % 4) {
                     let ll = (xorshift(&mut r) % [20, 300, 70_000][(xorshift(&mut r) % 3) as usize])
                         as usize;
@@ -2413,14 +2451,28 @@ mod tests {
     /// streaming compressor's.
     #[test]
     fn roundtrip_ring_variants() {
-        let mut src = texty(100_000, 7);
-        src.extend_from_slice(&random(5000, 8));
-        src.extend_from_slice(&src.clone()[..40_000]);
-        src.extend_from_slice(&texty(50_000, 17));
-        for strategy in OPT {
-            for mls in 3..=6 {
-                for (search_log, target_length) in [(1, 4), (4, 32), (7, 256)] {
-                    for (window_log, bs) in [(12, 4096), (15, 5000), (16, 1 << 15)] {
+        let src = if MIRI {
+            ring_input(1000, 500, 600)
+        } else {
+            ring_input(100_000, 40_000, 50_000)
+        };
+        type Search = &'static [(u32, u32)];
+        // The ring (window + block size) wraps for every window.
+        let (searches, windows): (Search, &[(u32, usize)]) = if MIRI {
+            (&[(4, 32)], &[(10, 1 << 10), (10, 700)])
+        } else {
+            (
+                &[(1, 4), (4, 32), (7, 256)],
+                &[(12, 4096), (15, 5000), (16, 1 << 15)],
+            )
+        };
+        for (s, strategy) in OPT.into_iter().enumerate() {
+            // Miri: two mls per strategy (btopt 4 and 6, btultra 3 and 5,
+            // btultra2 4 and 6)
+            for mls in (3..=6).filter(|&mls| !MIRI || (mls as usize + s).is_multiple_of(2)) {
+                for &(search_log, target_length) in searches {
+                    // Miri: one window per mls, each across the mls
+                    for &(window_log, bs) in miri_pick(windows, mls as usize) {
                         let cp = CParams {
                             window_log,
                             chain_log: 16,
@@ -2432,7 +2484,7 @@ mod tests {
                         };
                         let (n, ext) = roundtrip_ring(&src, cp, bs);
                         assert!(
-                            n > 1000 && ext > 0,
+                            n > MIN_SEQUENCES && ext > 0,
                             "{strategy:?} mls {mls} slog {search_log} wlog {window_log}: {n} {ext}"
                         );
                     }

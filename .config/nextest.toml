@@ -1,0 +1,9 @@
+# cargo-nextest configuration. Only the Miri workflow runs nextest.
+
+# `cargo miri nextest` selects this profile. Every test is sized to take a
+# few minutes at most under Miri (see `MIRI` in enc/fast.rs and the other
+# test modules). A test still running after 5 minutes is reported SLOW,
+# and killed and failed at 10 minutes, so that a test that grew too slow
+# fails on its own instead of holding a slot until the job's time limit.
+[profile.default-miri]
+slow-timeout = { period = "5m", terminate-after = 2 }

@@ -1449,6 +1449,10 @@ mod tests {
             .collect()
     }
 
+    /// Under Miri, the randomized tests run fewer and smaller cases (a
+    /// minute or two each there, instead of hours).
+    const MIRI: bool = cfg!(miri);
+
     fn histogram(src: &[u8]) -> ([u32; 256], u32) {
         let mut count = [0u32; 256];
         let mut msv = 255;
@@ -1460,7 +1464,8 @@ mod tests {
     fn compress_weights_round_trip() {
         let mut r = Rng(12345);
         let mut done = 0;
-        for iter in 0..4000 {
+        let iters = if MIRI { 200 } else { 4000 };
+        for iter in 0..iters {
             let n = 2 + r.below(254) as usize;
             let maxw = 1 + r.below(12);
             let w: Vec<u8> = (0..n)
@@ -1481,7 +1486,7 @@ mod tests {
             assert_eq!(&out[..got], &w[..], "iter {iter}");
             done += 1;
         }
-        assert!(done > 1000, "{done}");
+        assert!(done > iters / 4, "{done}");
     }
 
     /// libzstd's `HUF_sort` as written there (every symbol, zero counts
@@ -1682,8 +1687,9 @@ mod tests {
     #[test]
     fn build_ctable_properties() {
         let mut r = Rng(4242);
-        for iter in 0..2000 {
-            let len = 2 + r.below(20000) as usize;
+        let (iters, max_len) = if MIRI { (40, 2000) } else { (2000, 20000) };
+        for iter in 0..iters {
+            let len = 2 + r.below(max_len) as usize;
             let src = skewed(&mut r, len, iter % 4);
             let (count, msv) = histogram(&src);
             if count.iter().filter(|&&c| c != 0).count() < 2 {
@@ -1720,8 +1726,13 @@ mod tests {
         let cpu = Features::detect();
         let mut dt = Box::new(HufTable::new());
         let mut scratch = Box::new(HufTable::new());
-        for iter in 0..1500 {
-            let len = 12 + r.below(if iter % 5 == 0 { 128 * 1024 - 12 } else { 3000 }) as usize;
+        let (iters, large, small) = if MIRI {
+            (12, 8 * 1024, 600)
+        } else {
+            (1500, 128 * 1024, 3000)
+        };
+        for iter in 0..iters {
+            let len = 12 + r.below(if iter % 5 == 0 { large - 12 } else { small }) as usize;
             let src = skewed(&mut r, len, iter % 4);
             let (count, msv) = histogram(&src);
             if count.iter().filter(|&&c| c != 0).count() < 2 {
@@ -1809,8 +1820,9 @@ mod tests {
     fn small_outputs() {
         let mut r = Rng(5);
         let mut dt = Box::new(HufTable::new());
-        for iter in 0..300 {
-            let len = 12 + r.below(400) as usize;
+        let (iters, max_len) = if MIRI { (5, 60) } else { (300, 400) };
+        for iter in 0..iters {
+            let len = 12 + r.below(max_len) as usize;
             let src = skewed(&mut r, len, iter % 4);
             let (count, msv) = histogram(&src);
             if count.iter().filter(|&&c| c != 0).count() < 2 {
@@ -1847,8 +1859,13 @@ mod tests {
         let mut prev = HufCTable::new();
         let mut prev_repeat = HufRepeat::None;
         let mut stats = [0usize; 4];
-        for iter in 0..1500u64 {
-            let len = 1 + r.below(if iter % 7 == 0 { 128 * 1024 } else { 2000 }) as usize;
+        let (iters, large, small) = if MIRI {
+            (48, 4 * 1024, 400)
+        } else {
+            (1500, 128 * 1024, 2000)
+        };
+        for iter in 0..iters {
+            let len = 1 + r.below(if iter % 7 == 0 { large } else { small }) as usize;
             let src = skewed(&mut r, len, (iter / 3) % 4);
             let four = len >= 256 && iter % 2 == 0;
             let flags = match iter % 4 {
@@ -1909,8 +1926,9 @@ mod tests {
     #[test]
     fn optimal_depth() {
         let mut r = Rng(8);
-        for iter in 0..300 {
-            let len = 100 + r.below(50_000) as usize;
+        let (iters, max_len) = if MIRI { (8, 4000) } else { (300, 50_000) };
+        for iter in 0..iters {
+            let len = 100 + r.below(max_len) as usize;
             let src = skewed(&mut r, len, iter % 4);
             let (count, msv) = histogram(&src);
             let card = huf_cardinality(&count, msv);

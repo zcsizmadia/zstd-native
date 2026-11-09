@@ -1201,10 +1201,17 @@ mod tests {
     #[test]
     fn jobs_run_in_the_calling_thread_without_workers() {
         // a pool whose threads could not be started: jobs run inline, with
-        // the same output
-        let data: Vec<u8> = (0..3_000_000u32)
-            .map(|i| (i.wrapping_mul(2_654_435_761) >> 27) as u8 ^ (i / 1000) as u8)
-            .collect();
+        // the same output. Miri: one job of 40 KB (two jobs need over 512
+        // KiB, minutes per compression there).
+        let data: Vec<u8> = if cfg!(miri) {
+            (0..40_000u32)
+                .map(|i| (i / 1000) as u8 ^ (i % 7) as u8)
+                .collect()
+        } else {
+            (0..3_000_000u32)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 27) as u8 ^ (i / 1000) as u8)
+                .collect()
+        };
         let mut p = MtParams::default();
         p.set_workers(2);
         p.set_job_size(JOBSIZE_MIN);
