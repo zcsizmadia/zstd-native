@@ -41,13 +41,21 @@ jobs:
           # seeds: the target has a seed corpus from src/bin/seeds.rs
           # (libzstd frames of every kind); the others take `arbitrary`
           # structures, not frames.
+          # pr_max_len: a smaller input limit for the short runs on pushes
+          # and PRs (compress: about 84 runs/s at 131072 bytes, too few
+          # for three minutes).
           - { target: decode, max_len: "65536", seeds: true }
           - { target: stream_decode, max_len: "65536", seeds: true }
           - { target: decode_valid, max_len: "131072", seeds: false }
-          - { target: compress, max_len: "131072", seeds: false }
+          - { target: compress, max_len: "131072", pr_max_len: "16384", seeds: false }
     env:
       # Short runs on pushes and PRs, long runs nightly or on demand.
       SECONDS_PER_TARGET: ${{ github.event_name == 'schedule' && '1800' || github.event.inputs.seconds || '180' }}
+      # The input limit of the fuzzing: `pr_max_len` on pushes and PRs when
+      # set, else `max_len`. Longer corpus files (the cache is shared with
+      # the long runs) are truncated to it when run, not dropped or
+      # rewritten.
+      FUZZ_MAX_LEN: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && matrix.pr_max_len || matrix.max_len }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -76,11 +84,19 @@ jobs:
         run: >
           cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} --
           -max_total_time=${{ env.SECONDS_PER_TARGET }}
-          -rss_limit_mb=4096 -timeout=60 -max_len=${{ matrix.max_len }}
+          -rss_limit_mb=4096 -timeout=60 -max_len=${{ env.FUZZ_MAX_LEN }}
       - name: Minimize corpus
         if: always()
         working-directory: fuzz
-        run: cargo fuzz cmin --target x86_64-unknown-linux-gnu ${{ matrix.target }} || true
+        # With the fuzzing's limits (else libFuzzer's 1 MiB default
+        # max_len, and compress grew past 1.5 GB), and always the full
+        # max_len: a file is kept or dropped by the coverage of what runs,
+        # so a smaller limit would drop long inputs that the long runs
+        # need.
+        run: >
+          cargo fuzz cmin --target x86_64-unknown-linux-gnu ${{ matrix.target }} --
+          -rss_limit_mb=4096 -timeout=60 -max_len=${{ matrix.max_len }}
+          || true
       - name: Save corpus
         if: always()
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
