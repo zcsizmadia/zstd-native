@@ -2663,7 +2663,7 @@ pub(super) mod tests {
     /// `src`. Returns the total number of sequences.
     pub(crate) fn roundtrip(src: &[u8], cparams: CParams, block_size: usize) -> usize {
         let mut ms = MatchState::new(cparams);
-        let mut ss = SeqStore::new(block_size, cparams.min_match);
+        let mut ss = SeqStore::new(seq_store_size(src, block_size), cparams.min_match);
         ms.update_window(0, src.len());
         let mut rep = REP_START_VALUE;
         let mut dec_rep = REP_START_VALUE;
@@ -2690,6 +2690,17 @@ pub(super) mod tests {
             pos += bs;
         }
         nb_seq
+    }
+
+    /// The block size of the round trips' `SeqStore`: `block_size`, or
+    /// under Miri at most the input size (no block is larger, and filling
+    /// a `SeqStore` for 128 KiB blocks takes a second there).
+    fn seq_store_size(src: &[u8], block_size: usize) -> usize {
+        if MIRI {
+            block_size.min(src.len()).max(1)
+        } else {
+            block_size
+        }
     }
 
     pub(crate) fn xorshift(state: &mut u64) -> u64 {
@@ -2739,11 +2750,21 @@ pub(super) mod tests {
         cparams: CParams,
         block_size: usize,
     ) -> (usize, usize) {
+        roundtrip_ring_with(src, MatchState::new(cparams), block_size)
+    }
+
+    /// [`roundtrip_ring`] with the match state `ms` (fresh, its match
+    /// finder chosen by the caller).
+    pub(crate) fn roundtrip_ring_with(
+        src: &[u8],
+        mut ms: MatchState,
+        block_size: usize,
+    ) -> (usize, usize) {
+        let cparams = ms.cparams;
         let window = 1usize << cparams.window_log;
         let ring_size = window + block_size;
         let mut ring = alloc::vec![0u8; ring_size + 32];
-        let mut ms = MatchState::new(cparams);
-        let mut ss = SeqStore::new(block_size, cparams.min_match);
+        let mut ss = SeqStore::new(seq_store_size(src, block_size), cparams.min_match);
         let mut rep = REP_START_VALUE;
         let mut dec_rep = REP_START_VALUE;
         let mut out = Vec::new();
@@ -2774,15 +2795,29 @@ pub(super) mod tests {
     }
 
     /// Under Miri, the round-trip tests take a few KB of input and fewer
-    /// parameter combinations, but every match finder template still runs:
-    /// with the full sizes, one test takes over six hours there.
+    /// parameter combinations (a minute or two per test there), but every
+    /// match finder template still runs: with the full sizes, one test
+    /// takes over six hours there.
     pub(crate) const MIRI: bool = cfg!(miri);
+
+    /// The values of a test's inner parameter loop: all of `all`, or under
+    /// Miri only the `i`-th (cyclically), `i` counting an outer loop, so
+    /// that each value still runs once across that loop rather than with
+    /// every outer value.
+    pub(crate) fn miri_pick<T>(all: &[T], i: usize) -> &[T] {
+        if MIRI {
+            let k = i % all.len();
+            &all[k..=k]
+        } else {
+            all
+        }
+    }
 
     /// The input of the `roundtrip_all_variants` tests: text, an
     /// incompressible stretch, then a repeat of the start.
     pub(crate) fn variants_input() -> Vec<u8> {
         let (text, noise, repeat) = if MIRI {
-            (6000, 500, 3000)
+            (1500, 200, 700)
         } else {
             (150_000, 5000, 40_000)
         };
@@ -2803,25 +2838,27 @@ pub(super) mod tests {
     }
 
     /// The minimum number of sequences of a variants round trip.
-    pub(crate) const MIN_SEQUENCES: usize = if MIRI { 100 } else { 1000 };
+    pub(crate) const MIN_SEQUENCES: usize = if MIRI { 50 } else { 1000 };
 
     #[test]
     fn roundtrip_ring_variants() {
         let src = if MIRI {
-            ring_input(6000, 3000, 3000)
+            ring_input(3000, 1500, 2000)
         } else {
             ring_input(150_000, 60_000, 100_000)
         };
         // The ring (window + block size) wraps for every window.
         let windows: &[(u32, usize)] = if MIRI {
-            &[(10, 1 << 10), (12, 3000)]
+            &[(10, 1 << 10), (11, 1500)]
         } else {
             &[(10, 1 << 10), (14, 3000), (16, 1 << 15), (17, 1 << 17)]
         };
         let target_lengths: &[u32] = if MIRI { &[0, 7] } else { &[0, 1, 7] };
+        // Miri: one window and target length per mls, every pair of them
+        // across the mls
         for mls in 3..=8 {
-            for &(window_log, bs) in windows {
-                for &target_length in target_lengths {
+            for &(window_log, bs) in miri_pick(windows, mls as usize) {
+                for &target_length in miri_pick(target_lengths, mls as usize / 2) {
                     let cp = CParams {
                         window_log,
                         chain_log: 16,
@@ -2884,9 +2921,11 @@ pub(super) mod tests {
             &[10, 14, 18, 19, 22]
         };
         let target_lengths: &[u32] = if MIRI { &[0, 7] } else { &[0, 1, 7] };
+        // Miri: one window and target length per mls, every pair of them
+        // across the mls
         for mls in 3..=8 {
-            for &window_log in window_logs {
-                for &target_length in target_lengths {
+            for &window_log in miri_pick(window_logs, mls as usize) {
+                for &target_length in miri_pick(target_lengths, mls as usize / 2) {
                     let cp = CParams {
                         window_log,
                         chain_log: 16,
@@ -2908,7 +2947,7 @@ pub(super) mod tests {
 
     #[test]
     fn small_blocks() {
-        let src = texty(5000, 9);
+        let src = texty(if MIRI { 1000 } else { 5000 }, 9);
         let cp = one_shot_cparams(1, src.len() as u64);
         for bs in [1, 6, 7, 8, 9, 20, 33, 100, 1000] {
             roundtrip(&src, cp, bs);

@@ -230,10 +230,20 @@ mod tests {
 
     #[test]
     fn matches_reference() {
-        for &n in &[
-            0usize, 1, 3, 15, 16, 17, 100, 1499, 1500, 1501, 5000, 8191, 8192, 8200, 131072,
-        ] {
-            for &alpha in &[1u32, 2, 40, 200, 256] {
+        // Miri: every size threshold (1500 bytes for the fast count, 8 KiB
+        // for 8 lanes), a remainder after the lanes, fewer alphabets.
+        let (ns, alphas): (&[usize], &[u32]) = if cfg!(miri) {
+            (&[0, 1, 3, 17, 1499, 1500, 8191, 8192], &[1, 256])
+        } else {
+            (
+                &[
+                    0, 1, 3, 15, 16, 17, 100, 1499, 1500, 1501, 5000, 8191, 8192, 8200, 131072,
+                ],
+                &[1, 2, 40, 200, 256],
+            )
+        };
+        for &n in ns {
+            for &alpha in alphas {
                 let src = data(n, n as u64 * 31 + u64::from(alpha), alpha);
                 let (rc, rmax, rl) = reference(&src);
                 assert_eq!(hist_largest_count(&src), rl, "n={n} alpha={alpha}");

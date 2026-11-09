@@ -742,36 +742,49 @@ mod tests {
     fn round_trip_every_mode() {
         use super::super::compress::{FrameCompressor, compress_bound};
         use super::super::fast::tests::{MIRI, texty};
-        // Miri: a smaller dictionary and input, still over the largest
-        // attach cutoff (32 KiB), so every strategy attaches and copies,
-        // but under 128 KiB: no frame loads the dictionary into its own
-        // tables. Fewer levels, at least one per strategy.
-        let (dict_len, pieces, tail) = if MIRI {
-            (6000, 12, 18_000)
-        } else {
-            (20_000, 40, 200_000)
-        };
+        // Miri: a smaller dictionary and input, and fewer levels, one per
+        // strategy. Every level attaches (600 bytes: the dictMatchState
+        // match finders take seconds per KB there); fast, dfast and greedy
+        // also copy (1 KiB over their attach cutoff, under 128 KiB: no frame
+        // loads the dictionary into its own tables; the extDict match
+        // finders of every strategy run in the `roundtrip_ring_variants`
+        // tests). Past 10 KB, the input repeats its start: long matches,
+        // cheap there. Whether the dictionary helps is not checked under
+        // Miri.
+        let (dict_len, pieces) = if MIRI { (4000, 8) } else { (20_000, 40) };
         let dict = texty(dict_len, 1);
         // the input repeats parts of the dictionary, with other text
-        let mut src = texty(if MIRI { 10_000 } else { 30_000 }, 2);
+        let mut src = texty(if MIRI { 2000 } else { 30_000 }, 2);
         for i in 0..pieces {
             let at = (i * 4999) % (dict_len - 1000);
             src.extend_from_slice(&dict[at..at + 700]);
             src.extend_from_slice(&texty(300, 3 + i as u64));
         }
-        src.extend_from_slice(&texty(tail, 50));
-        let ddict = crate::Dictionary::new(&dict).unwrap();
-        let (levels, sizes): (&[i32], &[usize]) = if MIRI {
-            (&[1, 3, 5, 7, 9, 15, 16, 19, 22], &[5_000, src.len()])
+        if MIRI {
+            while src.len() < 34 << 10 {
+                src.extend_from_within(..5000);
+            }
         } else {
-            (
-                &[-3, 1, 2, 3, 4, 5, 7, 8, 9, 12, 15, 16, 17, 19, 22],
-                &[5_000, 20_000, 60_000, src.len()],
-            )
+            src.extend_from_slice(&texty(200_000, 50));
+        }
+        let ddict = crate::Dictionary::new(&dict).unwrap();
+        let levels: &[i32] = if MIRI {
+            &[1, 3, 5, 7, 9, 15, 16, 19, 22]
+        } else {
+            &[-3, 1, 2, 3, 4, 5, 7, 8, 9, 12, 15, 16, 17, 19, 22]
         };
         for &level in levels {
             let cd = Arc::new(CDict::new(&dict, level, false).unwrap());
-            for &n in sizes {
+            let sizes = if MIRI && level <= 5 {
+                let cutoff = ATTACH_DICT_SIZE_CUTOFFS[cd.cparams.strategy as usize];
+                alloc::vec![600, cutoff as usize + 1024]
+            } else if MIRI {
+                alloc::vec![600]
+            } else {
+                alloc::vec![5_000, 20_000, 60_000, src.len()]
+            };
+            let largest = sizes[sizes.len() - 1];
+            for &n in &sizes {
                 let data = &src[..n];
                 let pledged = Some(n as u64);
                 let cp = frame_cparams(cd.level, Some(&cd), pledged, 0, false);
@@ -785,7 +798,7 @@ mod tests {
                 let c = fc.compress(&mut out, data).unwrap();
                 let mut d = crate::Decompressor::with_dictionary(ddict.clone());
                 assert_eq!(d.decompress(&out[..c]).unwrap(), data, "L{level} n={n}");
-                if n == src.len() {
+                if n == largest && !MIRI {
                     // the dictionary helps with its pieces
                     let plain = crate::compress(data, cd.level).unwrap();
                     assert!(c < plain.len(), "L{level} n={n}: {c} vs {}", plain.len());

@@ -2327,7 +2327,8 @@ fn ext_generic<
 #[cfg(test)]
 mod tests {
     use super::super::fast::tests::{
-        MIN_SEQUENCES, MIRI, random, ring_input, roundtrip, roundtrip_ring, texty, variants_input,
+        MIN_SEQUENCES, MIRI, miri_pick, random, ring_input, roundtrip, roundtrip_ring,
+        roundtrip_ring_with, texty, variants_input,
     };
     use super::super::fast::{MatchState, build_seq_store, reduce_table_btlazy2};
     use super::super::params::{CParams, Strategy, block_size_max, one_shot_cparams};
@@ -2362,8 +2363,10 @@ mod tests {
 
     #[test]
     fn roundtrip_levels() {
-        for src in &inputs() {
-            for level in 4..=15 {
+        let inputs = inputs();
+        for level in 4..=15 {
+            // Miri: one input per level, each across the levels
+            for src in miri_pick(&inputs, level as usize) {
                 let cp = one_shot_cparams(level, src.len() as u64);
                 if !LAZY.contains(&cp.strategy) {
                     continue;
@@ -2382,11 +2385,12 @@ mod tests {
         } else {
             (&[3, 4, 5, 6, 7], &[1, 4, 5, 6, 7], &[10, 14, 15, 18, 22])
         };
-        for strategy in LAZY {
+        for (s, strategy) in LAZY.into_iter().enumerate() {
             // mls 4, 5, 6 (3 and 7 are clamped to 4 and 6)
             for &mls in mlss {
-                // rowLog 4, 5, 6 (searchLog 1 and 7 are clamped)
-                for &search_log in search_logs {
+                // rowLog 4, 5, 6 (searchLog 1 and 7 are clamped); Miri:
+                // one per mls, each across the mls of every strategy
+                for &search_log in miri_pick(search_logs, mls as usize + s) {
                     // window logs up to 14 use the hash chain, above it
                     // the row finder (greedy..lazy2)
                     for &window_log in window_logs {
@@ -2415,7 +2419,7 @@ mod tests {
 
     #[test]
     fn small_blocks() {
-        let src = texty(5000, 9);
+        let src = texty(if MIRI { 600 } else { 5000 }, 9);
         for level in [5, 7, 9, 10] {
             let cp = one_shot_cparams(level, src.len() as u64);
             for bs in [1, 6, 7, 8, 9, 16, 17, 20, 33, 100, 1000] {
@@ -2453,11 +2457,19 @@ mod tests {
     #[test]
     fn stale_tags() {
         // libzstd doesn't clear the tag table between frames; the content
-        // must not matter (see the `row` module docs).
-        let src = texty(400_000, 11);
-        let other = random(400_000, 12);
+        // must not matter (see the `row` module docs). Miri: less input,
+        // and the levels' parameters with a 32 KiB window and 64 Ki-entry
+        // tables (still the row match finder).
+        let n = if MIRI { 1500 } else { 400_000 };
+        let src = texty(n, 11);
+        let other = random(n, 12);
         for level in [5, 6, 8, 12] {
-            let cp = one_shot_cparams(level, src.len() as u64);
+            let mut cp = one_shot_cparams(level, 400_000);
+            if MIRI {
+                cp.window_log = 15;
+                cp.hash_log = cp.hash_log.min(16);
+                cp.chain_log = cp.chain_log.min(16);
+            }
             let mut fresh = MatchState::new(cp);
             assert!(fresh.use_row_match_finder);
             let want = sequences(&mut fresh, &src);
@@ -2480,8 +2492,10 @@ mod tests {
 
     #[test]
     fn salt_advances() {
-        let src = texty(100_000, 13);
-        let cp = one_shot_cparams(6, src.len() as u64);
+        // Miri: less input, with the parameters (row match finder) of the
+        // full size
+        let src = texty(if MIRI { 4000 } else { 100_000 }, 13);
+        let cp = one_shot_cparams(6, 100_000);
         let mut ms = MatchState::new(cp);
         let first = ms.hash_salt;
         assert_ne!(first, 0);
@@ -2511,29 +2525,57 @@ mod tests {
     /// wrapping ring buffer like the streaming compressor's.
     #[test]
     fn roundtrip_ring_variants() {
-        // Miri: the ring of the row finder's 2^15 window wraps once.
-        let src = if MIRI {
-            ring_input(30_000, 3000, 6000)
-        } else {
-            ring_input(150_000, 60_000, 60_000)
-        };
-        let (search_logs, windows): (&[u32], &[(u32, usize)]) = if MIRI {
-            (&[4, 5, 6], &[(12, 4096), (15, 3000)])
-        } else {
-            (
-                &[1, 5, 6],
-                &[(12, 4096), (14, 3000), (15, 1 << 13), (17, 1 << 17)],
-            )
-        };
+        // Miri: a 1 KiB window, the row finder forced on for it (as
+        // ZSTD_c_useRowMatchFinder can) next to the hash chain, so that the
+        // ring wraps with a few KiB of input; one rowLog per mls, the hash
+        // chain once per strategy.
+        if MIRI {
+            let src = ring_input(1500, 700, 700);
+            for strategy in LAZY {
+                for mls in [4, 5, 6] {
+                    for &search_log in miri_pick(&[4, 5, 6], mls as usize) {
+                        let cp = CParams {
+                            window_log: 10,
+                            chain_log: 16,
+                            hash_log: 16,
+                            search_log,
+                            min_match: mls,
+                            target_length: 8,
+                            strategy,
+                        };
+                        let mut finders = Vec::new();
+                        // the hash chain once per strategy, the binary tree
+                        // with every mls
+                        if search_log == 5 || strategy == Strategy::BtLazy2 {
+                            let ms = MatchState::new(cp);
+                            assert!(!ms.use_row_match_finder);
+                            finders.push(ms);
+                        }
+                        if strategy != Strategy::BtLazy2 {
+                            finders.push(MatchState::new_with(cp, true, false));
+                        }
+                        for ms in finders {
+                            let row = ms.use_row_match_finder;
+                            let (n, ext) = roundtrip_ring_with(&src, ms, 1 << 10);
+                            assert!(
+                                n > MIN_SEQUENCES && ext > 0,
+                                "{strategy:?} mls {mls} slog {search_log} row {row}: {n} {ext}"
+                            );
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        let src = ring_input(150_000, 60_000, 60_000);
+        let search_logs: &[u32] = &[1, 5, 6];
+        let windows: &[(u32, usize)] = &[(12, 4096), (14, 3000), (15, 1 << 13), (17, 1 << 17)];
         for strategy in LAZY {
             for mls in [4, 5, 6] {
                 for &search_log in search_logs {
                     // window logs up to 14 use the hash chain, above it the
                     // row finder (greedy..lazy2)
                     for &(window_log, bs) in windows {
-                        if MIRI && window_log < 15 && search_log != 5 {
-                            continue; // the hash chain has no rowLog
-                        }
                         let cp = CParams {
                             window_log,
                             chain_log: 16,

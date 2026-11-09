@@ -1184,7 +1184,7 @@ fn ldm_block_compress(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::enc::fast::tests::{MIRI, random, texty};
+    use crate::enc::fast::tests::{MIRI, miri_pick, random, texty};
     use crate::enc::params::one_shot_cparams;
     use crate::{EndOp, StreamEncoder};
     use alloc::vec::Vec;
@@ -1325,14 +1325,16 @@ mod tests {
     #[test]
     fn round_trip_forced() {
         let data = if MIRI {
-            input(40_000, 25_000)
+            input(6_000, 3_000)
         } else {
             input(1 << 20, 400_000)
         };
+        // Miri: one window per level, each across the levels (the 2 KiB
+        // window's input buffer wraps)
         let (levels, windows): (&[i32], &[(u32, usize)]) = if MIRI {
             (
                 &[1, 3, 5, 8, 13, 16, 19, 22],
-                &[(17, data.len()), (14, 6000)],
+                &[(17, data.len()), (11, 1500)],
             )
         } else {
             (
@@ -1340,8 +1342,8 @@ mod tests {
                 &[(20, data.len()), (17, 70_000)],
             )
         };
-        for &level in levels {
-            for &(wlog, piece) in windows {
+        for (i, &level) in levels.iter().enumerate() {
+            for &(wlog, piece) in miri_pick(windows, i) {
                 let mut enc = StreamEncoder::new(level);
                 enc.set_long_distance_matching(true);
                 enc.set_window_log(wlog);

@@ -750,7 +750,7 @@ mod build_tests {
     #[allow(clippy::needless_range_loop)]
     fn fast_build_matches_reference() {
         let mut r = 12345u64;
-        for case in 0..2000 {
+        for case in 0..if cfg!(miri) { 100 } else { 2000 } {
             r ^= r << 13;
             r ^= r >> 7;
             r ^= r << 17;

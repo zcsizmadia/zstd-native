@@ -1547,7 +1547,8 @@ fn dms_generic<const MLS: u32>(
 #[cfg(test)]
 mod tests {
     use super::super::fast::tests::{
-        MIN_SEQUENCES, MIRI, random, ring_input, roundtrip, roundtrip_ring, texty, variants_input,
+        MIN_SEQUENCES, MIRI, miri_pick, random, ring_input, roundtrip, roundtrip_ring, texty,
+        variants_input,
     };
     use super::super::params::{CParams, Strategy, block_size_max, one_shot_cparams};
     use alloc::vec::Vec;
@@ -1577,8 +1578,9 @@ mod tests {
     fn roundtrip_all_variants() {
         let src = variants_input();
         let window_logs: &[u32] = if MIRI { &[10, 22] } else { &[10, 14, 18, 22] };
+        // Miri: one window per mls, each across the mls
         for mls in 3..=8 {
-            for &window_log in window_logs {
+            for &window_log in miri_pick(window_logs, mls as usize) {
                 let cp = CParams {
                     window_log,
                     chain_log: 13,
@@ -1602,18 +1604,19 @@ mod tests {
     #[test]
     fn roundtrip_ring_variants() {
         let src = if MIRI {
-            ring_input(6000, 3000, 3000)
+            ring_input(3000, 1500, 2000)
         } else {
             ring_input(150_000, 60_000, 100_000)
         };
         // The ring (window + block size) wraps for every window.
         let windows: &[(u32, usize)] = if MIRI {
-            &[(10, 1 << 10), (12, 3000)]
+            &[(10, 1 << 10), (11, 1500)]
         } else {
             &[(10, 1 << 10), (14, 3000), (16, 1 << 15), (17, 1 << 17)]
         };
+        // Miri: one window per mls, each across the mls
         for mls in 3..=8 {
-            for &(window_log, bs) in windows {
+            for &(window_log, bs) in miri_pick(windows, mls as usize) {
                 let cp = CParams {
                     window_log,
                     chain_log: 13,

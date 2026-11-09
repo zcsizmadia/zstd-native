@@ -340,31 +340,42 @@ mod tests {
         parts.concat()
     }
 
-    /// The test blocks; the expected split points (per level 0..=4) below
-    /// were produced by libzstd 1.5.7's `ZSTD_splitBlock` on the same data.
-    pub(super) fn datasets() -> Vec<Vec<u8>> {
-        alloc::vec![
-            random(BLOCK, 1),
-            text(BLOCK),
-            alloc::vec![0u8; BLOCK],
-            noisy_text(BLOCK, 2),
-            cat(&[random(BLOCK / 2, 3), text(BLOCK / 2)]),
-            cat(&[text(BLOCK * 3 / 4), random(BLOCK / 4, 4)]),
-            cat(&[random(BLOCK / 4, 5), text(BLOCK * 3 / 4)]),
-            cat(&[noisy_text(BLOCK / 2, 6), alloc::vec![7u8; BLOCK / 2]]),
-            cat(&[
+    /// Under Miri, fewer blocks (a minute or two per test there).
+    const MIRI: bool = cfg!(miri);
+
+    /// The test block `i` (of 9); the expected split points (per level
+    /// 0..=4) below were produced by libzstd 1.5.7's `ZSTD_splitBlock` on
+    /// the same data.
+    fn dataset(i: usize) -> Vec<u8> {
+        match i {
+            0 => random(BLOCK, 1),
+            1 => text(BLOCK),
+            2 => alloc::vec![0u8; BLOCK],
+            3 => noisy_text(BLOCK, 2),
+            4 => cat(&[random(BLOCK / 2, 3), text(BLOCK / 2)]),
+            5 => cat(&[text(BLOCK * 3 / 4), random(BLOCK / 4, 4)]),
+            6 => cat(&[random(BLOCK / 4, 5), text(BLOCK * 3 / 4)]),
+            7 => cat(&[noisy_text(BLOCK / 2, 6), alloc::vec![7u8; BLOCK / 2]]),
+            _ => cat(&[
                 noisy_text(40_000, 7),
                 random(30_000, 8),
-                noisy_text(BLOCK - 70_000, 9)
+                noisy_text(BLOCK - 70_000, 9),
             ]),
-        ]
+        }
     }
 
     #[test]
     fn split_points_match_libzstd() {
         const EXPECTED: [[usize; 5]; 9] = EXPECTED_FROM_LIBZSTD;
         let mut ws = FpStats::new();
-        for (i, data) in datasets().iter().enumerate() {
+        // Miri: two blocks that split, at different points per level
+        let which: &[usize] = if MIRI {
+            &[4, 8]
+        } else {
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8]
+        };
+        for &i in which {
+            let data = &dataset(i);
             for level in 0..=4 {
                 assert_eq!(
                     split_block(data, level, &mut ws),
@@ -379,7 +390,7 @@ mod tests {
     fn split_points_are_valid() {
         let mut ws = FpStats::new();
         let mut s = 99u64;
-        for _ in 0..20 {
+        for _ in 0..if MIRI { 2 } else { 20 } {
             let mut data = Vec::with_capacity(BLOCK);
             while data.len() < BLOCK {
                 let r = xorshift(&mut s);
@@ -426,7 +437,7 @@ mod tests {
     #[test]
     fn optimal_size() {
         let mut ws = FpStats::new();
-        let data = text(300_000);
+        let data = text(if MIRI { BLOCK + 1000 } else { 300_000 });
         let fast = Strategy::Fast;
         assert_eq!(
             optimal_block_size(&data[..1000], 1 << 17, 0, fast, 100, &mut ws),
@@ -445,7 +456,7 @@ mod tests {
             1 << 17
         );
         // Level by strategy (fast -> 0, dfast -> 1, ...) or explicit 2..=6.
-        let mixed = &datasets()[4];
+        let mixed = &dataset(4);
         let e = EXPECTED_FROM_LIBZSTD[4];
         assert_eq!(
             optimal_block_size(mixed, 1 << 17, 0, fast, 100, &mut ws),
@@ -459,7 +470,8 @@ mod tests {
             optimal_block_size(mixed, 1 << 17, 0, Strategy::BtUltra2, 100, &mut ws),
             e[4]
         );
-        for sl in 2..=6 {
+        // Miri: the cheap levels (0 and 1; level 4 ran above)
+        for sl in if MIRI { 2..=3 } else { 2..=6 } {
             let got = optimal_block_size(mixed, 1 << 17, sl, fast, 100, &mut ws);
             assert_eq!(got, e[sl as usize - 2]);
         }
