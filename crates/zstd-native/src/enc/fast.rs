@@ -2773,15 +2773,55 @@ pub(super) mod tests {
         (nb_seq, ext)
     }
 
+    /// Under Miri, the round-trip tests take a few KB of input and fewer
+    /// parameter combinations, but every match finder template still runs:
+    /// with the full sizes, one test takes over six hours there.
+    pub(crate) const MIRI: bool = cfg!(miri);
+
+    /// The input of the `roundtrip_all_variants` tests: text, an
+    /// incompressible stretch, then a repeat of the start.
+    pub(crate) fn variants_input() -> Vec<u8> {
+        let (text, noise, repeat) = if MIRI {
+            (6000, 500, 3000)
+        } else {
+            (150_000, 5000, 40_000)
+        };
+        let mut src = texty(text, 7);
+        src.extend_from_slice(&random(noise, 8));
+        src.extend_from_slice(&src.clone()[..repeat]);
+        src
+    }
+
+    /// The input of the `roundtrip_ring_variants` tests: as
+    /// [`variants_input`], with `more` bytes of other text.
+    pub(crate) fn ring_input(text: usize, repeat: usize, more: usize) -> Vec<u8> {
+        let mut src = texty(text, 7);
+        src.extend_from_slice(&random(if MIRI { 500 } else { 5000 }, 8));
+        src.extend_from_slice(&src.clone()[..repeat]);
+        src.extend_from_slice(&texty(more, 17));
+        src
+    }
+
+    /// The minimum number of sequences of a variants round trip.
+    pub(crate) const MIN_SEQUENCES: usize = if MIRI { 100 } else { 1000 };
+
     #[test]
     fn roundtrip_ring_variants() {
-        let mut src = texty(150_000, 7);
-        src.extend_from_slice(&random(5000, 8));
-        src.extend_from_slice(&src.clone()[..60_000]);
-        src.extend_from_slice(&texty(100_000, 17));
+        let src = if MIRI {
+            ring_input(6000, 3000, 3000)
+        } else {
+            ring_input(150_000, 60_000, 100_000)
+        };
+        // The ring (window + block size) wraps for every window.
+        let windows: &[(u32, usize)] = if MIRI {
+            &[(10, 1 << 10), (12, 3000)]
+        } else {
+            &[(10, 1 << 10), (14, 3000), (16, 1 << 15), (17, 1 << 17)]
+        };
+        let target_lengths: &[u32] = if MIRI { &[0, 7] } else { &[0, 1, 7] };
         for mls in 3..=8 {
-            for (window_log, bs) in [(10, 1 << 10), (14, 3000), (16, 1 << 15), (17, 1 << 17)] {
-                for target_length in [0, 1, 7] {
+            for &(window_log, bs) in windows {
+                for &target_length in target_lengths {
                     let cp = CParams {
                         window_log,
                         chain_log: 16,
@@ -2793,7 +2833,7 @@ pub(super) mod tests {
                     };
                     let (n, ext) = roundtrip_ring(&src, cp, bs);
                     assert!(
-                        n > 1000 && ext > 0,
+                        n > MIN_SEQUENCES && ext > 0,
                         "mls {mls} wlog {window_log}: {n} {ext}"
                     );
                 }
@@ -2808,17 +2848,18 @@ pub(super) mod tests {
 
     #[test]
     fn roundtrip_levels() {
+        let k = if MIRI { 50 } else { 1 }; // sizes divided by k
         let inputs: [Vec<u8>; 7] = [
             texty(1000, 1),
-            texty(100_000, 2),
-            texty(300_000, 3),
-            random(50_000, 4),
-            vec![0u8; 200_000],
-            (0..70_000u32).map(|i| (i % 251) as u8).collect(),
+            texty(100_000 / k, 2),
+            texty(300_000 / k, 3),
+            random(50_000 / k, 4),
+            vec![0u8; 200_000 / k],
+            (0..(70_000 / k) as u32).map(|i| (i % 251) as u8).collect(),
             {
-                let mut v = random(20_000, 5);
+                let mut v = random(20_000 / k, 5);
                 v.extend_from_within(..);
-                v.extend_from_slice(&texty(30_000, 6));
+                v.extend_from_slice(&texty(30_000 / k, 6));
                 v
             },
         ];
@@ -2836,12 +2877,16 @@ pub(super) mod tests {
 
     #[test]
     fn roundtrip_all_variants() {
-        let mut src = texty(150_000, 7);
-        src.extend_from_slice(&random(5000, 8));
-        src.extend_from_slice(&src.clone()[..40_000]);
+        let src = variants_input();
+        let window_logs: &[u32] = if MIRI {
+            &[10, 22]
+        } else {
+            &[10, 14, 18, 19, 22]
+        };
+        let target_lengths: &[u32] = if MIRI { &[0, 7] } else { &[0, 1, 7] };
         for mls in 3..=8 {
-            for window_log in [10, 14, 18, 19, 22] {
-                for target_length in [0, 1, 7] {
+            for &window_log in window_logs {
+                for &target_length in target_lengths {
                     let cp = CParams {
                         window_log,
                         chain_log: 16,
@@ -2852,7 +2897,10 @@ pub(super) mod tests {
                         strategy: Strategy::Fast,
                     };
                     let n = roundtrip(&src, cp, (1 << 17).min(1 << window_log));
-                    assert!(n > 1000, "mls {mls} wlog {window_log}: {n} sequences");
+                    assert!(
+                        n > MIN_SEQUENCES,
+                        "mls {mls} wlog {window_log}: {n} sequences"
+                    );
                 }
             }
         }

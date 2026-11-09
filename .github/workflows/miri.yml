@@ -6,9 +6,11 @@ name: Miri
 # unsafe: the bit reader and writer, Huffman and FSE tables, sequence
 # execution, match finders) runs.
 #
-# Pushes and pull requests skip the encoder round-trip tests: they
-# compress hundreds of KiB per case, each over 15 minutes under Miri. The
-# weekly and manual runs take every test.
+# Pushes and pull requests skip the slowest tests (the encoder round
+# trips and the other tests below take minutes each under Miri, even with
+# their Miri sizes: a few KiB of input, see `MIRI` in enc/fast.rs). The
+# weekly and manual runs take every test. A test is killed after 30
+# minutes (.config/nextest.toml).
 on:
   push:
     branches: [main]

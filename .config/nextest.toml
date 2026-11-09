@@ -1,0 +1,9 @@
+# cargo-nextest configuration. Only the Miri workflow runs nextest.
+
+# `cargo miri nextest` selects this profile. A test that runs longer than
+# 30 minutes under Miri is killed and reported as failed, so one slow
+# test can't hold a slot until the job's time limit, and the rest still
+# run and report (the weekly run of 2026-11-09: four round-trip tests ran
+# for six hours, and 98 of 112 tests never started).
+[profile.default-miri]
+slow-timeout = { period = "60s", terminate-after = 30 }

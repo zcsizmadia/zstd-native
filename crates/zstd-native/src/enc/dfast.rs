@@ -1546,18 +1546,21 @@ fn dms_generic<const MLS: u32>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::fast::tests::{random, roundtrip, roundtrip_ring, texty};
+    use super::super::fast::tests::{
+        MIN_SEQUENCES, MIRI, random, ring_input, roundtrip, roundtrip_ring, texty, variants_input,
+    };
     use super::super::params::{CParams, Strategy, block_size_max, one_shot_cparams};
     use alloc::vec::Vec;
 
     #[test]
     fn roundtrip_levels() {
+        let k = if MIRI { 50 } else { 1 }; // sizes divided by k
         let inputs: [Vec<u8>; 5] = [
             texty(1000, 1),
-            texty(300_000, 3),
-            random(50_000, 4),
-            alloc::vec![0u8; 200_000],
-            (0..70_000u32).map(|i| (i % 251) as u8).collect(),
+            texty(300_000 / k, 3),
+            random(50_000 / k, 4),
+            alloc::vec![0u8; 200_000 / k],
+            (0..(70_000 / k) as u32).map(|i| (i % 251) as u8).collect(),
         ];
         for src in &inputs {
             for level in [2, 3, 4] {
@@ -1572,11 +1575,10 @@ mod tests {
 
     #[test]
     fn roundtrip_all_variants() {
-        let mut src = texty(150_000, 7);
-        src.extend_from_slice(&random(5000, 8));
-        src.extend_from_slice(&src.clone()[..40_000]);
+        let src = variants_input();
+        let window_logs: &[u32] = if MIRI { &[10, 22] } else { &[10, 14, 18, 22] };
         for mls in 3..=8 {
-            for window_log in [10, 14, 18, 22] {
+            for &window_log in window_logs {
                 let cp = CParams {
                     window_log,
                     chain_log: 13,
@@ -1587,7 +1589,10 @@ mod tests {
                     strategy: Strategy::DFast,
                 };
                 let n = roundtrip(&src, cp, (1 << 17).min(1 << window_log));
-                assert!(n > 1000, "mls {mls} wlog {window_log}: {n} sequences");
+                assert!(
+                    n > MIN_SEQUENCES,
+                    "mls {mls} wlog {window_log}: {n} sequences"
+                );
             }
         }
     }
@@ -1596,12 +1601,19 @@ mod tests {
     /// streaming compressor's.
     #[test]
     fn roundtrip_ring_variants() {
-        let mut src = texty(150_000, 7);
-        src.extend_from_slice(&random(5000, 8));
-        src.extend_from_slice(&src.clone()[..60_000]);
-        src.extend_from_slice(&texty(100_000, 17));
+        let src = if MIRI {
+            ring_input(6000, 3000, 3000)
+        } else {
+            ring_input(150_000, 60_000, 100_000)
+        };
+        // The ring (window + block size) wraps for every window.
+        let windows: &[(u32, usize)] = if MIRI {
+            &[(10, 1 << 10), (12, 3000)]
+        } else {
+            &[(10, 1 << 10), (14, 3000), (16, 1 << 15), (17, 1 << 17)]
+        };
         for mls in 3..=8 {
-            for (window_log, bs) in [(10, 1 << 10), (14, 3000), (16, 1 << 15), (17, 1 << 17)] {
+            for &(window_log, bs) in windows {
                 let cp = CParams {
                     window_log,
                     chain_log: 13,
@@ -1613,7 +1625,7 @@ mod tests {
                 };
                 let (n, ext) = roundtrip_ring(&src, cp, bs);
                 assert!(
-                    n > 1000 && ext > 0,
+                    n > MIN_SEQUENCES && ext > 0,
                     "mls {mls} wlog {window_log}: {n} {ext}"
                 );
             }

@@ -1184,7 +1184,7 @@ fn ldm_block_compress(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::enc::fast::tests::{random, texty};
+    use crate::enc::fast::tests::{MIRI, random, texty};
     use crate::enc::params::one_shot_cparams;
     use crate::{EndOp, StreamEncoder};
     use alloc::vec::Vec;
@@ -1301,7 +1301,7 @@ mod tests {
 
     /// Text with copies from up to `reach` bytes back.
     fn input(n: usize, reach: usize) -> Vec<u8> {
-        let mut v = texty(50_000, 1);
+        let mut v = texty(50_000.min(n / 4), 1);
         let mut k = 0u64;
         while v.len() < n {
             k += 1;
@@ -1320,12 +1320,28 @@ mod tests {
 
     /// Every level with LDM forced on: one-shot, and streamed through a
     /// wrapping input buffer (extDict); the frames round trip and LDM
-    /// helps the fast levels.
+    /// helps the fast levels (not checked under Miri, where the input
+    /// and the windows are smaller, and fewer levels run).
     #[test]
     fn round_trip_forced() {
-        let data = input(1 << 20, 400_000);
-        for level in [-3, 1, 2, 3, 4, 5, 6, 8, 13, 15, 16, 17, 18, 19, 22] {
-            for (wlog, piece) in [(20, data.len()), (17, 70_000)] {
+        let data = if MIRI {
+            input(40_000, 25_000)
+        } else {
+            input(1 << 20, 400_000)
+        };
+        let (levels, windows): (&[i32], &[(u32, usize)]) = if MIRI {
+            (
+                &[1, 3, 5, 8, 13, 16, 19, 22],
+                &[(17, data.len()), (14, 6000)],
+            )
+        } else {
+            (
+                &[-3, 1, 2, 3, 4, 5, 6, 8, 13, 15, 16, 17, 18, 19, 22],
+                &[(20, data.len()), (17, 70_000)],
+            )
+        };
+        for &level in levels {
+            for &(wlog, piece) in windows {
                 let mut enc = StreamEncoder::new(level);
                 enc.set_long_distance_matching(true);
                 enc.set_window_log(wlog);

@@ -2326,7 +2326,9 @@ fn ext_generic<
 
 #[cfg(test)]
 mod tests {
-    use super::super::fast::tests::{random, roundtrip, roundtrip_ring, texty};
+    use super::super::fast::tests::{
+        MIN_SEQUENCES, MIRI, random, ring_input, roundtrip, roundtrip_ring, texty, variants_input,
+    };
     use super::super::fast::{MatchState, build_seq_store, reduce_table_btlazy2};
     use super::super::params::{CParams, Strategy, block_size_max, one_shot_cparams};
     use super::super::seq_store::{REP_START_VALUE, SeqDef, SeqStore};
@@ -2341,17 +2343,18 @@ mod tests {
     ];
 
     fn inputs() -> [Vec<u8>; 6] {
+        let k = if MIRI { 50 } else { 1 }; // sizes divided by k
         [
             texty(1000, 1),
-            texty(300_000, 3),
-            random(50_000, 4),
-            alloc::vec![0u8; 200_000],
-            (0..70_000u32).map(|i| (i % 251) as u8).collect(),
+            texty(300_000 / k, 3),
+            random(50_000 / k, 4),
+            alloc::vec![0u8; 200_000 / k],
+            (0..(70_000 / k) as u32).map(|i| (i % 251) as u8).collect(),
             {
                 // incompressible stretches (lazy skipping), then matches
-                let mut v = random(20_000, 5);
-                v.extend_from_slice(&texty(30_000, 6));
-                v.extend_from_within(..25_000);
+                let mut v = random(20_000 / k, 5);
+                v.extend_from_slice(&texty(30_000 / k, 6));
+                v.extend_from_within(..25_000 / k);
                 v
             },
         ]
@@ -2372,17 +2375,21 @@ mod tests {
 
     #[test]
     fn roundtrip_all_variants() {
-        let mut src = texty(150_000, 7);
-        src.extend_from_slice(&random(5000, 8));
-        src.extend_from_slice(&src.clone()[..40_000]);
+        let src = variants_input();
+        // Miri: no clamped values, one window per match finder
+        let (mlss, search_logs, window_logs): (&[u32], &[u32], &[u32]) = if MIRI {
+            (&[4, 5, 6], &[4, 5, 6], &[14, 15])
+        } else {
+            (&[3, 4, 5, 6, 7], &[1, 4, 5, 6, 7], &[10, 14, 15, 18, 22])
+        };
         for strategy in LAZY {
             // mls 4, 5, 6 (3 and 7 are clamped to 4 and 6)
-            for mls in 3..=7 {
+            for &mls in mlss {
                 // rowLog 4, 5, 6 (searchLog 1 and 7 are clamped)
-                for search_log in [1, 4, 5, 6, 7] {
+                for &search_log in search_logs {
                     // window logs up to 14 use the hash chain, above it
                     // the row finder (greedy..lazy2)
-                    for window_log in [10, 14, 15, 18, 22] {
+                    for &window_log in window_logs {
                         let cp = CParams {
                             window_log,
                             chain_log: 16,
@@ -2397,7 +2404,7 @@ mod tests {
                         assert_eq!(row, strategy != Strategy::BtLazy2 && window_log > 14);
                         let n = roundtrip(&src, cp, (1 << 17).min(1 << window_log));
                         assert!(
-                            n > 1000,
+                            n > MIN_SEQUENCES,
                             "{strategy:?} mls {mls} slog {search_log} wlog {window_log}: {n} sequences"
                         );
                     }
@@ -2504,16 +2511,29 @@ mod tests {
     /// wrapping ring buffer like the streaming compressor's.
     #[test]
     fn roundtrip_ring_variants() {
-        let mut src = texty(150_000, 7);
-        src.extend_from_slice(&random(5000, 8));
-        src.extend_from_slice(&src.clone()[..60_000]);
-        src.extend_from_slice(&texty(60_000, 17));
+        // Miri: the ring of the row finder's 2^15 window wraps once.
+        let src = if MIRI {
+            ring_input(30_000, 3000, 6000)
+        } else {
+            ring_input(150_000, 60_000, 60_000)
+        };
+        let (search_logs, windows): (&[u32], &[(u32, usize)]) = if MIRI {
+            (&[4, 5, 6], &[(12, 4096), (15, 3000)])
+        } else {
+            (
+                &[1, 5, 6],
+                &[(12, 4096), (14, 3000), (15, 1 << 13), (17, 1 << 17)],
+            )
+        };
         for strategy in LAZY {
             for mls in [4, 5, 6] {
-                for search_log in [1, 5, 6] {
+                for &search_log in search_logs {
                     // window logs up to 14 use the hash chain, above it the
                     // row finder (greedy..lazy2)
-                    for (window_log, bs) in [(12, 4096), (14, 3000), (15, 1 << 13), (17, 1 << 17)] {
+                    for &(window_log, bs) in windows {
+                        if MIRI && window_log < 15 && search_log != 5 {
+                            continue; // the hash chain has no rowLog
+                        }
                         let cp = CParams {
                             window_log,
                             chain_log: 16,
@@ -2525,7 +2545,7 @@ mod tests {
                         };
                         let (n, ext) = roundtrip_ring(&src, cp, bs);
                         assert!(
-                            n > 1000 && ext > 0,
+                            n > MIN_SEQUENCES && ext > 0,
                             "{strategy:?} mls {mls} slog {search_log} wlog {window_log}: {n} {ext}"
                         );
                     }

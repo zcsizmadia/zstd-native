@@ -741,20 +741,37 @@ mod tests {
     #[test]
     fn round_trip_every_mode() {
         use super::super::compress::{FrameCompressor, compress_bound};
-        use super::super::fast::tests::texty;
-        let dict = texty(20_000, 1);
+        use super::super::fast::tests::{MIRI, texty};
+        // Miri: a smaller dictionary and input, still over the largest
+        // attach cutoff (32 KiB), so every strategy attaches and copies,
+        // but under 128 KiB: no frame loads the dictionary into its own
+        // tables. Fewer levels, at least one per strategy.
+        let (dict_len, pieces, tail) = if MIRI {
+            (6000, 12, 18_000)
+        } else {
+            (20_000, 40, 200_000)
+        };
+        let dict = texty(dict_len, 1);
         // the input repeats parts of the dictionary, with other text
-        let mut src = texty(30_000, 2);
-        for i in 0..40 {
-            let at = (i * 4999) % 19_000;
+        let mut src = texty(if MIRI { 10_000 } else { 30_000 }, 2);
+        for i in 0..pieces {
+            let at = (i * 4999) % (dict_len - 1000);
             src.extend_from_slice(&dict[at..at + 700]);
             src.extend_from_slice(&texty(300, 3 + i as u64));
         }
-        src.extend_from_slice(&texty(200_000, 50));
+        src.extend_from_slice(&texty(tail, 50));
         let ddict = crate::Dictionary::new(&dict).unwrap();
-        for level in [-3, 1, 2, 3, 4, 5, 7, 8, 9, 12, 15, 16, 17, 19, 22] {
+        let (levels, sizes): (&[i32], &[usize]) = if MIRI {
+            (&[1, 3, 5, 7, 9, 15, 16, 19, 22], &[5_000, src.len()])
+        } else {
+            (
+                &[-3, 1, 2, 3, 4, 5, 7, 8, 9, 12, 15, 16, 17, 19, 22],
+                &[5_000, 20_000, 60_000, src.len()],
+            )
+        };
+        for &level in levels {
             let cd = Arc::new(CDict::new(&dict, level, false).unwrap());
-            for n in [5_000usize, 20_000, 60_000, src.len()] {
+            for &n in sizes {
                 let data = &src[..n];
                 let pledged = Some(n as u64);
                 let cp = frame_cparams(cd.level, Some(&cd), pledged, 0, false);

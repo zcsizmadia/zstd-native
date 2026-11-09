@@ -2180,23 +2180,27 @@ fn opt_generic<
 
 #[cfg(test)]
 mod tests {
-    use super::super::fast::tests::{random, roundtrip, roundtrip_ring, texty, xorshift};
+    use super::super::fast::tests::{
+        MIN_SEQUENCES, MIRI, random, ring_input, roundtrip, roundtrip_ring, texty, variants_input,
+        xorshift,
+    };
     use super::super::params::{CParams, Strategy, block_size_max, one_shot_cparams};
     use super::*;
 
     const OPT: [Strategy; 3] = [Strategy::BtOpt, Strategy::BtUltra, Strategy::BtUltra2];
 
     fn inputs() -> [Vec<u8>; 6] {
+        let k = if MIRI { 50 } else { 1 }; // sizes divided by k
         [
             texty(1000, 1),
-            texty(300_000, 3),
-            random(50_000, 4),
-            alloc::vec![0u8; 200_000],
-            (0..70_000u32).map(|i| (i % 251) as u8).collect(),
+            texty(300_000 / k, 3),
+            random(50_000 / k, 4),
+            alloc::vec![0u8; 200_000 / k],
+            (0..(70_000 / k) as u32).map(|i| (i % 251) as u8).collect(),
             {
-                let mut v = random(20_000, 5);
-                v.extend_from_slice(&texty(30_000, 6));
-                v.extend_from_within(..25_000);
+                let mut v = random(20_000 / k, 5);
+                v.extend_from_slice(&texty(30_000 / k, 6));
+                v.extend_from_within(..25_000 / k);
                 v
             },
         ]
@@ -2217,14 +2221,22 @@ mod tests {
 
     #[test]
     fn roundtrip_all_variants() {
-        let mut src = texty(150_000, 7);
-        src.extend_from_slice(&random(5000, 8));
-        src.extend_from_slice(&src.clone()[..40_000]);
+        let src = variants_input();
+        type Search = &'static [(u32, u32)];
+        let (mlss, searches, window_logs): (&[u32], Search, &[u32]) = if MIRI {
+            (&[3, 4, 5, 6], &[(1, 4), (7, 256)], &[10, 22])
+        } else {
+            (
+                &[3, 4, 5, 6, 7],
+                &[(1, 4), (4, 32), (7, 256), (9, 999)],
+                &[10, 17, 22],
+            )
+        };
         for strategy in OPT {
             // mls 3, 4, 5, 6 (7 is clamped to 6)
-            for mls in 3..=7 {
-                for (search_log, target_length) in [(1, 4), (4, 32), (7, 256), (9, 999)] {
-                    for window_log in [10, 17, 22] {
+            for &mls in mlss {
+                for &(search_log, target_length) in searches {
+                    for &window_log in window_logs {
                         let cp = CParams {
                             window_log,
                             chain_log: 16,
@@ -2236,7 +2248,7 @@ mod tests {
                         };
                         let n = roundtrip(&src, cp, (1 << 17).min(1 << window_log));
                         assert!(
-                            n > 1000,
+                            n > MIN_SEQUENCES,
                             "{strategy:?} mls {mls} slog {search_log} wlog {window_log}: {n} sequences"
                         );
                     }
@@ -2413,14 +2425,25 @@ mod tests {
     /// streaming compressor's.
     #[test]
     fn roundtrip_ring_variants() {
-        let mut src = texty(100_000, 7);
-        src.extend_from_slice(&random(5000, 8));
-        src.extend_from_slice(&src.clone()[..40_000]);
-        src.extend_from_slice(&texty(50_000, 17));
+        let src = if MIRI {
+            ring_input(6000, 3000, 3000)
+        } else {
+            ring_input(100_000, 40_000, 50_000)
+        };
+        type Search = &'static [(u32, u32)];
+        // The ring (window + block size) wraps for every window.
+        let (searches, windows): (Search, &[(u32, usize)]) = if MIRI {
+            (&[(4, 32)], &[(10, 1 << 10), (12, 3000)])
+        } else {
+            (
+                &[(1, 4), (4, 32), (7, 256)],
+                &[(12, 4096), (15, 5000), (16, 1 << 15)],
+            )
+        };
         for strategy in OPT {
             for mls in 3..=6 {
-                for (search_log, target_length) in [(1, 4), (4, 32), (7, 256)] {
-                    for (window_log, bs) in [(12, 4096), (15, 5000), (16, 1 << 15)] {
+                for &(search_log, target_length) in searches {
+                    for &(window_log, bs) in windows {
                         let cp = CParams {
                             window_log,
                             chain_log: 16,
@@ -2432,7 +2455,7 @@ mod tests {
                         };
                         let (n, ext) = roundtrip_ring(&src, cp, bs);
                         assert!(
-                            n > 1000 && ext > 0,
+                            n > MIN_SEQUENCES && ext > 0,
                             "{strategy:?} mls {mls} slog {search_log} wlog {window_log}: {n} {ext}"
                         );
                     }
