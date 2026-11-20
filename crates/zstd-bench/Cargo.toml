@@ -20,7 +20,7 @@ zstd = { version = "0.14", default-features = false, features = ["zstdmt", "expe
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 # Pure-Rust competitors.
 ruzstd = "0.9"
-structured-zstd = "0.2"
+structured-zstd = "0.4"
 
 [[bench]]
 name = "decode"
