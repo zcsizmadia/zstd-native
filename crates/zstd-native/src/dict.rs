@@ -87,13 +87,13 @@ impl Dictionary {
             return Err(Error::InvalidDictionary);
         }
         let content_len = data.len() - (p + 12);
-        for i in 0..3 {
+        for rep in &mut ent.rep {
             let r = u32::from_le_bytes(data[p..p + 4].try_into().unwrap());
             p += 4;
             if r == 0 || r as usize > content_len {
                 return Err(Error::InvalidDictionary);
             }
-            ent.rep[i] = r;
+            *rep = r;
         }
         Ok(Dictionary {
             inner: Arc::new(Inner {
