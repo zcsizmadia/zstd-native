@@ -8,11 +8,14 @@
 //! libzstd rejects.
 
 use std::borrow::Cow;
+use std::ptr::NonNull;
 use std::sync::LazyLock;
 
 use arbitrary::Arbitrary;
-use zstd::zstd_safe::zstd_sys::ZSTD_EndDirective;
-use zstd::zstd_safe::{CCtx, CDict, CParameter, DCtx, DDict, DParameter, InBuffer, OutBuffer};
+use zstd::zstd_safe::zstd_sys::{
+    self, ZSTD_CCtx, ZSTD_CDict, ZSTD_EndDirective, ZSTD_inBuffer, ZSTD_outBuffer,
+};
+use zstd::zstd_safe::{CDict, CParameter, DCtx, DDict, DParameter, InBuffer, OutBuffer};
 use zstd_native::EndOp;
 
 /// Output cap when decoding arbitrary bytes: an RLE block expands 3 bytes
@@ -363,19 +366,164 @@ pub fn c_accepts_dict(p: &EncParams) -> bool {
     }
 }
 
-/// The prepared libzstd dictionary `p` asks for, if any (the dictionary
-/// must be accepted, see [`c_accepts_dict`]).
-pub fn c_cdict(p: &EncParams) -> Option<CDict<'static>> {
-    match &p.dict {
-        EncDict::Prepared(s) => s.bytes().map(|d| CDict::create(&d, p.level())),
-        _ => None,
+/// A libzstd compression context driven through `zstd_sys` directly: the
+/// oracle. zstd-safe (since 8.3) keeps its own account of the frames of a
+/// context with worker threads, and answers some calls without reaching
+/// libzstd (one that starts a frame with no input and `ZSTD_e_continue` or
+/// `ZSTD_e_flush`): libzstd would start the frame there, with an unknown
+/// size, and then writes a different frame. The oracle must be libzstd
+/// itself.
+pub struct RawCCtx {
+    cctx: NonNull<ZSTD_CCtx>,
+    /// The prepared dictionary it references (`ZSTD_CCtx_refCDict`), freed
+    /// after the context.
+    cdict: Option<NonNull<ZSTD_CDict>>,
+}
+
+impl Drop for RawCCtx {
+    fn drop(&mut self) {
+        // SAFETY: both were created by libzstd and are freed once; the
+        // context (which waits for its workers) goes before the dictionary
+        // it references.
+        unsafe {
+            zstd_sys::ZSTD_freeCCtx(self.cctx.as_ptr());
+            if let Some(d) = self.cdict {
+                zstd_sys::ZSTD_freeCDict(d.as_ptr());
+            }
+        }
     }
 }
 
-/// A libzstd context with `p` applied (`cdict` from [`c_cdict`]); the
-/// dictionary must be accepted (see [`c_accepts_dict`]).
-pub fn c_context<'a>(p: &EncParams, cdict: Option<&'a CDict<'static>>) -> CCtx<'a> {
-    let mut c = CCtx::create();
+/// `Ok(code)` unless `code` is a libzstd error code.
+fn c_result(code: usize) -> Result<usize, usize> {
+    // SAFETY: a pure function of its argument.
+    if unsafe { zstd_sys::ZSTD_isError(code) } != 0 {
+        Err(code)
+    } else {
+        Ok(code)
+    }
+}
+
+impl RawCCtx {
+    /// `ZSTD_createCCtx`.
+    pub fn create() -> Self {
+        // SAFETY: no arguments; a null result (allocation failure) panics.
+        let cctx = NonNull::new(unsafe { zstd_sys::ZSTD_createCCtx() }).expect("ZSTD_createCCtx");
+        RawCCtx { cctx, cdict: None }
+    }
+
+    /// `ZSTD_CCtx_setParameter`, for the parameters the targets use.
+    pub fn set_parameter(&mut self, p: CParameter) -> Result<(), usize> {
+        use zstd_sys::ZSTD_cParameter::*;
+        let (param, value) = match p {
+            CParameter::CompressionLevel(v) => (ZSTD_c_compressionLevel, v),
+            CParameter::WindowLog(v) => (ZSTD_c_windowLog, v as i32),
+            CParameter::EnableLongDistanceMatching(v) => {
+                (ZSTD_c_enableLongDistanceMatching, v as i32)
+            }
+            CParameter::NbWorkers(v) => (ZSTD_c_nbWorkers, v as i32),
+            CParameter::JobSize(v) => (ZSTD_c_jobSize, v as i32),
+            CParameter::OverlapSizeLog(v) => (ZSTD_c_overlapLog, v as i32),
+            CParameter::ChecksumFlag(v) => (ZSTD_c_checksumFlag, v as i32),
+            CParameter::ContentSizeFlag(v) => (ZSTD_c_contentSizeFlag, v as i32),
+            CParameter::DictIdFlag(v) => (ZSTD_c_dictIDFlag, v as i32),
+            other => unimplemented!("RawCCtx::set_parameter({other:?})"),
+        };
+        // SAFETY: a valid context.
+        c_result(unsafe { zstd_sys::ZSTD_CCtx_setParameter(self.cctx.as_ptr(), param, value) })
+            .map(drop)
+    }
+
+    /// `ZSTD_CCtx_loadDictionary` (libzstd copies `dict`).
+    pub fn load_dictionary(&mut self, dict: &[u8]) -> Result<(), usize> {
+        // SAFETY: a valid context; `dict` is only read during the call.
+        c_result(unsafe {
+            zstd_sys::ZSTD_CCtx_loadDictionary(self.cctx.as_ptr(), dict.as_ptr().cast(), dict.len())
+        })
+        .map(drop)
+    }
+
+    /// `ZSTD_createCDict` of `dict` at `level`, referenced with
+    /// `ZSTD_CCtx_refCDict` and owned by the context.
+    pub fn ref_new_cdict(&mut self, dict: &[u8], level: i32) -> Result<(), usize> {
+        // SAFETY: `ZSTD_createCDict` copies `dict`; null means rejected.
+        let cdict = NonNull::new(unsafe {
+            zstd_sys::ZSTD_createCDict(dict.as_ptr().cast(), dict.len(), level)
+        })
+        .expect("ZSTD_createCDict");
+        // SAFETY: a valid context and dictionary, which `self` keeps alive
+        // until after the context is freed.
+        let res =
+            c_result(unsafe { zstd_sys::ZSTD_CCtx_refCDict(self.cctx.as_ptr(), cdict.as_ptr()) });
+        if let Some(old) = self.cdict.replace(cdict) {
+            // SAFETY: the context no longer references the old dictionary.
+            unsafe { zstd_sys::ZSTD_freeCDict(old.as_ptr()) };
+        }
+        res.map(drop)
+    }
+
+    /// `ZSTD_CCtx_setPledgedSrcSize`.
+    pub fn set_pledged_src_size(&mut self, size: u64) -> Result<(), usize> {
+        // SAFETY: a valid context.
+        c_result(unsafe { zstd_sys::ZSTD_CCtx_setPledgedSrcSize(self.cctx.as_ptr(), size) })
+            .map(drop)
+    }
+
+    /// `ZSTD_compress2` into the spare capacity of `dst`: the size written.
+    pub fn compress2(&mut self, dst: &mut Vec<u8>, src: &[u8]) -> Result<usize, usize> {
+        let spare = dst.spare_capacity_mut();
+        // SAFETY: a valid context; libzstd writes at most `spare.len()`
+        // bytes into `spare` and reads `src`.
+        let n = c_result(unsafe {
+            zstd_sys::ZSTD_compress2(
+                self.cctx.as_ptr(),
+                spare.as_mut_ptr().cast(),
+                spare.len(),
+                src.as_ptr().cast(),
+                src.len(),
+            )
+        })?;
+        // SAFETY: libzstd initialized the first `n` spare bytes.
+        unsafe { dst.set_len(dst.len() + n) };
+        Ok(n)
+    }
+
+    /// `ZSTD_compressStream2`: compresses from `src[*src_pos..]` into
+    /// `dst[*dst_pos..]`, advancing both positions; libzstd's return value
+    /// (a lower bound of what is left to flush).
+    pub fn compress_stream2(
+        &mut self,
+        dst: &mut [u8],
+        dst_pos: &mut usize,
+        src: &[u8],
+        src_pos: &mut usize,
+        op: ZSTD_EndDirective,
+    ) -> Result<usize, usize> {
+        let mut output = ZSTD_outBuffer {
+            dst: dst.as_mut_ptr().cast(),
+            size: dst.len(),
+            pos: *dst_pos,
+        };
+        let mut input = ZSTD_inBuffer {
+            src: src.as_ptr().cast(),
+            size: src.len(),
+            pos: *src_pos,
+        };
+        // SAFETY: a valid context; the buffers describe `dst` and `src`,
+        // which outlive the call.
+        let res = c_result(unsafe {
+            zstd_sys::ZSTD_compressStream2(self.cctx.as_ptr(), &mut output, &mut input, op)
+        });
+        *dst_pos = output.pos;
+        *src_pos = input.pos;
+        res
+    }
+}
+
+/// A libzstd context with `p` applied; the dictionary must be accepted
+/// (see [`c_accepts_dict`]).
+pub fn c_context(p: &EncParams) -> RawCCtx {
+    let mut c = RawCCtx::create();
     c.set_parameter(CParameter::CompressionLevel(p.level()))
         .unwrap();
     c.set_parameter(CParameter::WindowLog(p.window_log()))
@@ -400,9 +548,9 @@ pub fn c_context<'a>(p: &EncParams, cdict: Option<&'a CDict<'static>>) -> CCtx<'
                 c.load_dictionary(&d).expect("ZSTD_CCtx_loadDictionary");
             }
         }
-        EncDict::Prepared(_) => {
-            if let Some(cd) = cdict {
-                c.ref_cdict(cd).expect("ZSTD_CCtx_refCDict");
+        EncDict::Prepared(s) => {
+            if let Some(d) = s.bytes() {
+                c.ref_new_cdict(&d, p.level()).expect("ZSTD_CCtx_refCDict");
             }
         }
     }
@@ -417,13 +565,13 @@ pub fn c_accepts_ddict(dict: &[u8]) -> bool {
 /// Runs a streaming compression script on libzstd: `ops` are
 /// `(input length, op, output buffer size)`.
 pub fn c_stream_compress(
-    c: &mut CCtx<'_>,
+    c: &mut RawCCtx,
     data: &[u8],
     ops: &[(usize, EndOp, usize)],
     pledged: Option<u64>,
 ) -> Vec<u8> {
     if let Some(p) = pledged {
-        c.set_pledged_src_size(Some(p)).unwrap();
+        c.set_pledged_src_size(p).unwrap();
     }
     let mut out = Vec::new();
     let mut pos = 0;
@@ -431,16 +579,15 @@ pub fn c_stream_compress(
     for &(len, op, out_size) in ops {
         let piece = &data[pos..pos + len];
         pos += len;
-        let mut input = InBuffer::around(piece);
+        let mut in_pos = 0;
         buf.resize(out_size, 0);
         loop {
-            let mut output = OutBuffer::around(&mut buf[..]);
+            let mut n = 0;
             let remaining = c
-                .compress_stream2(&mut output, &mut input, directive(op))
+                .compress_stream2(&mut buf, &mut n, piece, &mut in_pos, directive(op))
                 .unwrap_or_else(|e| panic!("libzstd: {}", c_error(e)));
-            let n = output.pos();
             out.extend_from_slice(&buf[..n]);
-            if input.pos() == piece.len() && (op == EndOp::Continue || remaining == 0) {
+            if in_pos == piece.len() && (op == EndOp::Continue || remaining == 0) {
                 break;
             }
         }

@@ -9,10 +9,10 @@ use std::io::Read;
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use zstd::zstd_safe::{CCtx, CDict, CParameter};
+use zstd::zstd_safe::{CDict, CParameter};
 use zstd_native::{Dictionary, EndOp};
 use zstd_native_fuzz::{
-    DictSpec, c_stream_compress, chunk_sizes, first_diff, level_from, native_stream_decode,
+    DictSpec, RawCCtx, c_stream_compress, chunk_sizes, first_diff, level_from, native_stream_decode,
     window_log_from,
 };
 
@@ -39,7 +39,7 @@ fuzz_target!(|input: Input| {
     let window_log = window_log_from(input.window_log_n);
 
     // libzstd compresses.
-    let mut c = CCtx::create();
+    let mut c = RawCCtx::create();
     c.set_parameter(CParameter::CompressionLevel(level))
         .unwrap();
     c.set_parameter(CParameter::ChecksumFlag(input.checksum))

@@ -11,7 +11,7 @@ use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use zstd_native::Dictionary;
 use zstd_native_fuzz::{
-    EncDict, EncParams, OUT_CAP, c_accepts_dict, c_cdict, c_context, c_decompress,
+    EncDict, EncParams, OUT_CAP, c_accepts_dict, c_context, c_decompress,
     c_stream_compress, first_diff, first_frame_len, head, native_encoder, native_stream_compress,
     script_from,
 };
@@ -42,8 +42,7 @@ fuzz_target!(|input: Input| {
             p.dict
         ),
     };
-    let cdict = c_cdict(p);
-    let mut c = c_context(p, cdict.as_ref());
+    let mut c = c_context(p);
 
     // The content of the frames, and the output of each library.
     let (content, want, got): (Vec<u8>, Vec<u8>, Vec<u8>);
