@@ -12,8 +12,8 @@ use libfuzzer_sys::fuzz_target;
 use zstd::zstd_safe::{CDict, CParameter};
 use zstd_native::{Dictionary, EndOp};
 use zstd_native_fuzz::{
-    DictSpec, RawCCtx, c_stream_compress, chunk_sizes, first_diff, level_from, native_stream_decode,
-    window_log_from,
+    DictSpec, RawCCtx, c_stream_compress, chunk_sizes, first_diff, level_from,
+    native_stream_decode, window_log_from,
 };
 
 #[derive(Arbitrary, Debug)]

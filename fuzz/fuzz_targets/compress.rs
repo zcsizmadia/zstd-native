@@ -11,9 +11,8 @@ use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use zstd_native::Dictionary;
 use zstd_native_fuzz::{
-    EncDict, EncParams, OUT_CAP, c_accepts_dict, c_context, c_decompress,
-    c_stream_compress, first_diff, first_frame_len, head, native_encoder, native_stream_compress,
-    script_from,
+    EncDict, EncParams, OUT_CAP, c_accepts_dict, c_context, c_decompress, c_stream_compress,
+    first_diff, first_frame_len, head, native_encoder, native_stream_compress, script_from,
 };
 
 #[derive(Arbitrary, Debug)]
